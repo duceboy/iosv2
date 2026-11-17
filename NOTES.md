@@ -47,6 +47,15 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   (`spesufslog=1`: UFS log-only with rd=md0; before, sweetlog could not work in touch/gpu-display at
   all because only the read-only storage probe starts the UFS) added. `build-spes-diagnostic.sh`:
   `SPES_SWEETLOG=1` (-> `spesufslog=1 sweetlog=1`, ufsrw stays 0), `SPES_EXTRA_BOOTARGS`.
+- **0178 reworked, 0179-0181 added (not yet built; run 44004485346 with the first 0178 cancelled):**
+  0178 bounds in `bsd/dev/spes_ufs_log.h` (`spes_ufs_log_lo`, `spes_ufs_log_write_ok`), host test
+  `tests/test_spes_ufs_log.py` (first/last allowed block, one before/behind, lengths > 1, wrap-around;
+  two deliberate mutations fail it); log-only init returns after `sweet_log_start()` and calls only
+  `spes_vib_init()`/`spes_usb_probe()` (opt-in). Finding: `sweet_touch_init`, `spes_cpufreq_init`,
+  `spes_vib_init`, `spes_amp_init`, `spes_usb_probe` run only at the end of a full UFS init, so never
+  in rd=md0 diagnostics before. 0179: SM5602 voltage/current exactly as Linux; one bq2589x dump.
+  0180: `spesvib=2` reads LPG SID1 0xb300-0xb347; sweet_spmi.c uses the SM6225 arbiter on spes (it had
+  SM7150's 0x0c440000). 0181: `spesusb=1` logs GPIO 31 via the three-tile search.
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables

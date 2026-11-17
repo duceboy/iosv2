@@ -1,0 +1,63 @@
+spes USB probe (0181): spesusb=1 also logs GPIO 31 (D+/D- switch at the bq2589x), read only.
+
+spesn.dtsi: usb-switch1-gpios = <&tlmm 31 0>; Linux (OrangeFox log) left it at 0 = data lines to the
+SoC. The pin's config and in/out registers are read on all three TLMM tiles (spes_amp.c's method;
+khaje's pin-to-tile table is not known here) and decoded when exactly one tile answers. No write.
+
+diff --git a/bsd/dev/spes_usb.c b/bsd/dev/spes_usb.c
+index 1031929..444c241 100644
+--- a/bsd/dev/spes_usb.c
++++ b/bsd/dev/spes_usb.c
+@@ -60,6 +60,44 @@ su_rd(vm_offset_t page, uint32_t off)
+ 	return v;
+ }
+ 
++/*
++ * 0181: GPIO 31, the D+/D- switch at the bq2589x (spesn.dtsi usb-switch1-gpios = <&tlmm 31 0>;
++ * Linux left it at 0 = data lines to the SoC). Read only, with spes_amp.c's tile search: the pin's
++ * page (config +0, in/out +4) is read on all three TLMM tiles, since khaje's pin-to-tile table is
++ * not known here; one 4 KB map per tile (io_map is never given back).
++ */
++static const uint32_t su_tiles[3] = { 0x00500000u, 0x00900000u, 0x00d00000u };
++#define SU_SWITCH_PIN   31u
++
++static void
++su_gpio31(void)
++{
++	uint32_t cfg[3] = { 0, 0, 0 }, io[3] = { 0, 0, 0 };
++	unsigned hits = 0, at = 0;
++	for (unsigned i = 0; i < 3; i++) {
++		vm_offset_t page = ml_io_map(su_tiles[i] + SU_SWITCH_PIN * 0x1000u, 0x1000u);
++		if (page == 0) {
++			continue;
++		}
++		cfg[i] = su_rd(page, 0);
++		io[i] = su_rd(page, 4);
++		if (cfg[i] != 0 && cfg[i] != 0xffffffffu) {
++			hits++;
++			at = i;
++		}
++	}
++	printf("SPES USB: GPIO31 cfg/io on tiles 0x500000 %#x/%#x 0x900000 %#x/%#x 0xd00000 %#x/%#x\n",
++	    cfg[0], io[0], cfg[1], io[1], cfg[2], io[2]);
++	if (hits == 1) {
++		/* TLMM CFG: pull 1:0, function 5:2, drive 8:6 (2 mA steps), output enable 9; IO: in 0, out 1 */
++		printf("SPES USB: GPIO31 on tile %#x: func %u pull %u drive %u mA %s, in %u out %u\n",
++		    su_tiles[at], (cfg[at] >> 2) & 0xfu, cfg[at] & 3u, 2u * (((cfg[at] >> 6) & 7u) + 1u),
++		    (cfg[at] & (1u << 9)) ? "output" : "input", io[at] & 1u, (io[at] >> 1) & 1u);
++	} else {
++		printf("SPES USB: GPIO31 tile %s; not decoded\n", hits ? "ambiguous" : "not found (cfg 0?)");
++	}
++}
++
+ /* the 4 KB page of a block that holds off, or 0 */
+ static vm_offset_t
+ su_page(uint32_t pa, uint32_t off)
+@@ -74,6 +112,7 @@ spes_usb_probe(void)
+ 	if (!PE_parse_boot_argn("spesusb", &on, sizeof(on)) || on != 1) {
+ 		return;
+ 	}
++	su_gpio31();
+ 	vm_offset_t g1a = su_page(SU_GCC_PA, 0x1a000u), g1d = su_page(SU_GCC_PA, 0x1d000u),
+ 	    g9f = su_page(SU_GCC_PA, 0x9f000u);
+ 	if (g1a == 0 || g1d == 0 || g9f == 0) {

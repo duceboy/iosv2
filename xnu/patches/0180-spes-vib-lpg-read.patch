@@ -1,0 +1,125 @@
+spes vibration (0180): spesvib=2 reads the PM6125 LPG (SID 1, 0xb300-0xb347), nothing else.
+
+sweet_spmi.c (observer reads only) had SM7150 sweet's arbiter addresses; on the spes platform
+(/spes-platform in the ADT) it now uses the SM6225 ones from the live DT qcom,spmi@1c40000 (core
+0x1c40000, obsrvr 0x3e00000, cnfg 0x1c0a000, as bsd/dev/sweet_keys.c), and its allow-list gains
+exactly SID 1 peripheral 0xb3 offsets 0x00-0x47. spesvib=2 logs those 72 bytes once, including
+TYPE/SUBTYPE 0xb304/0xb305 and the PWM registers 0x41-0x47. GPIO 36 is not touched; spesvib=1 is
+unchanged. Reference from Linux (OrangeFox log): period 50000 ns, duty 42500 ns.
+
+diff --git a/bsd/dev/spes_vib.c b/bsd/dev/spes_vib.c
+index 406a30d..ad1cb20 100644
+--- a/bsd/dev/spes_vib.c
++++ b/bsd/dev/spes_vib.c
+@@ -17,8 +17,39 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_spmi_init(void);
++extern int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ void spes_vib_init(void);
+ 
++/*
++ * 0180, spesvib=2: read the PM6125 LPG (SPMI SID 1, 0xb300-0xb347) and log it; nothing is written
++ * and GPIO 36 is not touched. Registers (Linux pwm-qti-lpg.c, relative to 0xb300): 0x04/0x05
++ * TYPE/SUBTYPE, 0x41 PWM_SIZE_CLK, 0x42 FREQ_PREDIV_CLK, 0x43 TYPE_CONFIG, 0x44/0x45 VALUE_LSB/MSB,
++ * 0x46 ENABLE_CONTROL, 0x47 PWM_SYNC. Linux set 50000 ns / 42500 ns for the motor (OrangeFox log).
++ */
++static void
++spes_vib_lpg_dump(void)
++{
++	if (sweet_spmi_init() != 0) {
++		printf("SPES VIB: SPMI not available; LPG not read\n");
++		return;
++	}
++	uint8_t r[0x48];
++	for (unsigned i = 0; i < sizeof(r); i++) {
++		if (sweet_spmi_read(1, 0xb300u + i, &r[i]) != 0) {
++			printf("SPES VIB: LPG read failed at %#x\n", 0xb300u + i);
++			return;
++		}
++	}
++	printf("SPES VIB: LPG type %#x subtype %#x (0xb304/0xb305)\n", r[0x04], r[0x05]);
++	for (unsigned row = 0; row < sizeof(r); row += 8) {
++		printf("SPES VIB: LPG %#06x: %02x %02x %02x %02x %02x %02x %02x %02x\n", 0xb300u + row,
++		    r[row], r[row + 1], r[row + 2], r[row + 3], r[row + 4], r[row + 5], r[row + 6], r[row + 7]);
++	}
++	printf("SPES VIB: LPG size_clk %#x prediv %#x type_cfg %#x value %#x enable %#x sync %#x\n",
++	    r[0x41], r[0x42], r[0x43], r[0x44] | (r[0x45] << 8), r[0x46], r[0x47]);
++}
++
+ #define VIB_EAST_PA     0x00d00000u     /* TLMM 0x400000 + EAST tile */
+ #define VIB_PIN         36u
+ #define VIB_CFG         (VIB_PIN * 0x1000u)
+@@ -37,7 +68,14 @@ void
+ spes_vib_init(void)
+ {
+ 	int on = 0;
+-	if (!PE_parse_boot_argn("spesvib", &on, sizeof(on)) || on != 1) {
++	if (!PE_parse_boot_argn("spesvib", &on, sizeof(on))) {
++		return;
++	}
++	if (on == 2) {
++		spes_vib_lpg_dump();       /* 0180: read only, GPIO 36 untouched */
++		return;
++	}
++	if (on != 1) {
+ 		return;
+ 	}
+ 	vm_offset_t east = ml_io_map(VIB_EAST_PA, VIB_CFG + 0x1000u);
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..f0a4677 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -10,6 +10,7 @@
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
++#include <pexpert/device_tree.h>
+ #include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -17,6 +18,14 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ #define SP_CORE_PA 0x0c440000u
+ #define SP_OBS_PA  0x0e600000u
+ #define SP_CFG_PA  0x0c40a000u
++/*
++ * 0180: SM6225 (spes/spesn, /spes-platform in the ADT): the arbiter is elsewhere. Live DT
++ * qcom,spmi@1c40000 reg-names core 0x1c40000, obsrvr 0x3e00000, cnfg 0x1c0a000 (the same
++ * addresses bsd/dev/sweet_keys.c uses for khaje). Still observer reads only.
++ */
++#define SP_KHAJE_CORE_PA 0x01c40000u
++#define SP_KHAJE_OBS_PA  0x03e00000u
++#define SP_KHAJE_CFG_PA  0x01c0a000u
+ #define SP_NO_APID 0xffffu
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+@@ -62,9 +71,11 @@ sweet_spmi_init(void)
+ 	if (!sp_lock) {
+ 		return -1;
+ 	}
+-	sp_core = ml_io_map(SP_CORE_PA, 0x2000);
+-	sp_cfg = ml_io_map(SP_CFG_PA, 0x1000);
+-	sp_obs = ml_io_map(SP_OBS_PA, 0x10000); /* EE 0, 512 * 0x80 */
++	DTEntry platform;
++	bool khaje = SecureDTLookupEntry(NULL, "/spes-platform", &platform) == kSuccess;
++	sp_core = ml_io_map(khaje ? SP_KHAJE_CORE_PA : SP_CORE_PA, 0x2000);
++	sp_cfg = ml_io_map(khaje ? SP_KHAJE_CFG_PA : SP_CFG_PA, 0x1000);
++	sp_obs = ml_io_map(khaje ? SP_KHAJE_OBS_PA : SP_OBS_PA, 0x10000); /* EE 0, 512 * 0x80 */
+ 	if (!sp_core || !sp_cfg || !sp_obs) {
+ 		printf("SWEET BATTERY: SPMI mapping failed\n");
+ 		return -1;
+@@ -88,9 +99,10 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	bool battery = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
++	    peripheral == 0x13 || peripheral == 0x48);
++	bool lpg = sid == 1 && peripheral == 0xb3 && (addr & 0xffu) <= 0x47u;   /* 0180: PM6125 LPG, spesvib=2 */
++	if (!sp_ready || !out || addr > 0xffffu || (!battery && !lpg)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);

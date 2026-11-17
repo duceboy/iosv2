@@ -1,0 +1,57 @@
+spes battery (0179): SM5602 arithmetic exactly as Linux; one read-only bq2589x register dump.
+
+With spesbattery=1 on an SM5602 board: voltage (raw*94)>>10 + 2700 and current
+((raw*10000+2048)>>12)/5 (5 mOhm, live DT sm,rsns=<0>) as Xiaomi's sm5602_fuelgauge.c; 0173 rounded the
+current to even mA. Checked with the spesn phone's Linux values (raw 0x49ed/0x8011 -> 4437 mV/-8 mA).
+At start the bq2589x/SYV690 registers 0x00-0x14 are logged once through spes_i2c1_read (0x0C, the
+fault register, is cleared by that read; the log says so). Nothing is written.
+
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 2aa1da6..f98b81c 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -314,8 +314,14 @@ SweetBattery::pollSpesSm(void)
+ 	}
+ 	bool chgOk = spes_i2c1_read(0x6a, 0x0b, &st, 1) == 0;
+ 	unsigned percent = (soc & 0x8000u) ? 0 : ((soc >> 8) & 0x7fu);
+-	unsigned mv = 1800u * (volt & 0x7fffu) / 19622u + 2700u;
+-	int ma = (int)((cur & 0x7fffu) * 1000u / 4088u * 2u);
++	/*
++	 * 0179: exactly as Xiaomi's sm5602_fuelgauge.c (lineage-24.0) fg_read_volt / fg_read_current,
++	 * with sense resistor 5 mOhm (live DT sm,rsns = <0>). Checked against Linux on the spesn
++	 * phone (OrangeFox, 2026-11-17): raw 0x8011 -> -8 mA, as Linux; bit 15 set = discharging.
++	 */
++	int scaled = (int)(((volt & 0x7fffu) * 94u) >> 10);
++	unsigned mv = (unsigned)(((volt & 0x8000u) ? -scaled : scaled) + 2700);
++	int ma = (int)((((cur & 0x7fffu) * 10000u) + 2048u) >> 12) / 5;
+ 	if (cur & 0x8000u) {
+ 		ma = -ma;
+ 	}
+@@ -416,6 +422,27 @@ SweetBattery::start(IOService *provider)
+ 		} else if (spesWord(0x71, 0x05, &probe)) {
+ 			fSpes = 2;
+ 			IOLog("SPES BATTERY: SM5602 gauge answers at 0x71\n");
++			/*
++			 * 0179: the charger's registers once, read only, for comparison with Linux
++			 * (bericht-android-ref). REG 0x0C (faults) clears on read: its value here is
++			 * what latched since the last read by anyone (ABL), and this read clears it.
++			 */
++			uint8_t r[0x15];
++			bool all = true;
++			for (unsigned i = 0; i < sizeof(r); i++) {
++				if (spes_i2c1_read(0x6a, (uint8_t)i, &r[i], 1) != 0) {
++					all = false;
++					break;
++				}
++			}
++			if (all) {
++				IOLog("SPES BATTERY: bq2589x 0x6a 00-0a %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++				    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10]);
++				IOLog("SPES BATTERY: bq2589x 0x6a 0b-14 %02x %02x(0c, cleared by this read) %02x %02x %02x %02x %02x %02x %02x %02x\n",
++				    r[11], r[12], r[13], r[14], r[15], r[16], r[17], r[18], r[19], r[20]);
++			} else {
++				IOLog("SPES BATTERY: bq2589x 0x6a not readable\n");
++			}
+ 		} else {
+ 			IOLog("SPES BATTERY: no gauge at 0x36 or 0x71; static fallback\n");
+ 		}
