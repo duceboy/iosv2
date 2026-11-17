@@ -1,3 +1,31 @@
+# spesn 4 GB handset: 0173–0176, first storage diagnostic boots, 2026-11-17
+
+Different handset and user from everything below (duceboy fork, branch `spesn-4gb`). Read
+`docs/SPESN-4GB-MEMORY.md` first.
+
+- Handset: Redmi Note 11 2201117TG, but ABL/DT say **spesn** (`androidboot.hwname=spesn`, SKU k7tn,
+  board-id 0x30022, st21nfc at I2C2 0x08). Battery chips: SM5602 @0x71, bq2589x-compatible SYV690 @0x6a,
+  sc8551 @0x66 (no max77729). **4 GB** RAM. Bootloader unlocked, active slot b, Evolution X 16.
+  Panel `k7_38_0c_0a` (same as the author's), USB `dwc3@4e00000`.
+- Commits: c525f2c 0173 (battery gauge, read-only, spesbattery=1), 5891f29 0174 (opt-in
+  `--memory-floor`/`SPES_MEMORY_FLOOR`; SpesModem pool leaves kernel RAM), 49f69d7 0175 (amp probe
+  labels), ce46f3c 0176 (USB step 1 read-only probe, spesusb=1; not built yet, local).
+- CI run 43996868056 (0173–0175) success; kernel `xnu/out-spesn-4gb/kernel.development.sweet`
+  SHA256 10d4cd0c9b3c22add19c41950cf53d87bcc60f6aaa380ab781f1efe29e258529.
+- **Boot 1 (observed, photos of all but the first screen):** `shim/out/spes-storage-probe.img`
+  (SHA256 f4b24664…7c32), default layout phys 0x100000000 + 1 GiB, `spesufsprobe=1 sweetlog=0`.
+  XNU boots on spesn: 1/1 CPU (mpidr 0x100), MDP direct scanout at 0x5c000000, panel 60 Hz,
+  `SPES UFS PROBE: result=0`, `SWEET UFS: "userdata" on LUN 0: first block 0x2b4c28, 104715 MiB,
+  read-only, DMA at 0x103430000` (author's phone: 0x2B8C00), md0 root, `*** SWEET userspace: init
+  running as PID 1 ***`, AMFI/sandbox stand-ins load. Battery: static fallback (spesbattery off).
+  The first screen (shim PHYS line) was not captured; the DMA address confirms RAM above 4 GiB.
+- Built, not booted yet: `shim/out/spes-storage-probe-floor0xa0000000.img` (SHA256 892f531f…843e,
+  phys 0xa0000000 + 2.5 GiB). Each `fastboot boot` is confirmed by the user individually.
+- Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
+  PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
+  `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
+  (`modem_part=modem_b`), `spesbattery=1`, vibration. userdata only after the user's go.
+
 # 0170–0172 upstream HackiOS adaptations; new boot images, 2026-11-15
 
 - Reviewed all five requested repositories (`JopangJovan/hackios-xnu-kernel-umi`,
