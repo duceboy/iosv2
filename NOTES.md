@@ -165,6 +165,18 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   SWEET_EXTRA_ARGS="modem=1 wifi=1 modem_part=modem_b spesbattery=1" tools/build-spes-ios-graphics.sh` ->
   spesgpu=1 spesgpuprobe=1 spesgpu_mhz=300 glsync=1 sweetkeys=1 sweetfb_hz=60, wlan_mac from the serial (kept local,
   never written here).
+- **Graphics boot 1 (2026-11-17 06:13, `spes-ios-graphics-1.img`, EAGL root delta):** user: Apple logo, brief
+  black, Apple logo, **home screen within ~15 s**; Settings and Photos open; Wi-Fi networks listed; frequent
+  graphics glitches when opening apps, e.g. Wi-Fi settings reached from Control Center. Log
+  `research/logs/gfx1.txt` (1415491 B, flush #60): backboardd draws through redwood-gl/Mesa on the A610
+  (>10000 frames, "drawn in place", 0 textures refilled), RedwoodGPU ~100 submissions/5 s, GPU 299 MHz measured,
+  no GPU fault after the probe. Crashes: syncdefaultsd x14, driverkitd. Battery temp_in 34 C.
+  **Wi-Fi join (first time in this project): the user joined a WPA2 hotspot from Settings (password accepted);
+  `join: auth reply status 0`, `assoc reply status 0`, 4-way handshake, `WPA2 keys installed`, `joined`,
+  `net: the link (wcn3988) is up`, `SPES WIFI: join -> 0`. But iOS kept spinning "connecting": `net: so far 0
+  frames sent, 45-50 received; dropped 0/0` -> en0 receives, nothing is ever transmitted (no DHCP DISCOVER).**
+  Likely wifid/configd never consider the association complete (apple80211 state/event after join), so
+  IPConfiguration does not start; to investigate (SSID/MACs deliberately not recorded here).
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
