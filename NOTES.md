@@ -184,6 +184,14 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   made en3. User set `sudo networksetup -setmanual "Sweet iOS (USB Ethernet)" 192.168.7.1 255.255.255.0`.
   `ping 192.168.7.2`: 3/3, ~4 ms. UDP live log to 192.168.7.1:5140 arrives (host: ~/ios-spes/tools-local/
   spes-live.py). No SoC reset: the SMMU stream for 0x120 works. PHY untouched.
+- **MILESTONE 2026-11-17 07:53: key-free return to fastboot from XNU (0184-0186).** 0184 USB command server
+  (UDP 5141 ping/sync/reboot/fastboot, USB link only): IMEM restart_reason 0x77665500 + PSCI SYSTEM_RESET alone
+  -> normal boot (Mi-logo loop with the iOS userdata): Xiaomi's ABL ignores the IMEM cookie. 0185 read-only run:
+  PM6125 PON rev 0x1 type 0x1 subtype 0x4 (gen2 primary), SOFT_RB_SPARE 0x88F = 0x00. 0186 (CI 44032494804,
+  c84e70a3...): allow-listed SPMI write (SID 0, 0x88F, 1 byte, host-tested; ownership EE 0; arbiter v5 RW channel
+  chnls 0x1e00000 + 0x10000*apid) used by "fastboot": `SPES PON: SOFT_RB_SPARE 0 -> 0x4 (bootloader), read back
+  OK`, IMEM cookie, PSCI reset -> **fastboot 8 s later**. Slots after every fastboot stay b / retry 6 / not
+  unbootable (`bericht/fastboot-slots.log`). Live log still loses the boot backlog (sock_send succeeds before ARP).
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
