@@ -5512,3 +5512,13 @@ Fastboot-Rückweg: 0205 synct (Log „sync done“), Telefon setzte zurück, Fas
 Modem und ADSP vor dem Reset + Countdown `spesautofb=N` (Idee des Nutzers: iOS nie endlos laufen lassen). **0208**
 /dev/spes-screen + tools-local/spes-screen.py (Bildschirmabbild per SSH, Idee des Nutzers). wifip2pd (131 Neustarts je Boot)
 soll aus launchd.plist (beim nächsten erreichbaren Boot). CI 44187398152.
+
+### 2026-11-17 23:25 – Haptik Ende-zu-Ende, Video-Absturz-Ursache (0209)
+
+- **Haptik:** userland/happrobe (AudioServicesPlaySystemSound 4095/1519/1520/1521, eigener Code) auf all-5 →
+  „SPES HAPTIC: on“ ×6 mit vielen lauten Schreibvorgängen: iOS → RedwoodAudio „Actuator“ → /dev/redwood-haptic → Motor.
+  Voraussetzung war der neu erzeugte MobileGestalt-Cache (DeviceSupportsClosedLoopHaptics = true durch /product/haptics).
+- **Video:** userland/vtprobe (AVAssetReader → 420v) + 720p-Testclip reproduziert den mediaserverd-SIGBUS in H264SW.
+  IOSurface-Client-Layout aus der Disassemblierung (IOSurfaceClientGet*OfPlane, 20H392): Ebene i im Lock-Ergebnis bei
+  0x68+i*0x80, bytesPerRow bei +0x10 (wir hatten +0x08 → 0). **0209** setzt +0x10. CI 44188142821 (mit 0207/0208).
+- Kein Neustart ohne Nutzer: der laufende all-5-Kernel hat den DSP-Shutdown vor dem Reset (0207) noch nicht.
