@@ -1,0 +1,273 @@
+spes vibration: allow-listed LPG write path, spesvib=3 (PWM + read back) and spesvib=4 (one buzz) (0192).
+
+User approval (2026-11-17): PMIC SPMI SID 1, 0xb340-0xb347 only, one byte at a time, read run first,
+then one 100 ms buzz. bsd/dev/spes_lpg.h (host-tested, tests/test_spes_lpg.py) holds the allow-list,
+Linux's masked write and the register values; sweet_spmi_write() accepts the PON register (0185) or
+this range, nothing else.
+
+Values from Linux drivers/pwm/pwm-qti-lpg.c (xiaomi-spes-devs lineage-24.0) for the motor's PWM in the
+OrangeFox log (50000 ns period, 42500 ns duty) on this LPG (type 0x13, subtype 0x0b = SUBTYPE_PWM):
+19.2 MHz, prediv 1, exponent 1, 9 bit (53248 ns), value 435. 0xb341 already holds 0x07 after the ABL.
+Sequence as Linux set_pwm_config + enable: SIZE_CLK, PREDIV_CLK, VALUE_MSB/LSB (masked where Linux
+masks), PWM_SYNC, glitch removal, ENABLE_CONTROL = output | PWM-value source; every byte read back.
+spesvib=4 then raises GPIO 36 for spesvibms (default 100, clamped to 1..100 ms). Afterwards the output
+goes off and 0xb341-0xb346 are restored to the values read before; the log says whether they match.
+The driver refuses to write if the LPG is not type 0x13 / subtype 0x0b. spesvib=1 (GPIO only) and 2
+(read only) are unchanged; the GPIO pulse is now a shared helper.
+
+diff --git a/bsd/dev/spes_lpg.h b/bsd/dev/spes_lpg.h
+new file mode 100644
+index 0000000..48fa461
+--- /dev/null
++++ b/bsd/dev/spes_lpg.h
+@@ -0,0 +1,63 @@
++/*
++ * PM6125 LPG (vibration motor PWM) write allow-list and register values for spes, free of kernel
++ * headers so tests/test_spes_lpg.py compiles this very file on the host (0192).
++ *
++ * The user allowed (2026-11-17): SPMI SID 1, 0xb340-0xb347, one byte at a time, after a read run.
++ * Live FDT: lpg at pm6125 SID 1, base 0xb300, subtype 0x0b (SUBTYPE_PWM, read on this phone).
++ * Register map and arithmetic: Linux drivers/pwm/pwm-qti-lpg.c (xiaomi-spes-devs lineage-24.0).
++ * The motor's PWM from the OrangeFox log: period 50000 ns, duty 42500 ns. Linux's search for that
++ * period picks 19.2 MHz, prediv 1, exponent 4 at 6 bit, then trades 3 exponent steps for 9 bit:
++ * size 9, exponent 1 (period 512 * 2 * 52 ns = 53248 ns), value 42500 * 512 / 50000 = 435 = 0x1b3.
++ */
++#ifndef SPES_LPG_H
++#define SPES_LPG_H
++
++#define SPES_LPG_SID            1u
++#define SPES_LPG_BASE           0xb300u
++#define SPES_LPG_FIRST          0xb340u     /* PATTERN_CONFIG (never written here) */
++#define SPES_LPG_LAST           0xb347u     /* PWM_SYNC */
++
++#define SPES_LPG_SIZE_CLK       0xb341u     /* bit 2 size (SUBTYPE_PWM: 0 = 6 bit, 1 = 9 bit), 1:0 clock */
++#define SPES_LPG_PREDIV_CLK     0xb342u     /* 6:5 prediv index, 2:0 exponent */
++#define SPES_LPG_TYPE_CONFIG    0xb343u     /* bit 5 glitch removal */
++#define SPES_LPG_VALUE_LSB      0xb344u
++#define SPES_LPG_VALUE_MSB      0xb345u     /* bit 0 */
++#define SPES_LPG_ENABLE         0xb346u     /* bit 7 output, bit 2 source (1 = PWM value), bit 1 ramp */
++#define SPES_LPG_SYNC           0xb347u     /* bit 0 value sync */
++
++/* (register, mask, value) for 9 bit, 19.2 MHz, prediv 1, exponent 1, value 435 */
++#define SPES_LPG_SIZE_CLK_MASK  0x07u
++#define SPES_LPG_SIZE_CLK_VAL   0x07u       /* (1 << 2) | (index of 19.2 MHz + 1 = 3) */
++#define SPES_LPG_PREDIV_MASK    0x67u
++#define SPES_LPG_PREDIV_VAL     0x01u
++#define SPES_LPG_MSB_MASK       0x01u
++#define SPES_LPG_VALUE          435u
++#define SPES_LPG_GLITCH_BIT     0x20u
++#define SPES_LPG_ENABLE_MASK    0x86u
++#define SPES_LPG_ENABLE_ON      0x84u       /* output on, source = PWM value, no ramp */
++#define SPES_LPG_ENABLE_OFF     0x04u       /* output off, source = PWM value (Linux disable) */
++
++#define SPES_VIB_MAX_MS         100u        /* longest buzz this driver allows */
++
++/* true only for SID 1, 0xb340-0xb347, exactly one byte. */
++static inline bool
++spes_lpg_write_allowed(uint32_t sid, uint32_t addr, uint32_t len)
++{
++	return sid == SPES_LPG_SID && addr >= SPES_LPG_FIRST && addr <= SPES_LPG_LAST && len == 1;
++}
++
++/* Linux qpnp_lpg_masked_write: keep the bits outside the mask. */
++static inline uint8_t
++spes_lpg_masked(uint8_t old, uint8_t mask, uint8_t val)
++{
++	return (uint8_t)((old & (uint8_t)~mask) | (val & mask));
++}
++
++/* A requested buzz length clamped to 1..SPES_VIB_MAX_MS. */
++static inline uint32_t
++spes_vib_clamp_ms(uint32_t ms)
++{
++	return ms == 0 ? 1u : (ms > SPES_VIB_MAX_MS ? SPES_VIB_MAX_MS : ms);
++}
++
++#endif /* SPES_LPG_H */
+diff --git a/bsd/dev/spes_vib.c b/bsd/dev/spes_vib.c
+index ad1cb20..52d89a7 100644
+--- a/bsd/dev/spes_vib.c
++++ b/bsd/dev/spes_vib.c
+@@ -19,6 +19,8 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int sweet_spmi_init(void);
+ extern int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);   /* sweet_spmi.c, 0186 */
++#include "spes_lpg.h"                                                     /* 0192 */
+ void spes_vib_init(void);
+ 
+ /*
+@@ -64,20 +66,10 @@ vib_wr(vm_offset_t b, uint32_t o, uint32_t v)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
+-void
+-spes_vib_init(void)
++/* Raise the motor enable (GPIO 36) for ms milliseconds and restore the pin (0114, now shared). */
++static void
++vib_gpio_pulse(uint32_t ms)
+ {
+-	int on = 0;
+-	if (!PE_parse_boot_argn("spesvib", &on, sizeof(on))) {
+-		return;
+-	}
+-	if (on == 2) {
+-		spes_vib_lpg_dump();       /* 0180: read only, GPIO 36 untouched */
+-		return;
+-	}
+-	if (on != 1) {
+-		return;
+-	}
+ 	vm_offset_t east = ml_io_map(VIB_EAST_PA, VIB_CFG + 0x1000u);
+ 	if (east == 0) {
+ 		printf("SPES VIB: no TLMM mapping\n");
+@@ -91,11 +83,126 @@ spes_vib_init(void)
+ 		out |= 1u << 12;                            /* EGPIO enable when present (khaje) */
+ 	}
+ 	vib_wr(east, VIB_CFG, out);
+-	printf("SPES VIB: enable high (cfg %#x io %#x) for 300 ms\n", vib_rd(east, VIB_CFG), vib_rd(east, VIB_IO));
+-	delay(300 * 1000);
++	printf("SPES VIB: enable high (cfg %#x io %#x) for %u ms\n", vib_rd(east, VIB_CFG), vib_rd(east, VIB_IO), ms);
++	delay(ms * 1000);
+ 	vib_wr(east, VIB_IO, vib_rd(east, VIB_IO) & ~2u);
+ 	vib_wr(east, VIB_CFG, cfg);
+ 	vib_wr(east, VIB_IO, io);
+ 	printf("SPES VIB: enable low, pin restored (cfg %#x io %#x)\n", vib_rd(east, VIB_CFG), vib_rd(east, VIB_IO));
+ }
++
++/*
++ * 0192, spesvib=3: program the LPG like Linux (pwm-qti-lpg.c set_pwm_config + enable) and read every
++ * register back, GPIO 36 untouched; spesvib=4: the same, plus GPIO 36 for spesvibms (default 100,
++ * at most SPES_VIB_MAX_MS) = one buzz. Afterwards the output goes off and every register is put
++ * back to the value read before. Only SID 1, 0xb341-0xb347 are written (spes_lpg.h allow-list,
++ * enforced again in sweet_spmi_write). Any failed write or read-back stops and restores.
++ */
++static int
++lpg_put(unsigned addr, uint8_t v, bool verify)
++{
++	uint8_t back = 0;
++	if (sweet_spmi_write(SPES_LPG_SID, addr, v) != 0) {
++		printf("SPES VIB: write %#x = %#04x failed\n", addr, v);
++		return -1;
++	}
++	if (verify && (sweet_spmi_read(SPES_LPG_SID, addr, &back) != 0 || back != v)) {
++		printf("SPES VIB: write %#x = %#04x, read back %#04x\n", addr, v, back);
++		return -1;
++	}
++	return 0;
++}
++
++static int
++lpg_masked(unsigned addr, uint8_t mask, uint8_t val)
++{
++	uint8_t old = 0;
++	if (sweet_spmi_read(SPES_LPG_SID, addr, &old) != 0) {
++		return -1;
++	}
++	return lpg_put(addr, spes_lpg_masked(old, mask, val), true);
++}
++
++static void
++lpg_log(const char *when)
++{
++	uint8_t r[8] = { 0 };
++	for (unsigned i = 0; i < 8; i++) {
++		(void)sweet_spmi_read(SPES_LPG_SID, SPES_LPG_FIRST + i, &r[i]);
++	}
++	printf("SPES VIB: LPG %s: 0xb340: %02x %02x %02x %02x %02x %02x %02x %02x\n", when,
++	    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
++}
++
++static void
++spes_vib_lpg_run(uint32_t buzz_ms)
++{
++	uint8_t type = 0, sub = 0, orig[8];
++	if (sweet_spmi_init() != 0 || sweet_spmi_read(SPES_LPG_SID, SPES_LPG_BASE + 4, &type) != 0 ||
++	    sweet_spmi_read(SPES_LPG_SID, SPES_LPG_BASE + 5, &sub) != 0) {
++		printf("SPES VIB: SPMI not available; nothing written\n");
++		return;
++	}
++	if (type != 0x13 || sub != 0x0b) {
++		printf("SPES VIB: LPG type %#x subtype %#x, expected 0x13/0x0b: nothing written\n", type, sub);
++		return;
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		if (sweet_spmi_read(SPES_LPG_SID, SPES_LPG_FIRST + i, &orig[i]) != 0) {
++			printf("SPES VIB: LPG read failed; nothing written\n");
++			return;
++		}
++	}
++	lpg_log("before");
++	int err = 0;
++	err = err ? err : lpg_masked(SPES_LPG_SIZE_CLK, SPES_LPG_SIZE_CLK_MASK, SPES_LPG_SIZE_CLK_VAL);
++	err = err ? err : lpg_masked(SPES_LPG_PREDIV_CLK, SPES_LPG_PREDIV_MASK, SPES_LPG_PREDIV_VAL);
++	err = err ? err : lpg_masked(SPES_LPG_VALUE_MSB, SPES_LPG_MSB_MASK, (uint8_t)(SPES_LPG_VALUE >> 8));
++	err = err ? err : lpg_put(SPES_LPG_VALUE_LSB, (uint8_t)(SPES_LPG_VALUE & 0xff), true);
++	err = err ? err : lpg_put(SPES_LPG_SYNC, 0x01, false);       /* self-clearing strobe */
++	err = err ? err : lpg_masked(SPES_LPG_TYPE_CONFIG, SPES_LPG_GLITCH_BIT, SPES_LPG_GLITCH_BIT);
++	err = err ? err : lpg_masked(SPES_LPG_ENABLE, SPES_LPG_ENABLE_MASK, SPES_LPG_ENABLE_ON);
++	lpg_log(err ? "after a FAILED write" : "PWM on (9 bit, 19.2 MHz, value 435)");
++	if (!err && buzz_ms != 0) {
++		vib_gpio_pulse(spes_vib_clamp_ms(buzz_ms));
++	}
++	/* off, then every register back to what it was */
++	(void)lpg_masked(SPES_LPG_ENABLE, SPES_LPG_ENABLE_MASK, SPES_LPG_ENABLE_OFF);
++	(void)lpg_put(SPES_LPG_TYPE_CONFIG, orig[3], true);
++	(void)lpg_put(SPES_LPG_PREDIV_CLK, orig[2], true);
++	(void)lpg_put(SPES_LPG_SIZE_CLK, orig[1], true);
++	(void)lpg_put(SPES_LPG_VALUE_MSB, orig[5], true);
++	(void)lpg_put(SPES_LPG_VALUE_LSB, orig[4], true);
++	(void)lpg_put(SPES_LPG_SYNC, 0x01, false);
++	(void)lpg_put(SPES_LPG_ENABLE, orig[6], true);
++	bool same = true;
++	for (unsigned i = 1; i < 7; i++) {
++		uint8_t v = 0;
++		same = same && sweet_spmi_read(SPES_LPG_SID, SPES_LPG_FIRST + i, &v) == 0 && v == orig[i];
++	}
++	lpg_log(same ? "restored (0xb341-0xb346 = before)" : "NOT fully restored");
++}
++
++void
++spes_vib_init(void)
++{
++	int on = 0;
++	if (!PE_parse_boot_argn("spesvib", &on, sizeof(on))) {
++		return;
++	}
++	if (on == 2) {
++		spes_vib_lpg_dump();       /* 0180: read only, GPIO 36 untouched */
++		return;
++	}
++	if (on == 3 || on == 4) {
++		uint32_t ms = 100;
++		(void)PE_parse_boot_argn("spesvibms", &ms, sizeof(ms));
++		spes_vib_lpg_run(on == 4 ? ms : 0);       /* 0192: LPG write path (allow-listed) */
++		return;
++	}
++	if (on != 1) {
++		return;
++	}
++	vib_gpio_pulse(300);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 86385d0..d6d3eb2 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -13,6 +13,7 @@
+ #include <pexpert/device_tree.h>
+ #include "sweet_spmi.h"
+ #include "spes_spmi_allow.h"
++#include "spes_lpg.h"                  /* 0192 */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+@@ -156,7 +157,7 @@ int
+ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value)
+ {
+ 	DTEntry platform;
+-	if (!spes_spmi_write_allowed(sid, addr, 1)) {
++	if (!spes_spmi_write_allowed(sid, addr, 1) && !spes_lpg_write_allowed(sid, addr, 1)) {   /* 0192: + LPG */
+ 		printf("SWEET SPMI: write sid=%u addr=%#x refused (not allow-listed)\n", sid, addr);
+ 		return -1;
+ 	}
