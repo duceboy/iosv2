@@ -5440,3 +5440,22 @@ lokal). Kernel: 223 Kexts, 2357 Klassen, 830 Personalities, 250 Befehlstabellen/
 (Pfade im Xiaomi-Kernel geprüft), Stand im Port, Vorlagen → docs/IOS-LUECKEN.md (erzeugt, nur Zahlen/eigene Texte).
 Lehren: Kexts teils -O0 gebaut (Metaclass-Konstruktor über x0-Wrapper), Funktionsgrenzen nur über BL-Ziele/Vtables sicher;
 unifiedlog_iterator schreibt bei großem Archiv >36 GB JSON → künftig gefiltert. Teil D (anderes IPSW) noch offen.
+
+### 2026-11-17 ~20:15 – Metal-Weg gebaut und auf spesn bestätigt; Dauer-CPU-Last entfernt; Haptik 0199
+
+- **Metal (Auftrag Stufe 2):** Turnip (Mesa 25.0.7, tools/build-spes-turnip-macos.sh; HackiOS-Userland 906425b statt der
+  upstream verschwundenen b4c5513, gleiche tools/mesa-Patches; glslang aus Homebrew) und NegroniMetal + metal2vulkan 720ef1ce
+  (tools/build-spes-metal-macos.sh; iOSPlus10 c0a451f, ios-flame 745c434, Rust 1.98 per rustup) gebaut. Installiert mit
+  tools-local/spes-install-metal.sh (jede Datei zurückgelesen). Boot mtl-1 (ool-3-Kernel, spesmetal=1, 785 MHz, DDR-Vote):
+  **metalprobe PASS „Turnip Adreno (TM) 610“**, Takt gemessen 775 MHz, keine GPU-Fehler.
+  **Entscheidung:** backboardd (Oberfläche) bleibt auf GL: GL braucht 4–12 ms GPU je Abgabe, der Autor maß mit Metal-backboardd
+  ~49 ms/Bild (all45). clients = "* -backboardd" → alle Apps bekommen Metal (Dead-Man-Schalter des Plug-ins schützt).
+- **vmd** (Visual Voicemail) lief in jedem Boot im Kreis (CommCenter fehlt; „caught burning CPU“ 10×). vmd und bluetoothd aus
+  /System/Library/xpc/launchd.plist entfernt (Sicherung launchd.plist.before-disable auf dem Telefon, entfernte Einträge
+  lokal research/userland-ssh/launchd/removed-jobs-20261117.plist). fairplayd bewusst nicht angefasst (Apple-Dienst).
+- **0197** AKS-Protokoll nur erste 200 Aufrufe + Fehler; **0198** Touch: Leerlauf-Antwort 0xff ist „kein Kontakt“ (≈44 000
+  Scheinfehler je Boot ohne Berührung); **0199** /dev/redwood-haptic (spesvib=5): LPG wie Stufe 4 einmal an, Motor folgt
+  GPIO36 solange iOS auf „Actuator“ spielt, max. 1 s am Stück. HAL-Plug-in RedwoodAudio.driver (HackiOS audio_plugin.c, MIT)
+  gebaut und nach /System/Library/Audio/Plug-Ins/HAL installiert. CI 44155041553.
+- Mobilfunk-Daten: Live-DTB ipa-hw-ver 0x10 = IPA 4.2 (Linux ipa_data-v4.2 / SC7180); HackiOS-Datenweg ist für 4.11.
+- Touch-„verlorene Abheben“ waren Lücken im UDP-Live-Log, kein Treiberfehler.

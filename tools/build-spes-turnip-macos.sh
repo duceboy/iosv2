@@ -11,7 +11,10 @@ hack=$(cd "$1" && pwd); ip10=$(cd "$2" && pwd); sdk=$(cd "$3" && pwd)
 root=$(cd "$(dirname "$0")/.." && pwd)
 b="$root/research/turnip-build"; tar="$root/research/mesa-build/mesa-25.0.7.tar.xz"
 hc=b4c5513e2df93689895d21fd3b93b723a7bcfdd3; ic=c0a451f
-git -C "$hack" cat-file -e "$hc^{commit}"
+# HackiOS userland moved upstream (2573c4a); 906425b has the same tools/mesa patches as our GL build
+if git -C "$hack" cat-file -e "$hc^{commit}" 2>/dev/null; then hshow() { git -C "$hack" show "$hc:tools/mesa/$1.patch"; }; else
+  [[ $(git -C "$hack" rev-parse --short=7 HEAD) == 906425b ]] || { echo "HackiOS userland neither b4c5513 nor 906425b" >&2; exit 1; }
+  hshow() { cat "$hack/tools/mesa/$1.patch"; }; fi
 [[ $(git -C "$ip10" rev-parse --short=7 HEAD) == "$ic" ]] || { echo "iOSPlus10 not at $ic" >&2; exit 1; }
 printf '%s\n' "592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6  $tar" | shasum -a 256 -c - >/dev/null
 mkdir -p "$b"; src="$b/mesa-25.0.7"
@@ -19,7 +22,7 @@ if [[ ! -f "$src/.spes-turnip" ]]; then
   [[ ! -d "$src" ]] || { echo "partial tree $src: inspect, then remove it" >&2; exit 1; }
   tar -xJf "$tar" -C "$b"
   for p in freedreno-darwin ir3-round-default ir3-shift-split ir3-ssbo-subdword; do
-    git -C "$hack" show "$hc:tools/mesa/$p.patch" | patch -s --no-backup-if-mismatch -d "$src" -p1
+    hshow "$p" | patch -s --no-backup-if-mismatch -d "$src" -p1
   done
   mkdir -p "$src/src/redwood-drm"
   for f in xf86drm.h negroni_drm.c negroni_drm.h ngl_abi.h; do cp "$ip10/userland/negronigl/drm/$f" "$src/src/redwood-drm/"; done
