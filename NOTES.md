@@ -5459,3 +5459,14 @@ unifiedlog_iterator schreibt bei großem Archiv >36 GB JSON → künftig gefilte
   gebaut und nach /System/Library/Audio/Plug-Ins/HAL installiert. CI 44155041553.
 - Mobilfunk-Daten: Live-DTB ipa-hw-ver 0x10 = IPA 4.2 (Linux ipa_data-v4.2 / SC7180); HackiOS-Datenweg ist für 4.11.
 - Touch-„verlorene Abheben“ waren Lücken im UDP-Live-Log, kein Treiberfehler.
+
+### 2026-11-17 ~21:10 – Ton-Weg des Autors wieder eingeschaltet (Konfiguration), Haptik-Kernelweg bestätigt
+
+- Der iosv2-Autor hatte auf spes **Ton über den Lautsprecher** (all28–all33: ADSP APR → Codec-DMA → RX2 → WCD937x AUX →
+  aw87559; /dev/redwood-audio 0152; HAL-Plug-in; VirtualAudio zurück). Unsere Images schalteten das nie ein. Jetzt:
+  Boot-Args `adsp=1 spesamp=2 spescodec=4` ab dem nächsten Image; auf dem Telefon per SSH wie
+  tools/root-audio-hackios-layout.py: VirtualAudio.plugin HAL.disabled → HAL, alle Apple-HAL-Plug-ins außer RedwoodAudio
+  → /System/Library/Audio/Plug-Ins/HAL.disabled (Rückweg: umgekehrt verschieben).
+- hap-1 (CI 44158746082, Kernel 5c8cd386): /dev/redwood-haptic da; Testdaten per SSH → „SPES HAPTIC: on“. SpringBoard,
+  chronod, PosterBoard bekommen Metal (Turnip, Dead-Man-Strike jeweils gelöscht = erster Befehlspuffer fertig).
+- 0200 fragte nicht: Modem ist QRTR-Knoten 0, 0 galt als „nicht gesehen“ → **0201** (eigene Merker). CI 44163553017.
