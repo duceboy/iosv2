@@ -5534,3 +5534,13 @@ soll aus launchd.plist (beim nächsten erreichbaren Boot). CI 44187398152.
   research/userland-ssh/launchd/removed-jobs-20261117.plist (Rückweg: wieder einfügen).
 - CI 44188875852 = 0207–0210. Nächster Boot (wenn das Telefon ohne Hände nach Fastboot kann): `spesautofb=25`
   `modem_ipa_data=1 modem_ipa_readonly=1` + bisherige Args.
+
+### 2026-11-18 ~00:15 – Datenweg komplett als Entwurf: 0210 IPA, 0211 en1, 0212 QMI-Steuerung
+
+- 0207–0210 gebaut (CI 44190574292 success, nach Umbenennung mem_size/mem_offset → ipa_mem_*; BSD-sed kennt kein \b → perl).
+- **0211** bsd/dev/spes_cell.c: en1 (Ethernet-artig, lokale MAC, ARP/DHCP-Antworter), Testmodus `modem_cell=2 modem_cell_test=1`
+  ohne Modem; docs/SPES-CELL-DRAFT.md. Offene Frage: braucht en1 einen Dienst in preferences.plist (wie en0)?
+- **0212** SpesModem.cpp: IPA-QMI-Handshake + DPM/WDA/WDS-Session → spes_cell_set_session; docs/SPES-QMI-DATA-DRAFT.md
+  (Testplan 7 Läufe). Gate modem_ipa_data=1 ohne readonly.
+- Reihenfolge der Tests: (1) all-6: IPA readonly + en1-Testmodus (+ Countdown 0207), (2) IPA voll (Firmware, GSI), (3) QMI-Handshake,
+  (4) Session. Läufe brauchen Fastboot ohne Hände: erst ab einem Kernel mit 0207 sicher.
