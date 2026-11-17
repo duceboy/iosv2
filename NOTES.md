@@ -5384,3 +5384,16 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   icon briefly disappears (launch animation starts, then back on the home screen), then the next tap works. Feels
   like 20-30 fps, no stutter. Log: no app crash; spindump launched 2x and ReportMemoryException 2x (hang/memory
   reports), wifip2pd restarts 38x. Next: sample SpringBoard during a failed launch (sweetsample).
+
+## 2026-11-17 14:10 – iOS unified log readable; app-launch problem = failing CoreAnimation commits
+- `/var/db/diagnostics` + `/var/db/uuidtext` pulled over SSH (tar, 315 MB, 5 min), laid out as a .logarchive
+  (diagnostics/* + uuidtext/* + Info.plist OSArchiveVersion 4). macOS `log show` refuses it (partial
+  metadata); mandiant/macos-UnifiedLogs (user approved the new source) `unifiedlog_iterator -m log-archive`
+  reads it: 1.9 M entries for the current boot. Timestamps of this archive are not trustworthy in absolute
+  terms (scale looks off); ordering is fine.
+- App launches: SpringBoard launches the app, runningboardd starts it, scene "ready" ~1 s later; no crash,
+  no watchdog. But SpringBoard's CA commits to backboardd fail with MACH_SEND_INVALID_MEMORY
+  ("(ipc/send) invalid memory"), backboardd logs serialization errors and decode_object ptr = NULL. The
+  app's layers never show, the user swipes home and taps again. -> 0194 (diagnostic, CI 44088589821) logs
+  OOL copyin failures with the covering map entries.
+- Gap list of IOKit services iOS asks for: docs/IOS-LUECKEN.md.
