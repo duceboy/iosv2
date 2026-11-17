@@ -5478,3 +5478,15 @@ spescodec=4`, 785 MHz): SpesAudio: ADSP + APR (9 Dienste), LPASS-Vote, SoundWire
 ASM-Stream offen; **„stream: playing at -12 dB“ bei t=18.8 s** (iOS spielt über RedwoodAudio → /dev/redwood-audio). Hörprobe
 durch den Nutzer offen. /dev/redwood-haptic vorhanden. NAS/UIM (0201): **beide Slots „card absent“**, Signal -128 dBm,
 Serving System Fehler 74 → SIM steckt nicht oder der Slot muss erst eingeschaltet werden (HackiOS: Provisioning/Slot-Wahl). Nutzer fragen.
+
+### 2026-11-17 ~21:50 – all-2: Modem online, GSM-Empfang, SIM in Slot 2; Haptik noch stumm
+
+- all-2 (0202, `modem_online=1`): DMS Set Operating Mode online angenommen (vorher Modus 5); NAS: „searching“, GSM -63 dBm.
+  UIM: Slot 1 „card error“, **Slot 2 Karte vorhanden, USIM „detected“**, primary GW keine (0xffff). 0202 provisionierte nur
+  Slot 1 → **0203**: erste vorhandene SIM/USIM (ready/detected) in beliebigem Slot wird primäre GW-Anwendung. CI 44170370757.
+- Nutzer: Ton OK (Lautstärketasten, Klingelton), **Haptik nein** trotz /product/haptics closed-loop im ADT (mkadt kopiert jetzt
+  die /product-Unterknoten). Vermutung: veralteter MobileGestalt-Cache → gelöscht (Sicherung
+  …/com.apple.MobileGestalt.plist.before-haptics auf dem Telefon), wird beim nächsten Start neu erzeugt.
+- Mobilfunk-Menü fehlt: CommCenter läuft nicht (kein Apple-Baseband) – erwartet, siehe docs/OFFENE-TREIBER.md.
+- all-1-Ende war kein Absturz: Fastboot-Befehl kam an, Fastboot erschien nicht binnen 90 s (Skript jetzt 180 s).
+  0198 wirkt: Touch errors=0, idle-ff 2264.
