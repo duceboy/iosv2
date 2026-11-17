@@ -5470,3 +5470,11 @@ unifiedlog_iterator schreibt bei großem Archiv >36 GB JSON → künftig gefilte
 - hap-1 (CI 44158746082, Kernel 5c8cd386): /dev/redwood-haptic da; Testdaten per SSH → „SPES HAPTIC: on“. SpringBoard,
   chronod, PosterBoard bekommen Metal (Turnip, Dead-Man-Strike jeweils gelöscht = erster Befehlspuffer fertig).
 - 0200 fragte nicht: Modem ist QRTR-Knoten 0, 0 galt als „nicht gesehen“ → **0201** (eigene Merker). CI 44163553017.
+
+### 2026-11-17 21:10 – all-1: Ton-Kette läuft auf spesn, Haptik-Gerät da, SIM „absent“
+
+all-1 (CI 44163553017, Kernel dde2ba40, Image 94c6fa1d; `spesvib=5 spesmetal=1 spesddr_khz=2133000 modem_nas=1 adsp=1 spesamp=2
+spescodec=4`, 785 MHz): SpesAudio: ADSP + APR (9 Dienste), LPASS-Vote, SoundWire-Slaves rx/va, Port 0xb032 (Codec-DMA 48 kHz),
+ASM-Stream offen; **„stream: playing at -12 dB“ bei t=18.8 s** (iOS spielt über RedwoodAudio → /dev/redwood-audio). Hörprobe
+durch den Nutzer offen. /dev/redwood-haptic vorhanden. NAS/UIM (0201): **beide Slots „card absent“**, Signal -128 dBm,
+Serving System Fehler 74 → SIM steckt nicht oder der Slot muss erst eingeschaltet werden (HackiOS: Provisioning/Slot-Wahl). Nutzer fragen.
