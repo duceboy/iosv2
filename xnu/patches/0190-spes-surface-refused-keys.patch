@@ -1,0 +1,43 @@
+spes graphics: refused IOSurface requests one key per line (0190, diagnostic only).
+
+0189 printed the whole dictionary in one IOLog line; the live log cut it after ~300 characters, right
+before the interesting keys. Each key is now its own short line: name, number width and value, or the
+class (and count/length) for arrays and data. No behaviour change.
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 9237805..fefc857 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1025,11 +1025,28 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		 */
+ 		static uint32_t failed_props;
+ 		if (ret != kIOReturnSuccess && failed_props < 8) {
+-			OSSerialize *fser = OSSerialize::withCapacity(1024);
++			/* 0190: one short line per key (whole dictionaries were cut after ~300 characters) */
+ 			failed_props++;
+-			IOLog("SWEET SURF: refused %s request #%u (0x%x): %.900s\n", name, failed_props, ret,
+-			    fser != NULL && props->serialize(fser) ? fser->text() : "(no text)");
+-			OSSafeReleaseNULL(fser);
++			IOLog("SWEET SURF: refused %s request #%u (0x%x), %u keys:\n", name, failed_props, ret,
++			    props->getCount());
++			OSCollectionIterator *it = OSCollectionIterator::withCollection(props);
++			OSSymbol *key;
++			while (it != NULL && (key = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++				OSObject *v = props->getObject(key);
++				OSNumber *n = OSDynamicCast(OSNumber, v);
++				OSArray *a = OSDynamicCast(OSArray, v);
++				OSData *d = OSDynamicCast(OSData, v);
++				if (n != NULL) {
++					IOLog("SWEET SURF:  #%u %s = number/%u 0x%llx\n", failed_props, key->getCStringNoCopy(),
++					    n->numberOfBits(), n->unsigned64BitValue());
++				} else {
++					IOLog("SWEET SURF:  #%u %s = %s%s%u\n", failed_props, key->getCStringNoCopy(),
++					    v != NULL ? v->getMetaClass()->getClassName() : "null",
++					    a != NULL ? " count " : (d != NULL ? " bytes " : " "),
++					    a != NULL ? a->getCount() : (d != NULL ? d->getLength() : 0));
++				}
++			}
++			OSSafeReleaseNULL(it);
+ 		}
+ 		static uint32_t web_props;
+ 		uint32_t asked = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
