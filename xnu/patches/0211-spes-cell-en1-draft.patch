@@ -1,0 +1,880 @@
+spes: en1, the interface for mobile data, draft (0211; modem_cell=1, test without modem: modem_cell=2 modem_cell_test=1).
+
+bsd/dev/spes_cell.c (draft, docs/SPES-CELL-DRAFT.md) after HackiOS hakios.cell.c: an Ethernet-looking en1 with a made-up
+locally administered MAC and router; ARP answered for every address but our own, a minimal DHCP server (OFFER/ACK with
+mask, router, DNS, lease, MTU) answered locally, so configd sets en1 up like a USB Ethernet adapter. TX: IPv4 without the
+Ethernet header to spes_ipa_tx (0210); RX via spes_ipa_rx_hook, wrapped and fed to ifnet_input. Session from the QMI side
+through spes_cell_set_session() (host order; not wired yet). Started from SpesModem's thread after spes_ipa_init();
+nothing without the boot-arg. modem_cell=2 modem_cell_test=1 gives a fake session to test configd/DHCP alone.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index dd7890a..e3ac8da 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/spes_sta.c		standard
+ bsd/dev/spes_vib.c		standard
+ bsd/dev/spes_screen.c		standard
+ bsd/dev/spes_ipa.c		standard
++bsd/dev/spes_cell.c		standard
+ bsd/dev/spes_cpufreq.c		standard
+ bsd/dev/spes_amp.c		standard
+ bsd/dev/spes_usb.c		standard
+diff --git a/bsd/dev/spes_cell.c b/bsd/dev/spes_cell.c
+new file mode 100644
+index 0000000..60bd31e
+--- /dev/null
++++ b/bsd/dev/spes_cell.c
+@@ -0,0 +1,788 @@
++/*
++ * spes (SM6225 "khaje") mobile data as a network interface: en1 on top of the IPA data path (spes_ipa.c).
++ * DRAFT - not built, not run. Nothing happens without boot-arg modem_cell=1.
++ *
++ * iOS's own cellular interface (pdp_ip0) is made by CommCenter and Apple's baseband stack, which this port
++ * does not have. What it does have is configd/IPConfiguration, which runs DHCP on an Ethernet interface
++ * whose link is up and routes through what it is given. So, as HackiOS drivers/modem/hakios.cell.c does on
++ * SM7325, the modem's raw IP packets are shown as Ethernet frames between two made-up stations: en1 and
++ * "the router". This file answers in the kernel what the stack asks of that router:
++ *   - ARP for any address except en1's own (everything is behind the router),
++ *   - DHCP DISCOVER -> OFFER, REQUEST -> ACK (or NAK) with the session's address, a /24 around it, the
++ *     router, the DNS servers, a lease time and the MTU.
++ * Every other IPv4 packet loses its Ethernet header and goes to the modem (spes_ipa_tx). Every IP packet
++ * from the modem (spes_ipa_rx_hook) gets an Ethernet header "from the router" and goes up (ifnet_input).
++ * IPv6 is not carried (the session is IPv4 only; IPv6 frames are dropped and counted).
++ *
++ * Why a /24 and a made-up router: a cellular session is point-to-point; the gateway WDS reports need not be
++ * in a subnet with the address (often it is a /30 or even outside), and DHCP cannot express that. Since
++ * every packet goes to the modem anyway, any router inside the /24 will do: .1, or .2 if .1 is ours.
++ * CHECK: a destination inside that /24 (other subscribers of the operator) is ARPed and answered by the
++ * router MAC as well, so it still reaches the modem. Nothing is lost, only the routing table looks odd.
++ *
++ * KPI usage follows this tree's working interfaces: bsd/dev/redwood_net.c (en0 for WLAN: ioctl/media/link
++ * events/bpf) and bsd/dev/sweet_usb.c (ue0: one mbuf with a 2 KiB cluster per received frame, because
++ * mbuf_allocpacket may return a first mbuf of length 0 and stripping the header from it panicked).
++ *
++ * Threading:
++ *   - cell_output() runs on whatever thread the stack transmits from (IFNET_INIT_LEGACY: the caller's
++ *     thread, never an interrupt). It takes cell_lock, and with it held calls spes_ipa_tx(), which takes
++ *     the IPA's tx_lock. Nothing takes them in the other order.
++ *   - cell_rx_hook() runs on the IPA poll thread, without the IPA's tx_lock (spes_ipa.c: "only this thread
++ *     consumes RX: no lock"). It must not block or sleep for long (the RX ring is refilled only after it
++ *     returns) and must copy (the data points into a DMA buffer). It takes no lock here: it reads cell_ifp
++ *     and cell_link_up, which are written once/rarely by the modem thread (word-sized, a stale value only
++ *     drops or passes one packet). It allocates with MBUF_DONTWAIT and drops on failure.
++ *   - ifnet_input() is safe from both: for a legacy interface DLIL queues the packet to its input thread
++ *     (dlil.c: net_async || IFXF_LEGACY -> dlil_input_async) and returns. Local ARP/DHCP replies are still
++ *     built under cell_lock and handed to ifnet_input() only after cell_lock is dropped.
++ *   - spes_cell_init()/spes_cell_set_session() run on the modem (QMI) thread; init may sleep.
++ *   - Counters are plain uint64 bumped from two threads without atomics: they are for the log only.
++ *
++ * Boot-args:  modem_cell=1 (create en1 once spes_ipa_ready()), modem_cell=2 (create en1 even without IPA:
++ *             TX is dropped; for testing configd/DHCP alone), modem_cell_test=1 (with modem_cell=2: a made-up
++ *             session in TEST-NET-1, 192.0.2.2/24, router 192.0.2.1), modem_cell_trace=N (log the first N
++ *             packets either way, without addresses beyond the version/length).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/kern_event.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/sockio.h>
++#include <kern/locks.h>
++#include <libkern/libkern.h>
++#include <net/bpf.h>
++#include <net/ethernet.h>
++#include <net/if.h>
++#include <net/if_ether.h>
++#include <net/if_media.h>
++#include <net/if_types.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <netinet/in.h>
++#include <pexpert/pexpert.h>
++#include "spes_cell.h"
++#include "spes_ipa.h"
++
++#define LOGP                    "SPES CELL: "
++
++#define CELL_NAME               "en"
++#define CELL_UNIT               1               /* CHECK: en0 = WLAN (redwood_net.c), ue0 = USB (sweet_usb.c); nothing else makes en1 in this tree */
++#define CELL_FRAME_MAX          (ETHER_HDR_LEN + ETHERMTU)
++#define CELL_LEASE_S            86400u          /* a day; renewals are answered locally anyway */
++#define CELL_MSS_MIN_MTU        576u
++
++#define CELL_ETHERTYPE_IP       0x0800u
++#define CELL_ETHERTYPE_ARP      0x0806u
++#define CELL_DHCP_MAGIC         0x63825363u
++#define CELL_DHCP_DISCOVER      1u
++#define CELL_DHCP_OFFER         2u
++#define CELL_DHCP_REQUEST       3u
++#define CELL_DHCP_ACK           5u
++#define CELL_DHCP_NAK           6u
++
++/* for printf: "%u.%u.%u.%u" from a host-order address */
++#define CELL_IP4(a)             (unsigned)((a) >> 24), (unsigned)(((a) >> 16) & 0xff), (unsigned)(((a) >> 8) & 0xff), (unsigned)((a) & 0xff)
++
++/*
++ * Made up and locally administered (bit 1 of the first byte set, bit 0 clear = unicast); not derived from any
++ * device identifier. Bytes 1..4 are "spcl". The phone's WLAN MAC is never used here.
++ */
++static const uint8_t cell_mac[ETHER_ADDR_LEN] = { 0x02, 0x73, 0x70, 0x63, 0x6c, 0x01 };
++static const uint8_t cell_router_mac[ETHER_ADDR_LEN] = { 0x02, 0x73, 0x70, 0x63, 0x6c, 0xfe };
++
++static LCK_GRP_DECLARE(cell_lck_grp, "spes-cell");
++static LCK_MTX_DECLARE(cell_lock, &cell_lck_grp);
++
++static ifnet_t          cell_ifp;               /* set once by spes_cell_init() */
++static bool             cell_link_up;           /* KEV_DL_LINK_ON sent, SIOCGIFMEDIA says active */
++static uint32_t         cell_trace;
++static int              cell_mode = -1;         /* boot-arg modem_cell, read once */
++
++/* What DHCP gives out (host order). Under cell_lock. */
++static struct {
++	bool            up;
++	uint32_t        address, mask, router, dns1, dns2, mtu;
++	uint32_t        modem_gw;                       /* what WDS said, for the log only */
++} cell_session;
++
++static struct {
++	uint64_t        arp, dhcp, to_modem, from_modem, drop_out, drop_in, not_ip4_out, not_ip4_in, nobufs, tx_err;
++} cell_count;
++
++/* The frame being transmitted and the local reply being built. Under cell_lock. */
++static uint8_t          cell_txbuf[CELL_FRAME_MAX];
++static uint8_t          cell_reply[ETHER_HDR_LEN + 20 + 8 + 300 + 64];
++
++/* ---------------------------------------------------------------- small helpers */
++
++static inline uint32_t
++cell_get16(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 8 | p[1];
++}
++
++static inline uint32_t
++cell_get32(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
++}
++
++static inline void
++cell_put16(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)(v >> 8);
++	p[1] = (uint8_t)v;
++}
++
++static inline void
++cell_put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)(v >> 24);
++	p[1] = (uint8_t)(v >> 16);
++	p[2] = (uint8_t)(v >> 8);
++	p[3] = (uint8_t)v;
++}
++
++static uint16_t
++cell_ip_checksum(const uint8_t *data, size_t length)
++{
++	uint32_t sum = 0;
++
++	for (size_t i = 0; i + 1 < length; i += 2) {
++		sum += (uint32_t)data[i] << 8 | data[i + 1];
++	}
++	if (length & 1) {
++		sum += (uint32_t)data[length - 1] << 8;
++	}
++	while (sum >> 16) {
++		sum = (sum & 0xffff) + (sum >> 16);
++	}
++	return (uint16_t)~sum;
++}
++
++static int
++cell_boot_mode(void)
++{
++	if (cell_mode < 0) {
++		uint32_t v = 0;
++
++		(void)PE_parse_boot_argn("modem_cell", &v, sizeof(v));
++		cell_mode = (int)v;
++	}
++	return cell_mode;
++}
++
++static bool
++cell_trace_one(void)
++{
++	if (cell_trace == 0) {
++		return false;
++	}
++	cell_trace--;
++	return true;
++}
++
++/* ---------------------------------------------------------------- mbufs and the way up */
++
++/*
++ * An mbuf for one Ethernet frame of `len` bytes: one packet-header mbuf with a 2 KiB cluster (as sweet_usb.c
++ * ud_rx_done()). Returns the data pointer in *data; the caller fills the frame, then calls cell_input().
++ */
++static mbuf_t
++cell_frame_mbuf(size_t len, uint8_t **data)
++{
++	mbuf_t m = NULL;
++
++	if (len < ETHER_HDR_LEN || len > CELL_FRAME_MAX) {
++		return NULL;
++	}
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0) {
++		return NULL;
++	}
++	if (mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < len) {
++		mbuf_freem(m);
++		return NULL;
++	}
++	mbuf_setlen(m, len);
++	mbuf_pkthdr_setlen(m, len);
++	*data = mbuf_data(m);
++	return m;
++}
++
++/* Hand a filled frame mbuf to the stack: header noted and stepped over, as every Ethernet driver does. */
++static void
++cell_input(mbuf_t m)
++{
++	struct ifnet_stat_increment_param stats = {};
++	size_t len = mbuf_pkthdr_len(m);
++	void *header = mbuf_data(m);
++
++	if (cell_ifp == NULL) {
++		mbuf_freem(m);
++		return;
++	}
++	mbuf_pkthdr_setrcvif(m, cell_ifp);
++	mbuf_pkthdr_setheader(m, header);
++	mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++	(void)mbuf_setdata(m, (char *)header + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++	bpf_tap_in(cell_ifp, DLT_EN10MB, m, header, ETHER_HDR_LEN);
++	stats.packets_in = 1;
++	stats.bytes_in = (uint32_t)len;
++	ifnet_input(cell_ifp, m, &stats);
++}
++
++/* A copy of a locally built frame as an mbuf (still to be passed to cell_input()). */
++static mbuf_t
++cell_copy_frame(const uint8_t *frame, size_t len)
++{
++	uint8_t *data = NULL;
++	mbuf_t m = cell_frame_mbuf(len, &data);
++
++	if (m == NULL) {
++		cell_count.nobufs++;
++		return NULL;
++	}
++	memcpy(data, frame, len);
++	return m;
++}
++
++/* Tell configd (kernel event listeners) that the link is up or down. Same as redwood_net.c net_link_event(). */
++static void
++cell_link_event(uint32_t code)
++{
++	_Alignas(struct kern_event_msg) char message[sizeof(struct kern_event_msg) + sizeof(struct net_event_data)] = { 0 };
++	struct kern_event_msg *header = (struct kern_event_msg *)message;
++	struct net_event_data *about = (struct net_event_data *)(header + 1);
++
++	if (cell_ifp == NULL) {
++		return;
++	}
++	header->total_size = sizeof(message);
++	header->vendor_code = KEV_VENDOR_APPLE;
++	header->kev_class = KEV_NETWORK_CLASS;
++	header->kev_subclass = KEV_DL_SUBCLASS;
++	header->event_code = code;
++	about->if_family = ifnet_family(cell_ifp);
++	about->if_unit = ifnet_unit(cell_ifp);
++	strlcpy(about->if_name, ifnet_name(cell_ifp), IFNAMSIZ);
++	ifnet_event(cell_ifp, header);
++}
++
++static void
++cell_set_link(bool up)
++{
++	if (cell_ifp == NULL || up == cell_link_up) {
++		return;
++	}
++	cell_link_up = up;
++	printf(LOGP "en1 link %s\n", up ? "up" : "down");
++	cell_link_event(up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF);
++}
++
++/* ---------------------------------------------------------------- ARP: the router answers for everything */
++
++/* `frame` is cell_txbuf. Returns the reply mbuf, or NULL (not a request we answer). cell_lock held. */
++static mbuf_t
++cell_arp_answer(const uint8_t *frame, size_t len)
++{
++	const uint8_t *arp = frame + ETHER_HDR_LEN;
++	uint8_t *r = cell_reply;
++	uint32_t target;
++
++	/* Ethernet/IPv4, hlen 6, plen 4, opcode 1 (request) */
++	if (len < ETHER_HDR_LEN + 28 || cell_get32(arp) != 0x00010800u || arp[4] != 6 || arp[5] != 4 || cell_get16(arp + 6) != 1) {
++		return NULL;
++	}
++	target = cell_get32(arp + 24);
++	/*
++	 * Never for en1's own address: that keeps IPConfiguration's ARP probe (sender 0.0.0.0, target = offered
++	 * address) and gratuitous ARP unanswered, so there is no address conflict.
++	 */
++	if (target == 0 || (cell_session.address != 0 && target == cell_session.address)) {
++		return NULL;
++	}
++	memcpy(r, frame + 6, ETHER_ADDR_LEN);                   /* to the asker */
++	memcpy(r + 6, cell_router_mac, ETHER_ADDR_LEN);
++	cell_put16(r + 12, CELL_ETHERTYPE_ARP);
++	cell_put32(r + 14, 0x00010800u);
++	r[18] = 6;
++	r[19] = 4;
++	cell_put16(r + 20, 2);                                  /* reply */
++	memcpy(r + 22, cell_router_mac, ETHER_ADDR_LEN);        /* "that address is at the router" */
++	memcpy(r + 28, arp + 24, 4);
++	memcpy(r + 32, arp + 8, 10);                            /* the asker's MAC + IP */
++	cell_count.arp++;
++	if (cell_trace_one()) {
++		printf(LOGP "ARP: %u.%u.%u.%u is the router\n", CELL_IP4(target));
++	}
++	return cell_copy_frame(r, 42);
++}
++
++/* ---------------------------------------------------------------- DHCP: the session's settings */
++
++/* Is the IPv4 frame in cell_txbuf a DHCP client message (UDP 68 -> 67)? Sets *bootp to the BOOTP header. */
++static bool
++cell_is_dhcp(const uint8_t *frame, size_t len, const uint8_t **bootp)
++{
++	const uint8_t *ip = frame + ETHER_HDR_LEN, *udp;
++	size_t ihl;
++
++	if (len < ETHER_HDR_LEN + 20 + 8 + 240 || (ip[0] >> 4) != 4 || ip[9] != 17 /* UDP */) {
++		return false;
++	}
++	ihl = 4u * (ip[0] & 0xfu);
++	if (ihl < 20 || ETHER_HDR_LEN + ihl + 8 + 240 > len) {
++		return false;
++	}
++	udp = ip + ihl;
++	if (cell_get16(udp) != 68 || cell_get16(udp + 2) != 67) {
++		return false;
++	}
++	*bootp = udp + 8;
++	return true;
++}
++
++/*
++ * The answer to a DHCP client message: OFFER for DISCOVER; ACK (or NAK if it asks for another address) for
++ * REQUEST. Everything else (RELEASE, DECLINE, INFORM) is swallowed without an answer. cell_lock held.
++ * Returns NULL if nothing is sent back.
++ */
++static mbuf_t
++cell_dhcp_answer(const uint8_t *frame, size_t len, const uint8_t *request)
++{
++	const uint8_t *end = frame + len, *opt;
++	uint8_t *r = cell_reply, *ip = r + ETHER_HDR_LEN, *udp = ip + 20, *bootp = udp + 8, *o;
++	uint32_t type = 0, wanted = 0, server = 0, ciaddr, kind;
++	size_t size;
++
++	if (request[0] != 1 /* BOOTREQUEST */ || request[1] != 1 || request[2] != 6 || cell_get32(request + 236) != CELL_DHCP_MAGIC) {
++		return NULL;
++	}
++	ciaddr = cell_get32(request + 12);
++	opt = request + 240;
++	while (opt < end && opt[0] != 255) {
++		if (opt[0] == 0) {                              /* pad */
++			opt++;
++			continue;
++		}
++		if (opt + 2 > end || opt + 2 + opt[1] > end) {
++			break;
++		}
++		if (opt[0] == 53 && opt[1] == 1) {
++			type = opt[2];
++		} else if (opt[0] == 50 && opt[1] == 4) {
++			wanted = cell_get32(opt + 2);
++		} else if (opt[0] == 54 && opt[1] == 4) {
++			server = cell_get32(opt + 2);
++		}
++		opt += 2 + opt[1];
++	}
++	if (type == CELL_DHCP_DISCOVER) {
++		kind = CELL_DHCP_OFFER;
++	} else if (type == CELL_DHCP_REQUEST) {
++		if (server != 0 && server != cell_session.router) {
++			return NULL;                            /* the client chose another server (there is none) */
++		}
++		if (wanted == 0) {
++			wanted = ciaddr;                        /* RENEWING/REBINDING: no option 50, ciaddr set */
++		}
++		kind = (wanted != 0 && wanted != cell_session.address) ? CELL_DHCP_NAK : CELL_DHCP_ACK;
++	} else {
++		return NULL;
++	}
++
++	bzero(r, sizeof(cell_reply));
++	/* BOOTP */
++	bootp[0] = 2;                                           /* BOOTREPLY */
++	bootp[1] = 1;
++	bootp[2] = 6;
++	memcpy(bootp + 4, request + 4, 4);                      /* xid */
++	memcpy(bootp + 10, request + 10, 2);                    /* flags (broadcast bit) */
++	if (kind != CELL_DHCP_NAK) {
++		cell_put32(bootp + 16, cell_session.address);   /* yiaddr */
++		cell_put32(bootp + 20, cell_session.router);    /* siaddr */
++	}
++	memcpy(bootp + 28, request + 28, 16);                   /* chaddr */
++	cell_put32(bootp + 236, CELL_DHCP_MAGIC);
++	o = bootp + 240;
++	*o++ = 53; *o++ = 1; *o++ = (uint8_t)kind;
++	*o++ = 54; *o++ = 4; cell_put32(o, cell_session.router); o += 4;
++	if (kind != CELL_DHCP_NAK) {
++		*o++ = 51; *o++ = 4; cell_put32(o, CELL_LEASE_S); o += 4;
++		*o++ = 1;  *o++ = 4; cell_put32(o, cell_session.mask); o += 4;
++		*o++ = 3;  *o++ = 4; cell_put32(o, cell_session.router); o += 4;
++		if (cell_session.dns1 != 0 || cell_session.dns2 != 0) {
++			*o++ = 6;
++			*o++ = (uint8_t)(4 * ((cell_session.dns1 != 0) + (cell_session.dns2 != 0)));
++			if (cell_session.dns1 != 0) {
++				cell_put32(o, cell_session.dns1);
++				o += 4;
++			}
++			if (cell_session.dns2 != 0) {
++				cell_put32(o, cell_session.dns2);
++				o += 4;
++			}
++		}
++		*o++ = 26; *o++ = 2; cell_put16(o, cell_session.mtu); o += 2;  /* interface MTU */
++	}
++	*o++ = 255;
++	size = (size_t)(o - bootp);
++	if (size < 300) {
++		size = 300;                                     /* BOOTP minimum, zero padded (bzero above) */
++	}
++	/* UDP 67 -> 68, checksum 0 = none (allowed for IPv4). CHECK: IPConfiguration accepts it (socket or bpf). */
++	cell_put16(udp, 67);
++	cell_put16(udp + 2, 68);
++	cell_put16(udp + 4, (uint32_t)(8 + size));
++	cell_put16(udp + 6, 0);
++	/* IPv4 router -> 255.255.255.255 (works with and without the client's broadcast flag) */
++	ip[0] = 0x45;
++	cell_put16(ip + 2, (uint32_t)(20 + 8 + size));
++	ip[8] = 64;
++	ip[9] = 17;
++	cell_put32(ip + 12, cell_session.router);
++	cell_put32(ip + 16, 0xffffffffu);
++	cell_put16(ip + 10, cell_ip_checksum(ip, 20));
++	/* Ethernet: to en1 itself (the only client there can be), from the router */
++	memcpy(r, cell_mac, ETHER_ADDR_LEN);
++	memcpy(r + 6, cell_router_mac, ETHER_ADDR_LEN);
++	cell_put16(r + 12, CELL_ETHERTYPE_IP);
++	cell_count.dhcp++;
++	printf(LOGP "DHCP %s -> %s: %u.%u.%u.%u/%u.%u.%u.%u router %u.%u.%u.%u DNS %u.%u.%u.%u %u.%u.%u.%u MTU %u lease %us\n",
++	    type == CELL_DHCP_DISCOVER ? "DISCOVER" : "REQUEST",
++	    kind == CELL_DHCP_OFFER ? "OFFER" : kind == CELL_DHCP_ACK ? "ACK" : "NAK",
++	    CELL_IP4(cell_session.address), CELL_IP4(cell_session.mask), CELL_IP4(cell_session.router),
++	    CELL_IP4(cell_session.dns1), CELL_IP4(cell_session.dns2), cell_session.mtu, CELL_LEASE_S);
++	return cell_copy_frame(r, ETHER_HDR_LEN + 20 + 8 + size);
++}
++
++/* ---------------------------------------------------------------- the interface */
++
++/* The stack has a frame to send (an mbuf chain starting with the Ethernet header). Always consumes it. */
++static errno_t
++cell_output(ifnet_t ifp, mbuf_t m)
++{
++	size_t len = mbuf_pkthdr_len(m);
++	mbuf_t reply = NULL;
++	bool sent = false;
++	uint32_t type;
++
++	if (len < ETHER_HDR_LEN || len > CELL_FRAME_MAX) {
++		cell_count.drop_out++;
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		mbuf_freem(m);
++		return 0;
++	}
++	bpf_tap_out(ifp, DLT_EN10MB, m, NULL, 0);
++	lck_mtx_lock(&cell_lock);
++	if (mbuf_copydata(m, 0, len, cell_txbuf) != 0) {
++		lck_mtx_unlock(&cell_lock);
++		cell_count.drop_out++;
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		mbuf_freem(m);
++		return 0;
++	}
++	type = cell_get16(cell_txbuf + 12);
++	if (type == CELL_ETHERTYPE_ARP) {
++		reply = cell_arp_answer(cell_txbuf, len);
++		sent = true;                                    /* swallowed either way */
++	} else if (type == CELL_ETHERTYPE_IP) {
++		const uint8_t *bootp = NULL;
++
++		if (cell_is_dhcp(cell_txbuf, len, &bootp)) {
++			if (cell_session.up) {
++				reply = cell_dhcp_answer(cell_txbuf, len, bootp);
++			}
++			sent = true;
++		} else if (cell_session.up && len >= ETHER_HDR_LEN + 20 && (cell_txbuf[ETHER_HDR_LEN] >> 4) == 4) {
++			size_t iplen = len - ETHER_HDR_LEN;
++			uint32_t total = cell_get16(cell_txbuf + ETHER_HDR_LEN + 2);
++			int err;
++
++			if (total >= 20 && total < iplen) {
++				iplen = total;                  /* drop Ethernet padding */
++			}
++			err = spes_ipa_tx(cell_txbuf + ETHER_HDR_LEN, iplen);   /* copies; may take the IPA tx_lock */
++			if (err == 0) {
++				cell_count.to_modem++;
++				sent = true;
++				if (cell_trace_one()) {
++					printf(LOGP "to modem: IPv4 %zu bytes proto %u\n", iplen, cell_txbuf[ETHER_HDR_LEN + 9]);
++				}
++			} else {
++				cell_count.tx_err++;
++				if (cell_trace_one()) {
++					printf(LOGP "spes_ipa_tx: error %d (%zu bytes)\n", err, iplen);
++				}
++			}
++		} else {
++			cell_count.drop_out++;
++		}
++	} else {
++		cell_count.not_ip4_out++;                       /* IPv6 and the rest: not carried */
++	}
++	lck_mtx_unlock(&cell_lock);
++
++	if (sent) {
++		ifnet_stat_increment_out(ifp, 1, (uint32_t)len, 0);
++	} else {
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++	}
++	mbuf_freem(m);
++	if (reply != NULL) {
++		cell_input(reply);                              /* after cell_lock is dropped */
++	}
++	return 0;
++}
++
++/*
++ * One IP packet from the modem, called on the IPA poll thread (see the top of the file). `ip` points into a
++ * DMA buffer and is only valid during the call.
++ */
++static void
++cell_rx_hook(const void *ip, size_t len, uint8_t mux)
++{
++	const uint8_t *p = ip;
++	uint8_t *f = NULL;
++	uint32_t total;
++	mbuf_t m;
++
++	if (cell_ifp == NULL || !cell_link_up) {
++		cell_count.drop_in++;
++		return;
++	}
++	if (len < 20 || (p[0] >> 4) != 4) {
++		if (len > 0 && (p[0] >> 4) == 6) {
++			cell_count.not_ip4_in++;
++		} else {
++			cell_count.drop_in++;
++		}
++		return;
++	}
++	total = cell_get16(p + 2);
++	if (total >= 20 && total < len) {
++		len = total;                                    /* trailing QMAP padding the pad field did not cover */
++	}
++	if (len > ETHERMTU) {
++		cell_count.drop_in++;                           /* CHECK: network MTU > 1500 would need a bigger en1 MTU */
++		return;
++	}
++	m = cell_frame_mbuf(ETHER_HDR_LEN + len, &f);
++	if (m == NULL) {
++		cell_count.nobufs++;
++		return;
++	}
++	memcpy(f, cell_mac, ETHER_ADDR_LEN);
++	memcpy(f + 6, cell_router_mac, ETHER_ADDR_LEN);
++	cell_put16(f + 12, CELL_ETHERTYPE_IP);
++	memcpy(f + ETHER_HDR_LEN, p, len);
++	cell_count.from_modem++;
++	if (cell_trace_one()) {
++		printf(LOGP "from modem: IPv4 %zu bytes proto %u mux %u\n", len, p[9], mux);
++	}
++	cell_input(m);
++}
++
++static errno_t
++cell_ioctl(ifnet_t ifp, u_long command, void *data)
++{
++	const int media[] = { IFM_ETHER | IFM_AUTO };
++	struct ifreq *request = data;
++	struct ifmediareq *media_request = data;
++	user_addr_t list;
++	errno_t error = 0;
++
++	switch (command) {
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		break;
++	case SIOCSIFFLAGS:
++		ifnet_set_flags(ifp, (ifnet_flags(ifp) & IFF_UP) ? IFF_RUNNING : 0, IFF_RUNNING);
++		break;
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64:
++		/* what configd asks to learn whether "the cable is in": active while a data session exists */
++		list = command == SIOCGIFMEDIA64 ? ((struct ifmediareq64 *)media_request)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)media_request)->ifmu_ulist);
++		media_request->ifm_active = media_request->ifm_current = media[0];
++		media_request->ifm_mask = 0;
++		media_request->ifm_status = IFM_AVALID | (cell_link_up ? IFM_ACTIVE : 0);
++		if (list != USER_ADDR_NULL && media_request->ifm_count > 0) {
++			error = copyout(media, list, sizeof(media));
++		}
++		media_request->ifm_count = 1;
++		break;
++	case SIOCGIFDEVMTU:
++		request->ifr_devmtu.ifdm_current = ifnet_mtu(ifp);
++		request->ifr_devmtu.ifdm_max = ETHERMTU;
++		request->ifr_devmtu.ifdm_min = IF_MINMTU;
++		break;
++	case SIOCSIFMTU:
++		error = (request->ifr_mtu > ETHERMTU || request->ifr_mtu < IF_MINMTU) ? EINVAL : ifnet_set_mtu(ifp, request->ifr_mtu);
++		break;
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		break;
++	default:
++		error = EOPNOTSUPP;
++		break;
++	}
++	return error;
++}
++
++/* ---------------------------------------------------------------- API */
++
++void
++spes_cell_set_session(uint32_t ip, uint32_t gw, uint32_t dns1, uint32_t dns2, uint32_t mtu)
++{
++	uint32_t mask = 0xffffff00u, router = 0;
++	bool up = ip != 0, changed, bounce;
++
++	if (cell_boot_mode() == 0) {
++		return;
++	}
++	if (mtu == 0 || mtu > ETHERMTU) {
++		mtu = ETHERMTU;                                 /* CHECK: WDS MTU > 1500 is clipped; IPv4 fragments then */
++	} else if (mtu < CELL_MSS_MIN_MTU) {
++		mtu = CELL_MSS_MIN_MTU;
++	}
++	if (up) {
++		/* a /24 around the address with the router at .1, or .2 if .1 is the address itself (top of the file) */
++		router = (ip & mask) | 1u;
++		if (router == ip) {
++			router = (ip & mask) | 2u;
++		}
++	}
++	lck_mtx_lock(&cell_lock);
++	changed = cell_session.up != up || cell_session.address != ip || cell_session.dns1 != dns1 ||
++	    cell_session.dns2 != dns2 || cell_session.mtu != mtu;
++	bounce = cell_session.up && up && changed;              /* new settings while up: down/up makes configd ask again */
++	cell_session.up = up;
++	cell_session.address = up ? ip : 0;
++	cell_session.mask = up ? mask : 0;
++	cell_session.router = router;
++	cell_session.dns1 = dns1;
++	cell_session.dns2 = dns2;
++	cell_session.mtu = mtu;
++	cell_session.modem_gw = gw;
++	lck_mtx_unlock(&cell_lock);
++
++	printf(LOGP "session %s: %u.%u.%u.%u (modem gw %u.%u.%u.%u; en1 is told /24, router %u.%u.%u.%u) DNS %u.%u.%u.%u %u.%u.%u.%u "
++	    "MTU %u%s%s\n", up ? "UP" : "down", CELL_IP4(ip), CELL_IP4(gw), CELL_IP4(router), CELL_IP4(dns1), CELL_IP4(dns2), mtu,
++	    changed ? "" : " (unchanged)", cell_ifp != NULL ? "" : " (en1 not created yet)");
++	if (bounce) {
++		cell_set_link(false);
++	}
++	cell_set_link(up);
++}
++
++void
++spes_cell_status(char *out, size_t size)
++{
++	if (size == 0) {
++		return;
++	}
++	snprintf(out, size, "en1 %s, link %s; to modem %llu (err %llu), from modem %llu; drop out %llu in %llu nobufs %llu; "
++	    "not IPv4 out %llu in %llu; ARP %llu DHCP %llu",
++	    cell_ifp != NULL ? "attached" : "absent", cell_link_up ? "up" : "down",
++	    cell_count.to_modem, cell_count.tx_err, cell_count.from_modem, cell_count.drop_out, cell_count.drop_in,
++	    cell_count.nobufs, cell_count.not_ip4_out, cell_count.not_ip4_in, cell_count.arp, cell_count.dhcp);
++}
++
++bool
++spes_cell_init(void)
++{
++	struct ifnet_init_eparams init = {
++		.ver = IFNET_INIT_CURRENT_VERSION,
++		.len = sizeof(init),
++		/* every frame straight to cell_output(); no Skywalk nexus (as redwood_net.c) */
++		.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO,
++		.uniqueid = "spes-cell-en1",
++		.uniqueid_len = sizeof("spes-cell-en1") - 1,
++		.name = CELL_NAME,
++		.unit = CELL_UNIT,
++		.family = IFNET_FAMILY_ETHERNET,
++		.subfamily = IFNET_SUBFAMILY_ANY,               /* CHECK: iOS ranks a wired Ethernet service vs. Wi-Fi by ServiceOrder */
++		.type = IFT_ETHER,
++		.output = cell_output,
++		.demux = ether_demux,
++		.add_proto = ether_add_proto,
++		.del_proto = ether_del_proto,
++		.check_multi = ether_check_multi,
++		.framer_extended = ether_frameout_extended,
++		.ioctl = cell_ioctl,
++		.broadcast_addr = etherbroadcastaddr,
++		.broadcast_len = ETHER_ADDR_LEN,
++	};
++	uint32_t test = 0;
++	ifnet_t ifp = NULL;
++	errno_t error;
++	int mode = cell_boot_mode();
++
++	if (mode == 0) {
++		return false;
++	}
++	if (cell_ifp != NULL) {
++		return true;
++	}
++	(void)PE_parse_boot_argn("modem_cell_trace", &cell_trace, sizeof(cell_trace));
++	if (!spes_ipa_ready() && mode != 2) {
++		printf(LOGP "IPA data path not ready; en1 not created (modem_cell=2 creates it anyway)\n");
++		return false;
++	}
++	error = ifnet_allocate_extended(&init, &ifp);
++	if (error != 0) {
++		printf(LOGP "ifnet_allocate_extended failed: %d\n", error);
++		return false;
++	}
++	ifnet_set_capabilities_enabled(ifp, 0, -1);
++	ifnet_set_addrlen(ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(ifp, ETHER_HDR_LEN);
++	ifnet_set_mtu(ifp, ETHERMTU);
++	ifnet_set_baudrate(ifp, 100 * 1000 * 1000);             /* CHECK: nominal; only shown to user space */
++	ifnet_set_flags(ifp, IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX, 0xffff);
++	ifnet_set_offload(ifp, 0);                              /* the stack computes checksums: the IPA draft has no checksum offload */
++	error = ifnet_attach(ifp, NULL);
++	if (error != 0) {
++		printf(LOGP "ifnet_attach failed: %d\n", error);
++		ifnet_release(ifp);
++		return false;
++	}
++	ifnet_set_lladdr(ifp, cell_mac, ETHER_ADDR_LEN);
++	bpfattach(ifp, DLT_EN10MB, ETHER_HDR_LEN);
++	cell_ifp = ifp;
++	__asm__ volatile ("dmb ish" ::: "memory");              /* cell_ifp visible before the poll thread can call the hook */
++	spes_ipa_rx_hook = cell_rx_hook;
++	printf(LOGP "en1 attached (made-up MAC %02x:%02x:%02x:%02x:%02x:%02x, router %02x:..:%02x), IPA %s, mode %d\n",
++	    cell_mac[0], cell_mac[1], cell_mac[2], cell_mac[3], cell_mac[4], cell_mac[5], cell_router_mac[0], cell_router_mac[5],
++	    spes_ipa_ready() ? "ready" : "NOT ready (TX dropped)", mode);
++
++	(void)PE_parse_boot_argn("modem_cell_test", &test, sizeof(test));
++	if (test != 0 && mode == 2) {
++		/* TEST-NET-1 (RFC 5737): nothing real; lets configd/DHCP on en1 be watched without a modem */
++		spes_cell_set_session(0xc0000202u, 0xc0000201u, 0xc0000201u, 0, ETHERMTU);
++	} else {
++		bool up;
++
++		lck_mtx_lock(&cell_lock);
++		up = cell_session.up;
++		lck_mtx_unlock(&cell_lock);
++		cell_set_link(up);                              /* a session set before init */
++	}
++	return true;
++}
++
++#else /* !ARM64_BOARD_CONFIG_SWEET */
++#include <sys/cdefs.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include "spes_cell.h"
++bool spes_cell_init(void) { return false; }
++void spes_cell_set_session(uint32_t ip __unused, uint32_t gw __unused, uint32_t dns1 __unused, uint32_t dns2 __unused, uint32_t mtu __unused) {}
++void spes_cell_status(char *out, size_t size) { if (size) { out[0] = 0; } }
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/spes_cell.h b/bsd/dev/spes_cell.h
+new file mode 100644
+index 0000000..8dfb598
+--- /dev/null
++++ b/bsd/dev/spes_cell.h
+@@ -0,0 +1,39 @@
++/*
++ * spes_cell.h - mobile data as an Ethernet-looking interface en1 on top of the IPA data path.
++ * DRAFT (not built, not run). Implementation: bsd/dev/spes_cell.c, report: SPES-CELL-DRAFT.md.
++ *
++ * Everything sits behind boot-arg modem_cell=1 (or 2, see spes_cell.c). Callers: SpesModem.cpp (QMI).
++ *   1. spes_ipa_init() returned true                -> spes_cell_init()   (creates en1, registers spes_ipa_rx_hook)
++ *   2. WDS Get Runtime Settings answered            -> spes_cell_set_session(ip, gw, dns1, dns2, mtu)
++ *   3. session lost (WDS packet service status down) -> spes_cell_set_session(0, 0, 0, 0, 0)
++ *
++ * All addresses are IPv4 in HOST byte order (10.1.2.3 = 0x0a010203), exactly the uint32 values the QMI WDS
++ * TLVs carry once read as little-endian integers. Not network order.
++ */
++#ifndef _SPES_CELL_H_
++#define _SPES_CELL_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Create en1 (may sleep: call from a thread, without locks held). true if en1 exists afterwards. */
++bool spes_cell_init(void);
++/*
++ * The data session's settings, host byte order. ip == 0 means "no session" (link goes down).
++ * gw is only logged (en1 gets a made-up /24 router, see spes_cell.c). dns2 may be 0. mtu 0 = 1500.
++ * May be called before spes_cell_init(); the values are kept. May sleep briefly (mutex).
++ */
++void spes_cell_set_session(uint32_t ip, uint32_t gw, uint32_t dns1, uint32_t dns2, uint32_t mtu);
++/* One line of counters for logs / the USB command server. */
++void spes_cell_status(char *out, size_t size);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _SPES_CELL_H_ */
+diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
+index cb7a35f..140bbad 100644
+--- a/iokit/Kernel/arm/SpesModem.cpp
++++ b/iokit/Kernel/arm/SpesModem.cpp
+@@ -565,6 +565,7 @@ static bool q_hello_sent, q_hello_rx, q_announced;
+ static struct { uint32_t svc, inst, node, port; } q_srv[64];
+ static unsigned q_srv_count, g_rx_msgs, g_tx_msgs, q_resumes;
+ extern "C" bool spes_ipa_init(void);              /* 0210, bsd/dev/spes_ipa.c */
++extern "C" bool spes_cell_init(void);             /* 0211, bsd/dev/spes_cell.c */
+ static unsigned g_ms;                           /* watch time, for the log */
+ static bool g_modem_up;                         /* 0207: PAS-booted, shut down before a reset */
+ static uint32_t n_node, n_port, u_node, u_port;    /* 0200: NAS / UIM servers */
+@@ -6812,6 +6813,7 @@ spes_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 		/* 0210: IPA before the modem boots (modem_ipa_data=1; modem_ipa_readonly=1 stops after the clock vote and
+ 		 * the read-only probe). Nothing happens without the boot-arg. */
+ 		(void)spes_ipa_init();
++		(void)spes_cell_init();                 /* 0211: en1 (modem_cell=1/2); nothing without the boot-arg */
+ 	}
+ 	if (modem_boot()) {
+ 		modem_watch(smem_partition(0, 1), watch);
