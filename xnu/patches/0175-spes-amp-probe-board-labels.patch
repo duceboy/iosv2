@@ -1,0 +1,29 @@
+spes amp bus probe (0175): board-correct labels for 0x66/0x65 (log text only).
+
+0132 labelled 0x66 "max77729 charger/fuel gauge" and 0x65 "sc8551 charger", true only for board-id
+0x20022 (spes.dtsi), the iosv2 author's phone. On 0x40022 (spes-sm5602.dtsi) and on spesn 0x30022
+(measured 2026-11-17: sc8551-standalone at 0x66, bq2589x at 0x6a, sm5602 at 0x71) 0x66 is the
+sc8551 and 0x65 NACKs. Same register reads as before; only the printed names and the comment change.
+
+diff --git a/bsd/dev/spes_amp.c b/bsd/dev/spes_amp.c
+index 6fe7171..46b9ada 100644
+--- a/bsd/dev/spes_amp.c
++++ b/bsd/dev/spes_amp.c
+@@ -400,9 +400,15 @@ amp_init_locked(int on)
+ 	if (!amp_se_setup(se, rx)) {
+ 		return;
+ 	}
+-	/* 0x66 and 0x65 run off the battery: they answer whenever the bus works. */
++	/*
++	 * 0x66 runs off the battery on both boards: it answers whenever the bus works. Which chip it is
++	 * depends on the board (Xiaomi spes DTS): board-id 0x20022 (spes.dtsi) has the max77729 top
++	 * at 0x66 and the sc8551 at 0x65; 0x40022 (spes-sm5602.dtsi) and spesn 0x30022 have the sc8551
++	 * at 0x66 and nothing at 0x65 (NACK there is normal).
++	 */
+ 	static const struct { uint8_t addr; const char *what; } chips[] = {
+-		{ 0x66, "max77729 charger/fuel gauge" }, { 0x65, "sc8551 charger" }, { 0x64, "aw2016 LED driver" },
++		{ 0x66, "max77729 (board 0x20022) or sc8551 (0x30022/0x40022)" },
++		{ 0x65, "sc8551 (board 0x20022; absent on 0x30022/0x40022)" }, { 0x64, "aw2016 LED driver" },
+ 		{ 0x58, "amplifier (reset GPIO 106)" }, { 0x5b, "amplifier (reset GPIO 35)" },
+ 	};
+ 	static const char *const how[] = { "id", "NACK (absent or held in reset)", "bus error", "engine stuck" };
