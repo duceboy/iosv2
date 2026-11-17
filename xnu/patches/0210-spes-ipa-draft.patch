@@ -22,7 +22,7 @@ index 2012dd1..dd7890a 100644
  bsd/dev/spes_usb.c		standard
 diff --git a/bsd/dev/spes_ipa.c b/bsd/dev/spes_ipa.c
 new file mode 100644
-index 0000000..7f15368
+index 0000000..2023c4e
 --- /dev/null
 +++ b/bsd/dev/spes_ipa.c
 @@ -0,0 +1,1577 @@
@@ -217,7 +217,7 @@ index 0000000..7f15368
 +#define IPA_ENDP_INIT_SEQ(e)    (0x083cu + 0x70u * (e))
 +#define IPA_ENDP_STATUS(e)      (0x0840u + 0x70u * (e))
 +
-+/* IPA local memory map, IPA v4.2 (ipa_data-v4.2.c ipa_mem_local_data); offsets before adding mem_offset */
++/* IPA local memory map, IPA v4.2 (ipa_data-v4.2.c ipa_mem_local_data); offsets before adding ipa_mem_offset */
 +#define MEM_V4_FILTER           0x0290u         /* 0x78 bytes; hashed variants have size 0 (no hashing on v4.2) */
 +#define MEM_V6_FILTER           0x0318u
 +#define MEM_V4_ROUTE            0x03a0u
@@ -331,7 +331,7 @@ index 0000000..7f15368
 +static struct ipa_chan *const chans[4] = { &c_cmd, &c_lan, &c_mtx, &c_mrx };   /* Linux endpoint-name order: event rings 0..3 */
 +
 +static vm_offset_t ipa_va, gsi_va, sram_va;
-+static uint32_t mem_offset, mem_size;
++static uint32_t ipa_mem_offset, ipa_mem_size;
 +static struct ipa_dma tbl, zero;
 +static volatile bool ready, modem_started, clock_voted;
 +static bool trace;
@@ -941,12 +941,12 @@ index 0000000..7f15368
 +		uint64_t system_addr;
 +	} p;
 +
-+	if (size == 0 || size > ZERO_SIZE || mem_offset + offset > 0xffffu) {
++	if (size == 0 || size > ZERO_SIZE || ipa_mem_offset + offset > 0xffffu) {
 +		return false;
 +	}
 +	p.clear_after_read = 0;
 +	p.size = (uint16_t)size;
-+	p.local_addr = (uint16_t)(mem_offset + offset);
++	p.local_addr = (uint16_t)(ipa_mem_offset + offset);
 +	p.flags = 0;                                    /* direction 0: write to IPA */
 +	p.system_addr = zero.pa;
 +	return ipa_cmd(what, IPA_CMD_DMA_SHARED_MEM, &p, sizeof(p));
@@ -962,7 +962,7 @@ index 0000000..7f15368
 +	} h;
 +
 +	h.hdr_table_addr = zero.pa;
-+	h.flags = (MEM_MODEM_HEADER_SIZE & 0xfffu) | ((mem_offset + MEM_MODEM_HEADER) & 0xffffu) << 12;
++	h.flags = (MEM_MODEM_HEADER_SIZE & 0xfffu) | ((ipa_mem_offset + MEM_MODEM_HEADER) & 0xffffu) << 12;
 +	h.reserved = 0;
 +	if (!ipa_cmd("hdr init local", IPA_CMD_HDR_INIT_LOCAL, &h, sizeof(h)) ||
 +	    !ipa_cmd_zero("zero modem proc ctx", MEM_MODEM_PROC_CTX, MEM_PROC_CTX_SIZE) ||
@@ -970,7 +970,7 @@ index 0000000..7f15368
 +	    !ipa_cmd_zero("zero modem mem", MEM_MODEM, MEM_MODEM_SIZE)) {
 +		return false;
 +	}
-+	ipa_wr(IPA_LOCAL_PKT_PROC_CNTXT, (mem_offset + MEM_MODEM_PROC_CTX) & 0x1ffffu);   /* IPA_BASE_ADDR 16:0, multiple of 8 */
++	ipa_wr(IPA_LOCAL_PKT_PROC_CNTXT, (ipa_mem_offset + MEM_MODEM_PROC_CTX) & 0x1ffffu);   /* IPA_BASE_ADDR 16:0, multiple of 8 */
 +	return true;
 +}
 +
@@ -992,11 +992,11 @@ index 0000000..7f15368
 +	} p;
 +	uint32_t count = filter ? 1u + FILTER_COUNT : ROUTE_ENTRIES, size = count * 8u;
 +
-+	if (mem_offset + offset > 0xffffu) {
++	if (ipa_mem_offset + offset > 0xffffu) {
 +		return false;
 +	}
 +	p.hash_rules_addr = 0;                          /* hash size 0: hash address/offset ignored */
-+	p.flags = ((uint64_t)size & 0xfffu) << 28 | ((uint64_t)(mem_offset + offset) & 0xffffu) << 40;
++	p.flags = ((uint64_t)size & 0xfffu) << 28 | ((uint64_t)(ipa_mem_offset + offset) & 0xffffu) << 40;
 +	p.nhash_rules_addr = tbl.pa + (filter ? 8u : 16u);   /* skip the zero rule (and the bitmap for routes) */
 +	if (!ipa_cmd(what, opcode, &p, sizeof(p))) {
 +		return false;
@@ -1353,21 +1353,21 @@ index 0000000..7f15368
 +	}
 +	memset(m, 0, sizeof(*m));
 +	m->platform_type = IPA_QMI_PLATFORM_MSM_ANDROID;
-+	m->hdr_tbl_start = mem_offset + MEM_MODEM_HEADER;
++	m->hdr_tbl_start = ipa_mem_offset + MEM_MODEM_HEADER;
 +	m->hdr_tbl_end = m->hdr_tbl_start + MEM_MODEM_HEADER_SIZE - 1;
-+	m->v4_route_start = mem_offset + MEM_V4_ROUTE;
++	m->v4_route_start = ipa_mem_offset + MEM_V4_ROUTE;
 +	m->v4_route_end = MODEM_ROUTE_COUNT - 1;
-+	m->v6_route_start = mem_offset + MEM_V6_ROUTE;
++	m->v6_route_start = ipa_mem_offset + MEM_V6_ROUTE;
 +	m->v6_route_end = MODEM_ROUTE_COUNT - 1;
-+	m->v4_filter_start = mem_offset + MEM_V4_FILTER;
-+	m->v6_filter_start = mem_offset + MEM_V6_FILTER;
-+	m->modem_mem_start = mem_offset + MEM_MODEM;
++	m->v4_filter_start = ipa_mem_offset + MEM_V4_FILTER;
++	m->v6_filter_start = ipa_mem_offset + MEM_V6_FILTER;
++	m->modem_mem_start = ipa_mem_offset + MEM_MODEM;
 +	m->modem_mem_size = MEM_MODEM_SIZE;
 +	m->ctrl_comm_dest_end_pt = c_mrx.ep;
-+	m->hdr_proc_ctx_start = mem_offset + MEM_MODEM_PROC_CTX;
++	m->hdr_proc_ctx_start = ipa_mem_offset + MEM_MODEM_PROC_CTX;
 +	m->hdr_proc_ctx_end = m->hdr_proc_ctx_start + MEM_PROC_CTX_SIZE - 1;
-+	m->hw_stats_quota_base = mem_offset + MEM_STATS_QUOTA_MODEM;
-+	m->hw_stats_quota_size = mem_offset + MEM_STATS_QUOTA_SIZE;   /* sic: Linux ipa_qmi.c adds mem_offset to the size */
++	m->hw_stats_quota_base = ipa_mem_offset + MEM_STATS_QUOTA_MODEM;
++	m->hw_stats_quota_size = ipa_mem_offset + MEM_STATS_QUOTA_SIZE;   /* sic: Linux ipa_qmi.c adds ipa_mem_offset to the size */
 +	m->skip_uc_load = false;                        /* CHECK: true after the modem's DRIVER_INIT_COMPLETE (uC loaded) */
 +	return true;
 +}
@@ -1483,19 +1483,19 @@ index 0000000..7f15368
 +	ipa_probe_log("before");
 +	{
 +		uint32_t shm = ipa_rd(IPA_SHARED_MEM_SIZE);
-+		mem_offset = 8u * (shm >> 16);
-+		mem_size = 8u * (shm & 0xffffu);
++		ipa_mem_offset = 8u * (shm >> 16);
++		ipa_mem_size = 8u * (shm & 0xffffu);
 +	}
 +	if (ipa_bootarg("modem_ipa_readonly", 0) != 0) {
 +		printf(LOGP "modem_ipa_readonly=1: stopping after the read probe\n");
 +		return false;
 +	}
-+	if (mem_size < MEM_END || mem_offset + MEM_END > 0x10000u) {
++	if (ipa_mem_size < MEM_END || ipa_mem_offset + MEM_END > 0x10000u) {
 +		/* CHECK: ipa_mem_config() only warns when the size is smaller; here we refuse (the canaries would land outside) */
-+		printf(LOGP "local memory %#x+%#x does not hold the v4.2 layout (%#x): stopping\n", mem_offset, mem_size, MEM_END);
++		printf(LOGP "local memory %#x+%#x does not hold the v4.2 layout (%#x): stopping\n", ipa_mem_offset, ipa_mem_size, MEM_END);
 +		return false;
 +	}
-+	sram_va = ml_io_map(IPA_SRAM_PA + mem_offset, IPA_SRAM_SIZE);
++	sram_va = ml_io_map(IPA_SRAM_PA + ipa_mem_offset, IPA_SRAM_SIZE);
 +	if (sram_va == 0 || !spes_soc_map() || !ipa_alloc_all()) {
 +		printf(LOGP "SRAM map, SoC map or pool allocation failed\n");
 +		return false;
@@ -1582,7 +1582,7 @@ index 0000000..7f15368
 +		printf(LOGP "poll thread did not start\n");
 +	}
 +	printf(LOGP "IPA set up: cmd ep %u, LAN ep %u, modem TX ep %u, modem RX ep %u; local memory at %#x; waiting for QMI before "
-+	    "spes_ipa_modem_start()\n", c_cmd.ep, c_lan.ep, c_mtx.ep, c_mrx.ep, mem_offset);
++	    "spes_ipa_modem_start()\n", c_cmd.ep, c_lan.ep, c_mtx.ep, c_mrx.ep, ipa_mem_offset);
 +	return true;
 +}
 +
