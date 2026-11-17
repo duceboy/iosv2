@@ -5315,3 +5315,16 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+## 2026-11-17 09:40 – launchd panic after SSH install: file server did not truncate (0188)
+
+- dropbear 2025.88 (pubkey only, `localoptions.h` PASSWORD_AUTH 0), toybox 0.8.12, dash 0.5.12 built for iOS 16
+  arm64, ad-hoc signed, installed over the file server like ios-flame (`/var/local/bin`, `/bin/sh` -> dash,
+  launchd job `org.spes.dropbear` in `/System/Library/xpc/launchd.plist`, original kept as `.plist.orig`).
+- First job used `-E` -> dropbear prints "Invalid option -E" and exits (no syslog build); launchd restarts it.
+- Second PUT of launchd.plist (without `-E`, 9 bytes shorter) -> next boot: launchd_cache_loader sends the
+  cache, launchd exits "No service cache", initproc panic.
+- Root cause from a 16 GiB userdata snapshot: the phone's file = new plist + the old file's last 9 bytes.
+  The `vnode_open()` KPI ignores O_TRUNC (open1() truncates itself). 0188: `vnode_setsize(vp, 0)` after open,
+  plus fsync/F_FULLFSYNC before "OK" and a double sync before reset.
+- Repair: 7-MiB block delta (launchd.plist without `-E`), before hashes checked, readback = after.
