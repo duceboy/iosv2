@@ -5397,3 +5397,15 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   app's layers never show, the user swipes home and taps again. -> 0194 (diagnostic, CI 44088589821) logs
   OOL copyin failures with the covering map entries.
 - Gap list of IOKit services iOS asks for: docs/IOS-LUECKEN.md.
+
+### 2026-11-17 ~14:45 – Ursache der App-Start-Fehler gefunden (0194) und Fix 0195
+
+0194-Boot (ool-1), Nutzer öffnete viele Apps: 3 Fehlschläge, alle gleich:
+`SPES OOL: SpringBoard fail at 2: len 0xab4794 copy 1 dealloc 0 kr 2`, Eintrag prot 3/3, alias 21 (VM_MEMORY_IOKIT),
+Objekt `phys 1` (phys_contiguous), extern mit Pager, Größe 0xab8000 (~11 MB ≈ Vollbild-Bild, wohl der App-Schnappschuss
+für die Zoom-Animation). `vm_map_copyin_internal` lehnt phys_contiguous-Objekte grundsätzlich ab ("not supported for
+now") → KERN_PROTECTION_FAILURE → MACH_SEND_INVALID_MEMORY → CA-Commit verloren → Fenster erscheint nicht, nochmal tippen.
+Auf dem iPhone ist IOSurface-Speicher normaler auslagerbarer Speicher, daher dort kein Problem.
+**0195:** bei KERN_PROTECTION_FAILURE (≤ 64 MiB) physische Kopie über Kernpuffer in ipc_kernel_copy_map (copyin über die
+User-Abbildung, dann virtuelle Kopie des Puffers), deallocate danach. Log `SPES OOL: … phys-copy fallback`. CI 44123499911.
+Alternative (später, treuer): IOSurface-Speicher nicht phys-zusammenhängend anlegen.
