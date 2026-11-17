@@ -1,0 +1,36 @@
+spes graphics: accept client-memory IOSurfaces with an unpadded last row (0191).
+
+CoreAnimation in backboardd wraps its own pixels and sizes them with an unpadded last row:
+1105x1160 BGRA at 4448 bytes a row with IOSurfaceAllocSize 4448*1159 + 1105*4 = 5159652, and
+256x1 at 672 bytes a row with 512 (0190 log, 2026-11-17). sweet_surface_layout required
+bytesPerRow * rows and refused about 1000 creates a boot with kIOReturnBadArgument. For single-plane
+surfaces around client memory the required extent is now offset + bytesPerRow * (rows - 1) + the last
+row's pixels; the surface keeps the client's exact size. The kernel's own readers stay inside it:
+SweetFramebuffer computes the last byte exactly and checks the scanout window against the memory
+length (such a surface is copied, not scanned out).
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index fefc857..69aed6d 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -557,7 +557,19 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	/* Client-owned pictures must keep their exact extent (HackiOS MiniIOSurface). */
+ 	if (props->getObject("IOSurfaceAddress") != NULL) {
+ 		uint64_t supplied = sweet_dict_u32(props, "IOSurfaceAllocSize", (uint32_t)end);
+-		if (supplied < end) return kIOReturnBadArgument;
++		/*
++		 * 0191: CoreAnimation wraps its own pixels with an unpadded last row: 1105x1160 BGRA at
++		 * 4448 bytes a row comes with IOSurfaceAllocSize 4448*1159 + 1105*4 = 5159652, 256x1 at
++		 * 672 with 512 (0190 log). Requiring bytesPerRow * rows refused about 1000 of backboardd's
++		 * creates a boot. For single-plane client memory the last row only needs its pixels.
++		 */
++		uint64_t need = end;
++		uint32_t rows = sweet_div_up(s->height, s->elementHeight);
++		if (s->planeCount == 0 && rows > 0) {
++			need = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * (rows - 1) +
++			    (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement;
++		}
++		if (supplied < need) return kIOReturnBadArgument;
+ 		alloc = supplied;
+ 	} else {
+ 		alloc = round_page(alloc);
