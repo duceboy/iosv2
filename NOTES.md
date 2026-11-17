@@ -5409,3 +5409,17 @@ Auf dem iPhone ist IOSurface-Speicher normaler auslagerbarer Speicher, daher dor
 **0195:** bei KERN_PROTECTION_FAILURE (≤ 64 MiB) physische Kopie über Kernpuffer in ipc_kernel_copy_map (copyin über die
 User-Abbildung, dann virtuelle Kopie des Puffers), deallocate danach. Log `SPES OOL: … phys-copy fallback`. CI 44123499911.
 Alternative (später, treuer): IOSurface-Speicher nicht phys-zusammenhängend anlegen.
+
+### 2026-11-17 ~17:45 – 0195-Boot (ool-2) und 0196
+
+Nutzer: beim ersten Start gingen alle Apps auf Anhieb auf außer Telefon und Fotos (die lösten „irgendwie einen Swipe“ aus),
+insgesamt etwas flüssiger. Kernel-Log: nur noch 1 OOL-Fehlschlag statt 3, der Fallback lief, aber kr 2: ipc_kernel_copy_map
+ist nur 8 MiB (IPC_KERNEL_COPY_MAP_SIZE), das Bild 11 MiB → Allokation scheitert. **0196:** Puffer aus kernel_map (Muster aus
+IOUserClient.cpp, IOCatalogue), Log mit Schritt (1 Alloc, 2 copyin, 3 copyin des Puffers). CI 44130310949.
+Touch-Log desselben Boots: einzelne „down“ ohne „up“ und „up“ ohne „down“ (z. B. down 478,2399 edge → down 478,1115) –
+entweder Lücken im UDP-Live-Log oder verlorene Abheben-Ereignisse; wäre eine Erklärung für ungewollte Swipes. Offen.
+
+Statische Auswertung des iPhone-X-Kernelcache (kernelcache.release.iphone10b, lokal, nicht im Repo): 240 Kexts, 830
+IOKit-Personalities (`tools-local/kc-personalities.py`), 160 Befehlstabellen mit 1497 nummerierten Befehlen (IOExternalMethodDispatch
+24 Byte und Dispatch2022 40 Byte mit Entitlement, `tools-local/kc-dispatch.py`). User-Clients mit switch-basiertem externalMethod
+fehlen darin (bräuchten Disassemblierung).
