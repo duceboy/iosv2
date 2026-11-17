@@ -1,0 +1,463 @@
+spes-0173: battery level, voltage, current, temperature and charger state, read only
+
+QUP0 SE1 as a read-only bus (spes_i2c1_up/spes_i2c1_read in spes_amp.c, one lock with the
+amplifier bring-up) and SweetBattery reading the max77729 gauge (0x36) and charger (0x69)
+of board 0x20022, or the SM5602 (0x71) and bq2589x (0x6a) of board 0x40022, whichever gauge
+answers. Only with boot-arg spesbattery=1. Nothing is written to any chip.
+NOT RUN ON HARDWARE YET.
+---
+diff --git a/bsd/dev/spes_amp.c b/bsd/dev/spes_amp.c
+index fefec24..6fe7171 100644
+--- a/bsd/dev/spes_amp.c
++++ b/bsd/dev/spes_amp.c
+@@ -18,9 +18,18 @@
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <kern/locks.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void spes_amp_init(void);
++int spes_i2c1_up(void);
++int spes_i2c1_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
++
++/* SE1 has one engine: the amplifier bring-up and the battery reader (0173) take turns. */
++static LCK_GRP_DECLARE(spes_i2c1_grp, "spes_i2c1");
++static LCK_MTX_DECLARE(spes_i2c1_lock, &spes_i2c1_grp);
++static vm_offset_t spes_i2c1_se;       /* set once the bus has been set up */
++static bool spes_i2c1_dead;            /* an engine that did not come back idle: hands off */
+ 
+ #define AMP_GCC_PA      0x01400000u
+ #define AMP_GCC_VOTE    0x7900cu        /* QUP0 wrapper bits 6-9, SE1 bit 11 */
+@@ -329,13 +338,9 @@ amp_power_on(vm_offset_t se, uint8_t addr)
+ 	printf("SPES AMP: %#x on: writes %d/%d, sysctrl %#x gain %#x sysst %#x\n", addr, e1, e2, sys, pagr, st);
+ }
+ 
+-void
+-spes_amp_init(void)
++static void
++amp_init_locked(int on)
+ {
+-	int on = 0;
+-	if (!PE_parse_boot_argn("spesamp", &on, sizeof(on)) || on < 1 || on > 2) {
+-		return;
+-	}
+ 	/* the vote register's page and the S1 clock's page: not 512 KB of io_map's 8 MB */
+ 	vm_offset_t vpg = ml_io_map(AMP_GCC_PA + (AMP_GCC_VOTE & ~0xfffu), 0x1000u);
+ 	vm_offset_t rpg = ml_io_map(AMP_GCC_PA + (AMP_RCG & ~0xfffu), 0x1000u);
+@@ -426,4 +431,174 @@ spes_amp_init(void)
+ 		}
+ 	}
+ }
++
++void
++spes_amp_init(void)
++{
++	int on = 0;
++	if (!PE_parse_boot_argn("spesamp", &on, sizeof(on)) || on < 1 || on > 2) {
++		return;
++	}
++	lck_mtx_lock(&spes_i2c1_lock);
++	amp_init_locked(on);
++	lck_mtx_unlock(&spes_i2c1_lock);
++}
++
++/*
++ * 0173: SE1 as a read-only bus for the battery chips (iokit/Kernel/arm/SweetBattery.cpp,
++ * boot-arg spesbattery=1). Nothing below writes to any chip: the only bytes sent are a chip's
++ * address and the register number to read from.
++ *
++ * spes_i2c1_up() brings the bus up exactly as spes_amp_init() does (same clock vote, same
++ * RCG/branch checks, same firmware and FIFO checks, same pin rule, amp_se_setup) and is safe to
++ * call whether or not spesamp ran, and more than once. 0 = usable.
++ */
++static int
++i2c1_up_locked(void)
++{
++	if (spes_i2c1_dead) {
++		return 1;
++	}
++	if (spes_i2c1_se != 0) {
++		return 0;
++	}
++	vm_offset_t vpg = ml_io_map(AMP_GCC_PA + (AMP_GCC_VOTE & ~0xfffu), 0x1000u);
++	vm_offset_t rpg = ml_io_map(AMP_GCC_PA + (AMP_RCG & ~0xfffu), 0x1000u);
++	if (vpg == 0 || rpg == 0) {
++		printf("SPES I2C1: no GCC mapping\n");
++		return 1;
++	}
++	amp_wr(vpg, AMP_GCC_VOTE & 0xfffu, amp_rd(vpg, AMP_GCC_VOTE & 0xfffu) | AMP_GCC_BITS);
++	if ((amp_rd(rpg, (AMP_RCG & 0xfffu) + 4u) & 0x71fu) != 1u) {
++		amp_wr(rpg, (AMP_RCG & 0xfffu) + 4u, 1u);  /* XO, divider 1: 19.2 MHz */
++		amp_wr(rpg, (AMP_RCG & 0xfffu), amp_rd(rpg, (AMP_RCG & 0xfffu)) | 1u);
++		if (!amp_wait_clear(rpg, (AMP_RCG & 0xfffu), 1u)) {
++			printf("SPES I2C1: RCG update timeout\n");
++			return 1;
++		}
++	}
++	if (!amp_wait_clear(rpg, (AMP_RCG & 0xfffu) - 4u, 1u << 31)) {
++		printf("SPES I2C1: SE1 branch halted (%#x)\n", amp_rd(rpg, (AMP_RCG & 0xfffu) - 4u));
++		return 1;
++	}
++	vm_offset_t se = ml_io_map(AMP_SE_PA, 0x4000);
++	if (se == 0) {
++		printf("SPES I2C1: no SE1 mapping\n");
++		return 1;
++	}
++	uint32_t fw = amp_rd(se, 0x068), tx = amp_rd(se, 0xe24), rx = amp_rd(se, 0xe28);
++	if (((fw >> 8) & 0xffu) != 3u || (amp_rd(se, 0x64) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u) {
++		printf("SPES I2C1: no usable I2C firmware on SE1 (fw %#x tx %#x rx %#x)\n", fw, tx, rx);
++		return 1;
++	}
++	vm_offset_t west = ml_io_map(AMP_WEST_PA, 0x6000);
++	if (west == 0) {
++		printf("SPES I2C1: no TLMM mapping\n");
++		return 1;
++	}
++	for (uint32_t pin = 4; pin <= 5; pin++) {
++		uint32_t cfg = amp_rd(west, pin * 0x1000u);
++		if (((cfg >> 2) & 0xfu) != 1u) {
++			uint32_t want = (cfg & ~0x3cu) | (1u << 2) | 3u;   /* qup1, pull-up */
++			if (cfg & (1u << 11)) {
++				want |= 1u << 12;
++			}
++			amp_wr(west, pin * 0x1000u, want);
++		}
++		if (!(amp_rd(west, pin * 0x1000u + 4u) & 1u)) {
++			printf("SPES I2C1: GPIO%u pad low while idle; bus not used\n", pin);
++			return 1;
++		}
++	}
++	if (!amp_se_setup(se, rx)) {
++		return 1;
++	}
++	spes_i2c1_se = se;
++	return 0;
++}
++
++int
++spes_i2c1_up(void)
++{
++	lck_mtx_lock(&spes_i2c1_lock);
++	int err = i2c1_up_locked();
++	lck_mtx_unlock(&spes_i2c1_lock);
++	return err;
++}
++
++/*
++ * Read len (1..4) bytes starting at register reg: the register number is written with the bus
++ * kept (repeated START), then len bytes are read in one message. GENI packs received bytes
++ * into the FIFO word lowest byte first (RX packing = TX packing, amp_se_setup), so byte i is
++ * bits 8i..8i+7; i2c-qcom-geni.c and Topaz's sweet_i2c1.c read the same way. The 16-bit
++ * registers of the gauges are least significant byte first on the wire.
++ * 0 done, 1 NACK, 2 other error, 3 engine stuck (the bus is then left alone for good), 4 not up.
++ */
++int
++spes_i2c1_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len)
++{
++	if (buf == NULL || len < 1 || len > 4) {
++		return 2;
++	}
++	lck_mtx_lock(&spes_i2c1_lock);
++	vm_offset_t se = spes_i2c1_se;
++	int err = 4;
++	if (se != 0) {
++		err = amp_msg(se, addr, false, &reg);
++	}
++	if (se != 0 && err == 0) {
++		err = 2;
++		if (!amp_wait_clear(se, SE_STATUS, 1u)) {
++			err = 3;
++		} else {
++			bool got = false;
++			amp_wr(se, SE_IRQ_CLR, 0xffffffffu);
++			amp_wr(se, SE_TX_WM, 0);
++			amp_wr(se, SE_RX_LEN, len);
++			amp_wr(se, SE_CMD, (2u << 27) | ((uint32_t)addr << 9));
++			unsigned i;
++			for (i = 0; i < 5000; i++) {
++				uint32_t irq = amp_rd(se, SE_IRQ);
++				if (irq & SE_ERRORS) {
++					for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); j++) {
++						delay(1);
++						irq = amp_rd(se, SE_IRQ);
++					}
++					err = (irq & SE_NACK) ? 1 : 2;
++					if ((irq & SE_DONE) && !(amp_rd(se, SE_STATUS) & 1u)) {
++						amp_wr(se, SE_IRQ_CLR, irq);
++					} else if (!amp_abort(se)) {
++						err = 3;
++					}
++					break;
++				}
++				if (!got && (amp_rd(se, SE_RX_COUNT) & 0x1ffffffu)) {
++					uint32_t word = amp_rd(se, SE_RX);
++					for (unsigned b = 0; b < len; b++) {
++						buf[b] = (uint8_t)(word >> (8u * b));
++					}
++					got = true;
++				}
++				if (irq & SE_DONE) {
++					amp_wr(se, SE_IRQ_CLR, irq);
++					err = got ? 0 : 2;
++					break;
++				}
++				amp_wr(se, SE_IRQ_CLR, irq & (SE_TX_WM_IRQ | (3u << 26)));
++				delay(1);
++			}
++			if (i == 5000) {
++				err = amp_abort(se) ? 2 : 3;
++			}
++		}
++	}
++	if (err == 3) {
++		printf("SPES I2C1: engine stuck; SE1 is not used again this boot\n");
++		spes_i2c1_se = 0;
++		spes_i2c1_dead = true;
++	}
++	lck_mtx_unlock(&spes_i2c1_lock);
++	return err;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..2807189 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -15,6 +15,9 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* bsd/dev/spes_amp.c: QUP0 SE1, read-only (0173) */
++extern "C" int spes_i2c1_up(void);
++extern "C" int spes_i2c1_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -28,6 +31,14 @@ private:
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
++	int fSpes;              /* 0 none, 1 max77729 (board 0x20022), 2 SM5602 + bq2589x (0x40022) */
++	unsigned fSpesLogs;
++	int fTempCentiC;        /* what publish() reports; 2500 until a gauge has measured it */
++	bool fTempMeasured;
++	unsigned fCycles;
++	bool pollSpesMax(void);
++	bool pollSpesSm(void);
++	static bool spesWord(uint8_t addr, uint8_t reg, uint16_t *value);
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -52,6 +63,11 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+ 	fTimerAdded = fRunning = fReal = false;
++	fSpes = 0;
++	fSpesLogs = 0;
++	fTempCentiC = 2500;
++	fTempMeasured = false;
++	fCycles = 0;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -115,7 +131,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	setVoltage(mv);
+ 	setAmperage(ma);
+ 	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
+-	setCycleCount(0);     /* Placeholder: cycle learning is not implemented. */
++	setCycleCount(fCycles); /* 0 unless a gauge reported it (spes max77729) */
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+@@ -123,11 +139,11 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putNumber("DesignCapacity", 5020);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	putNumber("Temperature", (UInt32)fTempCentiC);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+ 	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatteryTemperatureEstimated", !fTempMeasured);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -154,7 +170,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    !measured ? "static fallback" : fSpes ? "spes gauge" : "PM6150 / estimated SOC",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -203,9 +219,132 @@ SweetBattery::estimatePercent(unsigned mv)
+ 	return 100;
+ }
+ 
++/*
++ * spes (0173, boot-arg spesbattery=1): the battery chips on QUP0 SE1, READ ONLY. Nothing is
++ * written to any of them; charging is left to the hardware as the bootloader set it up.
++ *
++ * There are two spes boards (Xiaomi's kernel, arch/arm64/boot/dts/vendor/qcom):
++ *   spes.dtsi, board-id 0x20022: Maxim max77729 at 0x66 (top), its charger at 0x69 and its
++ *     fuel gauge at 0x36 (drivers/mfd/maxim/max77729.c: 0xD2 >> 1 and 0x6C >> 1), sc8551 at 0x65;
++ *   spes-sm5602.dtsi, board-id 0x40022: SM5602 gauge at 0x71 and a bq2589x charger at 0x6a,
++ *     the pair Topaz has (topaz 0091), sc8551 at 0x66.
++ * Which board this is, is found by which gauge answers.
++ *
++ * max77729 gauge (ModelGauge m5; 16-bit registers, low byte first), numbers from Xiaomi's
++ * drivers/power/supply/maxim/max77729_fuelgauge.c and the DT (fuelgauge,fg_resistor = 2):
++ *   0x06 SOCREP   percent in the high byte, 1/256 % in the low  (max77729_fg_read_soc)
++ *   0x09 VCELL    78.125 uV per count                            (max77729_fg_read_vcell)
++ *   0x0A CURRENT  signed, 15625 * fg_resistor / 100 uA per count = 0.3125 mA; Linux reports it
++ *                 as is for POWER_SUPPLY current_now, where Xiaomi's sign is + while charging
++ *                 -- to be confirmed against Android (the log prints the raw word)
++ *   0x08 TEMP     signed, 1/256 degC per count                   (max77729_fg_read_temp)
++ *   0x17 CYCLES   1/100 cycle per count                          (max77729_fg_read_cycle)
++ * max77729 charger (max77729_charger.h):
++ *   0xB2 CHG_INT_OK   bit 6 CHGIN_OK: a valid input is on the USB port
++ *   0xB4 CHG_DTLS_01  bits 3:0: 0..3 charging (prequal, CC, CV, top-off), 4 done, 5..7 not
++ *                     charging, 8 off                            (max77729_get_charger_state)
++ */
++bool
++SweetBattery::spesWord(uint8_t addr, uint8_t reg, uint16_t *value)
++{
++	uint8_t w[2] = { 0, 0 };
++	if (spes_i2c1_read(addr, reg, w, 2) != 0) {
++		return false;
++	}
++	*value = (uint16_t)((unsigned)w[0] | ((unsigned)w[1] << 8));
++	return true;
++}
++
++bool
++SweetBattery::pollSpesMax(void)
++{
++	uint16_t soc, vcell, cur, temp = 0, cycles = 0;
++	if (!spesWord(0x36, 0x06, &soc) || !spesWord(0x36, 0x09, &vcell) ||
++	    !spesWord(0x36, 0x0a, &cur)) {
++		return false;
++	}
++	bool tempOk = spesWord(0x36, 0x08, &temp);
++	bool cyclesOk = spesWord(0x36, 0x17, &cycles);
++	uint8_t ok = 0, dtls = 0;
++	bool chgOk = spes_i2c1_read(0x69, 0xb2, &ok, 1) == 0 &&
++	    spes_i2c1_read(0x69, 0xb4, &dtls, 1) == 0;
++
++	unsigned percent = (soc >> 8) + ((soc & 0xffu) >= 0x80u ? 1u : 0u);
++	unsigned mv = (unsigned)(((uint64_t)vcell * 78125u) / 1000000u);
++	int ma = (int)(((int64_t)(int16_t)cur * 3125) / 10000);
++	if (percent > 101 || mv < 2800 || mv > 4600) {
++		return false;   /* an unprogrammed or absent gauge must not become a flat battery */
++	}
++	if (percent > 100) {
++		percent = 100;
++	}
++	if (tempOk) {
++		int centi = ((int)(int16_t)temp * 100) / 256;
++		if (centi > -3000 && centi < 9000) {
++			fTempCentiC = centi < 0 ? 0 : centi;
++			fTempMeasured = true;
++		}
++	}
++	unsigned state = dtls & 0x0fu;
++	bool external = chgOk && (ok & 0x40u) != 0;
++	bool charging = external && state <= 3;
++	bool done = external && state == 4;
++	if (cyclesOk) {
++		fCycles = cycles / 100u;
++	}
++	publish(done ? 100 : percent, mv, ma, external, external, charging, done, true, true);
++	if (fSpesLogs++ % 20 == 0) {
++		IOLog("SPES BATTERY: max77729 %u%% %umV %dmA temp=%d cycles=%u ok=%#x dtls=%#x "
++		    "(raw soc=%#x vcell=%#x cur=%#x temp=%#x) external=%d charging=%d\n",
++		    percent, mv, ma, fTempCentiC, cyclesOk ? cycles / 100u : 0u, ok, dtls,
++		    soc, vcell, cur, temp, external, charging);
++	}
++	return true;
++}
++
++/* Board 0x40022: Topaz's chips, Topaz's arithmetic (topaz 0091, MakrSas/topaz-woa gauge.c). */
++bool
++SweetBattery::pollSpesSm(void)
++{
++	uint16_t soc, volt, cur;
++	uint8_t st = 0;
++	if (!spesWord(0x71, 0x05, &soc) || !spesWord(0x71, 0x07, &volt) ||
++	    !spesWord(0x71, 0x08, &cur)) {
++		return false;
++	}
++	bool chgOk = spes_i2c1_read(0x6a, 0x0b, &st, 1) == 0;
++	unsigned percent = (soc & 0x8000u) ? 0 : ((soc >> 8) & 0x7fu);
++	unsigned mv = 1800u * (volt & 0x7fffu) / 19622u + 2700u;
++	int ma = (int)((cur & 0x7fffu) * 1000u / 4088u * 2u);
++	if (cur & 0x8000u) {
++		ma = -ma;
++	}
++	if (percent > 100 || mv < 2800 || mv > 4600) {
++		return false;
++	}
++	unsigned vbus = (st >> 5) & 7u, chrg = (st >> 3) & 3u;
++	bool external = chgOk && vbus >= 1 && vbus <= 6 && (st & 4u);
++	bool charging = external && (chrg == 1 || chrg == 2);
++	bool done = external && chrg == 3;
++	publish(done ? 100 : percent, mv, ma, external, external, charging, done, true, true);
++	if (fSpesLogs++ % 20 == 0) {
++		IOLog("SPES BATTERY: sm5602 %u%% %umV %dmA chg=%#x (raw soc=%#x volt=%#x cur=%#x) "
++		    "external=%d charging=%d\n", percent, mv, ma, st, soc, volt, cur, external, charging);
++	}
++	return true;
++}
++
+ void
+ SweetBattery::poll(void)
+ {
++	if (fSpes) {
++		if (fSpes == 1 ? pollSpesMax() : pollSpesSm()) {
++			return;
++		}
++		/* A failed read keeps the last good values out: say "unknown, on AC", not 0%. */
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -265,9 +404,25 @@ SweetBattery::start(IOService *provider)
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
++	int spes = 0;
++	(void)PE_parse_boot_argn("spesbattery", &spes, sizeof(spes));
++	if (spes == 1 && !fReal) {
++		uint16_t probe;
++		if (spes_i2c1_up() != 0) {
++			IOLog("SPES BATTERY: SE1 not usable; static fallback\n");
++		} else if (spesWord(0x36, 0x06, &probe)) {
++			fSpes = 1;
++			IOLog("SPES BATTERY: max77729 gauge answers at 0x36\n");
++		} else if (spesWord(0x71, 0x05, &probe)) {
++			fSpes = 2;
++			IOLog("SPES BATTERY: SM5602 gauge answers at 0x71\n");
++		} else {
++			IOLog("SPES BATTERY: no gauge at 0x36 or 0x71; static fallback\n");
++		}
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+-	if (fReal) {
++	if (fReal || fSpes) {
+ 		fLoop = IOWorkLoop::workLoop();
+ 		fTimer = IOTimerEventSource::timerEventSource(this, &SweetBattery::timerFired);
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+@@ -276,6 +431,7 @@ SweetBattery::start(IOService *provider)
+ 			fTimer->setTimeoutMS(30000);
+ 		} else {
+ 			fReal = false;
++			fSpes = 0;
+ 			poll();
+ 			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
+ 		}
