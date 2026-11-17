@@ -140,6 +140,11 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   (0x90014450/0x91014450), then "frame copied by the processor" (slow path). Touch: 31470 frames, 6037 errors,
   58 taps. Battery 15 samples temp_in 34 C. **User: the status bar battery showed 100 %** -> 0173/0179 (SM5602 via
   spes_i2c1, spesbattery=1) confirmed on hardware end to end (gauge -> SweetBattery -> IOPMPowerSource -> SpringBoard).
+- **Mesa build prerequisite (macOS):** use **flex 2.6.4** (`/usr/bin/flex`). Homebrew flex 2.6.15 writes
+  `#define _POSIX_C_SOURCE 1` into the generated scanner before Mesa's headers; on Darwin that hides the BSD
+  extensions and `ir3_lexer.c` fails (UTIL_ARCH_LITTLE_ENDIAN unset, Dl_info/dladdr undeclared). Remove Homebrew
+  flex or keep it out of PATH, and delete research/mesa-build/build-spes (meson caches the flex path). bison from
+  Homebrew (3.8.2; Mesa wants > 2.3). SDK used here: iPhoneOS 27.2 with -target arm64-apple-ios16.0.
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
