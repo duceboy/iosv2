@@ -5423,3 +5423,9 @@ Statische Auswertung des iPhone-X-Kernelcache (kernelcache.release.iphone10b, lo
 IOKit-Personalities (`tools-local/kc-personalities.py`), 160 Befehlstabellen mit 1497 nummerierten Befehlen (IOExternalMethodDispatch
 24 Byte und Dispatch2022 40 Byte mit Entitlement, `tools-local/kc-dispatch.py`). User-Clients mit switch-basiertem externalMethod
 fehlen darin (bräuchten Disassemblierung).
+
+### 2026-11-17 19:05 – 0196 wirkt: App-Starts auf Anhieb
+
+Boot ool-3 (CI 44130310949, Kernel fbe9702d…): `SPES OOL: SpringBoard phys-copy fallback #0 len 0xab4794 kr 0 step 3` – die
+Kopie gelingt, kein OOL-Fehlschlag mehr. Nutzer: Fotos als erste App ~10 s weiß beim Laden, danach gehen **alle anderen Apps
+direkt auf**. Offen: schwarzer Balken oben beim App-Start (nur Notch-Bereich oder halbes Bild), Fotos-Erststart langsam.
