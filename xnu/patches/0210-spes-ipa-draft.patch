@@ -8,7 +8,6 @@ never in git), GSI rings/channels for AP channels 1/2/0/3, endpoints, empty filt
 TX/RX with spes_ipa_rx_hook. Every unsure value carries a CHECK comment. Called from SpesModem before the modem boots;
 nothing without modem_ipa_data=1, and modem_ipa_readonly=1 stops after the clock vote and the read-only probe (first run).
 Still missing: IPA QMI handshake, WDA/DPM/WDS, the en1 interface (docs/OFFENE-TREIBER.md).
-
 diff --git a/bsd/conf/files b/bsd/conf/files
 index 2012dd1..dd7890a 100644
 --- a/bsd/conf/files
