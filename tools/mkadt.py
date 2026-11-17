@@ -73,6 +73,28 @@ def d22ap_product(path=D22AP_ADT):
                     for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
     raise SystemExit(f'{path}: no /product node')
 
+
+# /product child nodes copied from D22AP (HackiOS xnuloader/mkidentity.py does the same): haptics
+# (closed-loop: MobileGestalt DeviceSupportsClosedLoopHaptics, without it iOS never plays its feedbacks
+# as waveforms on the "Actuator" audio device), audio, camera (flash -> Control Center flashlight),
+# facetime, maps. MKADT_PRODUCT_CHILDREN=0 leaves them out.
+def d22ap_product_children(ph, path=D22AP_ADT):
+    if os.environ.get('MKADT_PRODUCT_CHILDREN', '1') == '0' or not os.path.exists(path):
+        return []
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
+            out = []
+            for g in c.children:
+                props = dict((k, v) for k, f, v in g.props)
+                nm = props.get('name', b'').rstrip(b'\0').decode()
+                if nm not in ('haptics', 'audio', 'camera', 'facetime', 'maps'):
+                    continue
+                out.append(node(nm, [ph()] + [(k, v) for k, f, v in g.props
+                                              if not f and k not in ('name', 'AAPL,phandle')]))
+            return out
+    return []
+
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
@@ -242,7 +264,7 @@ def build(seed=None, qemu=False, highmem=False, device="topaz", memory=None):
     ])
 
     product_props = d22ap_product()
-    product = [node('product', [ph()] + product_props)] if product_props else []
+    product = [node('product', [ph()] + product_props, d22ap_product_children(ph))] if product_props else []
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product

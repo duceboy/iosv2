@@ -1,0 +1,218 @@
+spes: SIM bring-up and registration (0202; modem_nas=1, modem_online=1).
+
+all-1: UIM said "card absent" in both slots with a SIM inserted: 0200 asked once, ~0.5 s after the
+service appeared, before UIM had looked at the cards. Now card status every 30 s until a card is READY.
+Then, as HackiOS hakios.mpss.c (cycles 30-37): logical slot 1 pointed at the physical slot with the READY
+card (UIM Switch Slot 0x46) when slot 1 has none; the READY/detected USIM of slot 1 made the primary GW
+application when none is (Change Provisioning Session 0x38; AID sent, never logged). modem_online=1 adds
+DMS Get/Set Operating Mode online (0x2D/0x2E) after 5 s and NAS Initiate Network Register automatic (0x22)
+once a card is ready. The modem's EFS writes stay in RAM (rmtfs): nothing persists. Application parsing
+fixed (type, state, perso state, feature, 2 retries, AID length + AID, 7 PIN bytes).
+
+diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
+index e4d7b3f..d700b26 100644
+--- a/iokit/Kernel/arm/SpesModem.cpp
++++ b/iokit/Kernel/arm/SpesModem.cpp
+@@ -566,7 +566,8 @@ static struct { uint32_t svc, inst, node, port; } q_srv[64];
+ static unsigned q_srv_count, g_rx_msgs, g_tx_msgs, q_resumes;
+ static unsigned g_ms;                           /* watch time, for the log */
+ static uint32_t n_node, n_port, u_node, u_port;    /* 0200: NAS / UIM servers */
+-static bool n_on, n_have, u_have;               /* 0200: modem_nas=1; servers seen (node 0 is the modem) */
++static bool n_on, n_have, u_have, d_have;       /* 0200/0202: modem_nas=1; servers seen (node 0 is the modem) */
++static uint32_t d_node, d_port;                 /* 0202: DMS server */
+ 
+ static uint32_t
+ rx_avail(void)
+@@ -874,6 +875,8 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 				n_node = c->c; n_port = c->d; n_have = true;
+ 			} else if (c->a == 0x0B && !u_have) {
+ 				u_node = c->c; u_port = c->d; u_have = true;
++			} else if (c->a == 0x02 && !d_have) {       /* 0202 */
++				d_node = c->c; d_port = c->d; d_have = true;
+ 			}
+ 		}
+ 		break;
+@@ -6094,7 +6097,6 @@ svc_announce(void)
+ #define PORT_UIMC           0x4006
+ static uint32_t n_last_ms;
+ static uint16_t n_txn = 0x100;
+-static bool u_asked;
+ 
+ static void
+ nq_send(uint32_t port_from, uint32_t node, uint32_t port, uint16_t msg)
+@@ -6118,16 +6120,15 @@ nas_rat(uint8_t r)
+ 	}
+ }
+ 
++static void cell_tick(unsigned ms);              /* 0202 */
++
+ static void
+ nas_tick(unsigned ms)
+ {
+ 	if (!n_on) {
+ 		return;
+ 	}
+-	if (u_have && !u_asked) {
+-		u_asked = true;
+-		nq_send(PORT_UIMC, u_node, u_port, 0x2F);
+-	}
++	cell_tick(ms);                                  /* 0202 */
+ 	if (n_have && (n_last_ms == 0 || ms - n_last_ms >= 30000)) {
+ 		n_last_ms = ms ? ms : 1;
+ 		nq_send(PORT_NASC, n_node, n_port, 0x24);
+@@ -6179,6 +6180,35 @@ nas_rx(const uint8_t *d, uint32_t len)
+ 	}
+ }
+ 
++static uint32_t u_last_ms;
++static bool d_online_sent, n_reg_sent, u_switched, u_provisioned, u_card_ready;
++#define PORT_DMSC           0x4007
++
++/* send a request with prepared TLV bytes (body = TLVs) */
++static void
++nq_send_tlv(uint32_t port_from, uint32_t node, uint32_t port, uint16_t msg, const uint8_t *tlv, uint16_t tlen)
++{
++	uint8_t b[96];
++	if (tlen > sizeof(b) - 7) {
++		return;
++	}
++	b[0] = QMI_REQ;
++	uint16_t t = n_txn++;
++	memcpy(b + 1, &t, 2);
++	memcpy(b + 3, &msg, 2);
++	memcpy(b + 5, &tlen, 2);
++	memcpy(b + 7, tlv, tlen);
++	qrtr_send(QRTR_TYPE_DATA, port_from, node, port, b, (uint32_t)(7 + tlen));
++}
++
++/*
++ * 0202: card status every 30 s until a card is READY (the first answer at t~0.5 s came before UIM had looked
++ * at the cards: "absent" in both slots with a SIM inserted). Then, as HackiOS hakios.mpss.c does (cycles 30-37):
++ * logical slot 1 pointed at the physical slot with the READY card (UIM Switch Slot 0x46) when slot 1 has none;
++ * the READY/detected USIM of slot 1 made the primary GW application when none is (Change Provisioning Session
++ * 0x38; the AID is sent, never logged). modem_online=1 also: DMS Set Operating Mode online (0x2E) and NAS
++ * Initiate Network Register automatic (0x22). The modem's EFS writes stay in RAM (rmtfs), nothing persists.
++ */
+ static void
+ uim_rx(const uint8_t *d, uint32_t len)
+ {
+@@ -6201,21 +6231,99 @@ uim_rx(const uint8_t *d, uint32_t len)
+ 		LOG("uim: card status without the status TLV");
+ 		return;
+ 	}
+-	unsigned slots = v[8], o = 9;
++	unsigned slots = v[8], o = 9, primary_gw = (unsigned)(v[0] | v[1] << 8), ready_slot = 0, first_card = ~0u;
++	uint8_t aid[33] = { 0 };
+ 	static const char *cs[] = { "absent", "present", "error" };
+-	static const char *as[] = { "unknown", "detected", "pin1/upin required", "puk1 required", "perso", "pin1 blocked", "illegal", "ready" };
++	static const char *as[] = { "unknown", "detected", "pin1 wanted", "puk1 wanted", "perso", "pin1 blocked", "illegal", "ready" };
++	LOG("uim: primary GW %#x, %u slot(s)", primary_gw, slots);
+ 	for (unsigned sl = 0; sl < slots && o + 6 <= l; sl++) {
+ 		unsigned card = v[o], napp = v[o + 5];
+-		LOG("uim: slot %u card %s, %u application(s)", sl + 1, card < 3 ? cs[card] : "?", napp);
++		LOG("uim: slot %u card %s, upin %u, error %u, %u application(s)", sl + 1, card < 3 ? cs[card] : "?", v[o + 1], v[o + 4], napp);
++		if (sl == 0) {
++			first_card = card;
++		}
+ 		o += 6;
+-		for (unsigned a = 0; a < napp && o + 2 <= l; a++) {
+-			unsigned type = v[o], state = v[o + 1];
+-			unsigned aidlen = (o + 4 < l) ? v[o + 4] : 0;     /* skip the AID itself */
+-			LOG("uim:   app type %u state %s", type, state < 8 ? as[state] : "?");
+-			o += 5 + aidlen;            /* type, state, perso state, perso feature, aid len, aid */
+-			o += 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1;   /* upin flag, pin1 state, pin1/puk1 retries, pin2 state, pin2/puk2 retries */
++		for (unsigned a = 0; a < napp && o + 7 <= l; a++) {
++			unsigned type = v[o], state = v[o + 1], alen = v[o + 6];
++			LOG("uim:   app %u type %u state %s", a, type, state < 8 ? as[state] : "?");
++			if (card == 1 && state == 7 && ready_slot == 0) {
++				ready_slot = sl + 1;
++			}
++			if (sl == 0 && card == 1 && (state == 7 || state == 1) && (type == 1 || type == 2) && alen <= 32 && o + 7 + alen <= l) {
++				aid[0] = (uint8_t)alen;
++				memcpy(aid + 1, v + o + 7, alen);
++			}
++			o += 7 + alen + 7;
+ 		}
+ 	}
++	u_card_ready = ready_slot != 0;
++	if (first_card != 1 && ready_slot > 1 && !u_switched) {
++		uint8_t t[] = { 0x01, 1, 0, 1,  0x02, 4, 0, (uint8_t)ready_slot, 0, 0, 0 };
++		u_switched = true;
++		LOG("uim: logical slot 1 -> physical slot %u (card ready there)", ready_slot);
++		nq_send_tlv(PORT_UIMC, u_node, u_port, 0x46, t, sizeof(t));
++	}
++	if (primary_gw == 0xffff && aid[0] != 0 && !u_provisioned) {
++		uint8_t t[5 + 3 + 2 + 32];
++		unsigned n = 0;
++		t[n++] = 0x01; t[n++] = 2; t[n++] = 0; t[n++] = 0; t[n++] = 1;          /* primary GW, activate */
++		t[n++] = 0x10; t[n++] = (uint8_t)(2 + aid[0]); t[n++] = 0;
++		t[n++] = 1; t[n++] = aid[0];
++		memcpy(t + n, aid + 1, aid[0]);
++		n += aid[0];
++		u_provisioned = true;
++		LOG("uim: slot 1 USIM made the primary GW application");
++		nq_send_tlv(PORT_UIMC, u_node, u_port, 0x38, t, (uint16_t)n);
++	}
++}
++
++static void
++dms_rx(const uint8_t *d, uint32_t len)
++{
++	uint16_t msg = 0, l = 0, res = 0xffff, err = 0xffff;
++	if (len < 7) {
++		return;
++	}
++	memcpy(&msg, d + 3, 2);
++	const uint8_t *r = qm_find(d, len, 2, &l);
++	if (r != NULL && l >= 4) {
++		memcpy(&res, r, 2);
++		memcpy(&err, r + 2, 2);
++	}
++	if (msg == 0x2D) {
++		const uint8_t *v = qm_find(d, len, 1, &l);
++		LOG("dms: operating mode %d (0 online, 1 low power, 2 factory, 3 offline, 5 shutting down, 6 persistent low power)",
++		    v != NULL && l >= 1 ? (int)v[0] : -1);
++	} else {
++		LOG("dms: msg %#x result %u error %u", msg, res, err);
++	}
++}
++
++static void
++cell_tick(unsigned ms)
++{
++	static int online = -1;
++	if (online < 0) {
++		online = 0;
++		(void)PE_parse_boot_argn("modem_online", &online, sizeof(online));
++	}
++	if (u_have && !u_card_ready && (u_last_ms == 0 || ms - u_last_ms >= 30000)) {
++		u_last_ms = ms ? ms : 1;
++		nq_send(PORT_UIMC, u_node, u_port, 0x2F);
++	}
++	if (d_have && online == 1 && !d_online_sent && ms > 5000) {
++		uint8_t t[] = { 0x01, 1, 0, 0 };                /* operating mode: online */
++		d_online_sent = true;
++		LOG("dms: asking for operating mode online");
++		nq_send(PORT_DMSC, d_node, d_port, 0x2D);
++		nq_send_tlv(PORT_DMSC, d_node, d_port, 0x2E, t, sizeof(t));
++	}
++	if (n_have && online == 1 && u_card_ready && !n_reg_sent) {
++		uint8_t t[] = { 0x01, 1, 0, 1 };                /* register automatically */
++		n_reg_sent = true;
++		LOG("nas: initiate network register (automatic)");
++		nq_send_tlv(PORT_NASC, n_node, n_port, 0x22, t, sizeof(t));
++	}
+ }
+ 
+ static bool
+@@ -6239,6 +6347,10 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+ 		uim_rx(data, len);
+ 		return true;
+ 	}
++	if (dst_port == PORT_DMSC) {
++		dms_rx(data, len);
++		return true;
++	}
+ 	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
+ 		return tftp_session(dst_port, data, len);
+ 	}
