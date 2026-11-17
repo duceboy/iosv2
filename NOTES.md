@@ -5344,3 +5344,11 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - 0191: single-plane client memory needs offset + bpr*(rows-1) + last row's pixels. Run surf-3 (CI
   44054679871): 0 refused creates (before ~1000), both shapes created once (backboardd stops retrying).
   Crashes in 90 s: driverkitd 1, syncdefaultsd 9 (both known). Visual check of the glitches still open.
+
+## 2026-11-17 10:50 – mediaserverd SIGBUS (ios2) symbolicated, deferred
+
+- Crash thread: H264SW.videocodec encoder worker (`_VCPAVCRegisterEncoder+0xf804`, from __pthread_start);
+  the faulting store hits a read-only shared-cache page (SnippetUI __TEXT) -> a bad output pointer, after
+  the only 420v surface of that boot (332x198, 2 planes, 131072 bytes).
+- Seen once (ios2, before the graphics stage); 0 mediaserverd crashes and 0 420v surfaces in gfx1 and the
+  nine USB-era iOS boots since. Deferred per the plan ("if it persists"); watch for `fmt 0x34323076`.
