@@ -5360,3 +5360,8 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   ENABLE 0x84 -> 0x80: bit 2 (source select) is not kept on this SUBTYPE_PWM channel; bit 7 is. Driver stopped,
   output off, 0xb341-0xb346 restored = before (logged). 0193 compares bits 7/1 only. Next: spesvib=3 again
   with 0193, then spesvib=4 (100 ms) with the user holding the phone.
+- vib-3 (spesvib=3, 0193, CI 44062990696): PWM on `00 07 01 20 b3 01 80 00`, restored = before.
+- **vib-4 (spesvib=4, 13:15): the motor buzzes.** LPG PWM on as vib-3, GPIO36 enable high (cfg 0x240 io 0x3)
+  for 100 ms, pin restored (cfg 0 io 0), LPG 0xb341-0xb346 restored = before. User felt one short tick.
+  Slots b/6 before and after. First vibration under XNU on spesn. Next for haptics: an iOS-facing path
+  (HackiOS audio_plugin "Actuator" -> device node) instead of the boot-time test.
