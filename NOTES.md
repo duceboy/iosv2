@@ -5379,4 +5379,8 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - Second WLAN boot (user, 13:40): join takes ~15 s, no error message this time. Safari did not start on the first
   tap and showed graphics errors, worked after 2-3 tries and then loads all pages. Share sheet hangs. Kernel log of
   that boot: no MobileSafari/WebKit crash, 0 refused IOSurfaces, only syncdefaultsd (11x, known) and driverkitd
-  (1x SIG9, known) crash. Touch down=191 up=33 (up events missing) — possible cause of stuck UI; to check.
+  (1x SIG9, known) crash. Touch down=191 up=33 is NOT an imbalance: s_down counts every position change, s_up the lifts (33 taps).
+- User (13:45): no pixel errors in the wallpaper any more (0191 confirmed). Every app needs 1-3 taps to start; the
+  icon briefly disappears (launch animation starts, then back on the home screen), then the next tap works. Feels
+  like 20-30 fps, no stutter. Log: no app crash; spindump launched 2x and ReportMemoryException 2x (hang/memory
+  reports), wifip2pd restarts 38x. Next: sample SpringBoard during a failed launch (sweetsample).
