@@ -111,6 +111,20 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   iOS image `shim/out/spes-ios.img` (e6275fd4...cd20): `SPES_MEMORY_FLOOR=0xa0000000 SPES_EXTRA_BOOTARGS=
   spesbattery=1 tools/build-spes-ios.sh`, rd=ufsroot0 ufsrw=1 rootrw=1 sweetlog=1, ADT with the D22AP /product
   node. Not booted yet.
+- **First iOS boot (observed, 2026-11-17 05:09, `shim/out/spes-ios.img` e6275fd4...cd20):** user saw the Apple
+  logo unchanged for ~11 min, then aborted. sweetlog `research/logs/ios1.txt` (129611 B, flush #68). launchd
+  from the HFS root ("not in trust cache" for the shared cache, continues), 212 different programs exec'd;
+  SpringBoard, backboardd, mediaserverd, runningboardd, lsd, lockdownd, mobileactivationd, wifid, locationd,
+  powerd once each; restarts only bluetoothd and fairplayd.H2 (68 each, no hardware, as upstream); the only
+  CRASH is driverkitd SIG9. backboardd matched IOAcceleratorES 76 times (no Metal plug-in named). Samples
+  (symbolicated with a local read-only dyld cache resolver, ~/ios-spes/tools-local/dsc_a2s.py): **SpringBoard's
+  main thread in every sample in `LaunchServices::Database::Context::_get` -> `_LSContextInitCommon` ->
+  `_LSCopyServerStore` -> synchronous XPC to lsd** (= all15: lsd builds the LaunchServices database from
+  scratch on a fresh root). backboardd idle in its run loop. Battery: 24 samples, temp_in 34 C throughout,
+  temp_ex raw 0x9ea7 -> 0x9dd7, +156 mA -> 0 mA. Touch: thousands of `report err=5` at first, later valid events.
+  Likely slow, not dead: the author's first boot after an LS reset took ~15 min, and before 0170 "hours",
+  because MobileGestalt waited up to 5 s per lookup without `local-mac-address` on the wlan node, which only
+  RedwoodWLAN sets (needs modem=1 wifi=1). Our image had neither.
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
