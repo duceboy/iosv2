@@ -1,0 +1,35 @@
+spes battery (0182): log the SM5602 temperature on every poll (spesbattery=1), read only.
+
+Without own charge control the live DT's JEITA step down (4100 mV above T3) is missing; the bq2589x
+keeps the ABL settings (VREG 4448 mV, ICHG 448 mA) at any temperature. Every 30 s poll now logs
+TEMPERATURE_IN (0x09, degC low byte, bit 15 negative, as sm5602_fuelgauge.c) and the raw
+TEMPERATURE_EX (0x0A, battery NTC; Linux needs batteryN,thermal_table, absent from this phone's
+live DT, so the raw value is logged for calibration against Linux), with SOC, voltage and current.
+
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index f98b81c..637056d 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -328,6 +328,22 @@ SweetBattery::pollSpesSm(void)
+ 	if (percent > 100 || mv < 2800 || mv > 4600) {
+ 		return false;
+ 	}
++	/*
++	 * 0182: battery temperature, read only, logged on every poll (30 s): there is no own
++	 * charge control yet, so the JEITA step down to 4100 mV above T3 (live DT) is missing and
++	 * the temperature has to be watched. SM5602 0x09 TEMPERATURE_IN: degC in the low byte, bit 15
++	 * negative (sm5602_fuelgauge.c TEMPERATURE_IN); 0x0A TEMPERATURE_EX: the battery NTC, raw
++	 * (Linux converts it with batteryN,thermal_table, which this phone's live DT does not have:
++	 * calibrate against Linux's power_supply temp before trusting a conversion).
++	 */
++	uint16_t tin = 0, tex = 0;
++	bool tinOk = spesWord(0x71, 0x09, &tin), texOk = spesWord(0x71, 0x0a, &tex);
++	int tinC = (int)(tin & 0xffu);
++	if (tin & 0x8000u) {
++		tinC = -tinC;
++	}
++	IOLog("SPES BATTERY: temp_in %d C (raw %#x%s) temp_ex raw %#x%s | %u%% %umV %dmA\n", tinC, tin,
++	    tinOk ? "" : " FAILED", tex, texOk ? "" : " FAILED", percent, mv, ma);
+ 	unsigned vbus = (st >> 5) & 7u, chrg = (st >> 3) & 3u;
+ 	bool external = chgOk && vbus >= 1 && vbus <= 6 && (st & 4u);
+ 	bool charging = external && (chrg == 1 || chrg == 2);
