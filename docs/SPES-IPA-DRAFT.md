@@ -16,7 +16,7 @@ Ein Kernel-Thread fragt alle 1 ms die Event-Ringe ab. Nichts passiert ohne `mode
 
 | Rolle | Endpunkt | GSI-Kanal | Event-Ring | Ring/TLV (Entwurf) | Puffer |
 |---|---|---|---|---|---|
-| Befehle (Immediate Commands) | 6 | 1 | 0 | 32 / 20 | 64 B |
+| Befehle (Immediate Commands) | 6 | 1 | 0 | 64 / 20 (Review: vorher 32) | 64 B |
 | LAN RX (Default-Route, Ausnahmen; verworfen) | 8 | 2 | 1 | 16 / 6 | 8 KB, Aggregation, Status an |
 | AP → Modem (QMAP) | 1 | 0 | 2 | 64 / 8 | 2 KB |
 | Modem → AP (QMAP, aggregiert) | 9 | 3 | 3 | 32 / 6 | 8 KB, Aggregation, EOF-Close |
@@ -170,3 +170,73 @@ Normal-NC. Deshalb ist keine Cache-Pflege nötig, nur `dsb` vor Doorbells. Bedar
    „IPA set up“. Das Modem bleibt dabei offline.
 3. QMI INIT_DRIVER/Handshake (neuer SpesModem-Patch) → `spes_ipa_modem_start()`.
 4. WDA/DPM/WDS + en1, `modem_ipa_trace=1` für die ersten Pakete.
+
+## Review (Agent)
+
+Stand 18.11.2026. Adversariales Review von `bsd/dev/spes_ipa.c`/`.h` gegen Linux v6.12 (`research-src/linux-ipa`) und
+zusätzlich gegen den **Downstream-Kernel des Geräts** (`research-src/android_kernel_xiaomi_spes`, `drivers/platform/msm/ipa`,
+`gsi`, `stock_defconfig` mit `CONFIG_ARCH_KHAJE=y`, `# CONFIG_GSI_REGISTER_VERSION_2 is not set`). Nachgeladen nach
+`research-src/linux-ipa`: `gsi_trans.c/.h`, `ipa_cmd.h`, `ipa.h`, `ipa_qmi_msg.c/.h`, `gsi_reg.c`, `ipa_endpoint.h`
+(`ipa_mem.h`/`ipa_reg.c` gaben HTTP 429, nicht nötig). Nicht gebaut, nicht gebootet, nichts committet.
+Nur ein `clang -fsyntax-only -Wall -Wextra` gegen Wegwerf-Stubs (mit und ohne `ARM64_BOARD_CONFIG_SWEET`): sauber.
+Im Code sind alle Stellen mit `REVIEW:` (geändert/verifiziert) bzw. `REVIEW-OPEN:` markiert.
+
+### Geändert (3)
+
+1. **GPI-Kanal-Scratch falsch belegt (wichtigster Fund).** Linux `struct gsi_channel_scratch_gpi` = `{u64 reserved1;
+   u16 reserved2; u16 max_outstanding_tre; u16 reserved3; u16 outstanding_threshold}`. Also SCRATCH_0/1 = 0,
+   `max_outstanding_tre` (TLV × 16) in **SCRATCH_2** 31:16, `outstanding_threshold` (32) in **SCRATCH_3** 31:16, SCRATCH_3
+   15:0 erhalten. Der Entwurf schrieb beide Werte ein Wort zu früh und löschte die Schwelle in SCRATCH_3 → falsches
+   Prefetch-/Doorbell-Verhalten des GSI-Sequenzers. Downstream `msm_gsi.h struct gsi_gpi_channel_scratch` bestätigt das.
+   (`gsi.c:gsi_channel_program`)
+2. **Befehlskanal 32 → 64 TREs.** Linux verlangt `tre_count ≥ 2·tlv_count − 1` (= 39 bei TLV 20) und Zweierpotenz
+   (`gsi.c:gsi_channel_data_valid`); 32 würde Linux ablehnen. Gleicher Pool-Verbrauch (1-KB-Ring, 4 KB Puffer).
+3. **`static bool trace` → `ipa_trace`.** `bsd/sys/trace.h` definiert ein funktionsartiges Makro `trace(a, b, c)`; heute
+   unschädlich (kein `trace(`), aber eine Falle wie `mem_size`. Sonst keine Namenskollision mit Kernel-Headern gefunden
+   (geprüft: alle file-static Namen gegen `bsd/sys`, `osfmk/kern|mach|arm|arm64|machine`, `libkern`, `pexpert`,
+   `EXTERNAL_HEADERS`). Externe Prototypen stimmen mit SpesModem.cpp/sweet_touch.c überein; `ml_io_map` behandelt
+   Seiten-Offsets (SRAM-Fenster 0x5847000 ist nicht 16-KB-ausgerichtet, das ist ok).
+
+### Geprüft und richtig (Auswahl)
+
+- IPA-Register (`ipa_reg-v4.2.c`): alle Offsets/Felder inkl. AGGR (TIME_LIMIT 14:10, SW_EOF 21), HDR/HDR_EXT, ROUTE,
+  STATUS, SEQ, FLAVOR_0, RSRC-Grenzen, COUNTER_CFG, TX_CFG, CLKON, COMP_CFG, QSB, IDLE, LOCAL_PKT_PROC_CNTXT.
+- **IPA-Basis 0x5840000 und SRAM = Basis + 0x7000 + mem_offset jetzt belegt** aus dem spes-Downstream:
+  `ipahal_get_reg_base()` = 0x40000, `mmio = ipa_mem_base + ipa_reg_base_ofst`, `ipa3_init_sram()` mit
+  `SW_AREA_RAM_DIRECT_ACCESS_n` 0x7000 + smem_restricted_bytes. (Liegt außerhalb des DT-Fensters 0x34000 – downstream
+  mappt es trotzdem.) Ob der Takt läuft, zeigt weiter nur die Lese-Probe.
+- GSI (`gsi_reg-v4.0.c`, von Linux für IPA v4.2 verwendet; Downstream `gsi_reg_v1.h`, da VERSION_2 aus): alle Offsets,
+  Felder, Opcodes, GENERIC-Kodierung/Ergebnisse, Event-Ring-Programmierung, Doorbell-Semantik (Index − 1), QOS
+  (Escape-Buffer außer Befehlskanal, WRR max für Befehle), CNTXT_4 als nächster Schreibzeiger.
+- Endpunkte/Kanäle/TLV wie Linux **und** Downstream `ipa3_ep_mapping[IPA_4_2]` (WAN_PROD 1/0/TLV 8, CMD 6/1/20,
+  LAN_CONS 8/2/6, WAN_CONS 9/3/6, Q6 4/0, 5/1, 10/2, 11/3). Event-Ringe 0–3 in Linux-Reihenfolge.
+- Befehle: Payload-Layouts IP_FLTRT_INIT (Größe 39:28, Adresse 55:40), HDR_INIT_LOCAL (11:0, 27:12), DMA_SHARED_MEM,
+  Opcodes 3/4/7/8/9/0x13 (`ipa_cmd.h`), TRE-Flags/Typen (`gsi_trans.c`), Tabelleninhalt (Null-Regel, Bitmap
+  `(BIT1|BIT4)<<1`, Filter 1+2 Einträge ab +8, Route 15 Einträge ab +16, Filter-Rest nullen).
+- Speicherkarte v4.2 inkl. Canaries, Endmarke, Modem-Infos für INIT_DRIVER (inkl. „sic“ bei hw_stats_quota_size).
+- Endpunktwerte: QMAP-Header 4 B, Metadaten/Größe an 1/2, BE, Pad-Felder nur RX, Metadata-Mask `cpu_to_be32(0xff)`,
+  Aggregation GENERIC, 6 KB weich, 1 Tick à 500 µs (Granularität 15), EOF nur Modem-RX, LAN-Status an, Modem-TX-Status
+  an Endpunkt 10, SEQ 0x0806 bzw. 0x00, DMA-Modus Befehle → 8. „QMAP ohne Checksumme“ ist in sich stimmig
+  (CFG 0, HDR_LEN 4 beidseitig; Linux v4.2 hätte TX 8 B + CS_OFFLOAD_UL/DL).
+- Reihenfolge = `ipa_probe`: config (hw, Canaries, FLAVOR, Ressourcen) → Firmware → `gsi_setup` (IRQ aus, Ringe,
+  Event-Ring vor Kanal, dann Modem-Kanäle) → Endpunkte → Befehlskanal → mem_setup → table_setup → LAN → Default-Route.
+- SMEM 497/0x2000 (Downstream-Default `IPA_SMEM_SIZE` 8 KB), QMI-Plattform 3, Aggregations-Granularität 500 µs
+  (steht in `ipa_endpoint.h`), RPM-Takt: Index 0x0a = `RPM_SMD_IPA_CLK`, Ressource 0x617069 id 0, Schlüssel „KHz“.
+- PAS-Ablauf/SCM-Arginfo (init_image 0x82, mem_setup 3 Args, auth_and_reset) wie `qcom_mdt_load`.
+
+### Offen (REVIEW-OPEN, Verhalten unverändert)
+
+1. **Taktvote nur Active-Set**: DT `core_clk` = `ipa_clk` (Index 10, Active + Sleep), nicht `ipa_a_clk`. Solange die
+   APSS nie in RPM-Sleep geht egal; sonst zusätzlich Sleep-Set voten.
+2. **Taktrate**: Downstream v4.x nutzt 60/125/220/250 MHz (SVS2/SVS/NOM/TURBO); 100 MHz (Linux sc7180) ist keine
+   davon. RPM rundet auf eine Ecke; 125 000 kHz wäre die Downstream-nahe Wahl.
+3. **Bus-Votes** (msm-bus Master 90 → EBI/IMEM, APPSS → IPA_CFG) fehlen weiter – größtes Risiko für einen Hänger.
+4. **GENERIC_CMD per Polling**: ob GLOB_IRQ_STTS.GP_INT1 bei maskiertem Typ latcht, bleibt offen (Ergebnisfeld ≠ 0
+   wird ersatzweise akzeptiert, das ist robust, weil das Feld vorher genullt wird). Danach schreibt der Entwurf
+   GLOB_IRQ_EN = 0 statt ERROR_INT (ohne Wirkung beim Polling).
+5. **MDT-Metadaten**: Linux nimmt die Kopfgröße aus `phdrs[0].p_filesz` und den Hash fest aus `phdrs[1]`; der Entwurf
+   rechnet `e_phoff + e_phnum·32`. Für die vorhandene `ipa_fws.mdt` identisch (0xd4).
+6. **BEI** auf TX-/Befehls-TREs fehlt (Linux setzt es); ändert nur Interrupts, nicht die Events → beim Polling egal.
+7. RX-TRE-Länge = ganzer 8-KB-Puffer (Linux: Puffer − NET_SKB_PAD); mit 6-KB-Weichgrenze unkritisch.
+8. Unverändert offen aus dem Entwurf: QMAP ohne Checksumme muss per WDA so ausgehandelt werden; SMMU-SID 0x140 vom
+   Hypervisor angenommen?; SHARED_MEM_SIZE-Plausibilität; kein Teardown.

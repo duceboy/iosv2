@@ -1,0 +1,190 @@
+spes: IPA draft review fixes (0213).
+
+Adversarial review of 0210 against Linux v6.12 drivers/net/ipa and the phone's own downstream kernel (drivers/platform/msm/ipa,
+gsi; CONFIG_ARCH_KHAJE): GPI channel scratch: max_outstanding_tre goes to SCRATCH_2[31:16] and outstanding_threshold to
+SCRATCH_3[31:16], SCRATCH_0/1 reserved (Linux gsi_channel_program, msm_gsi.h); command channel 64 TREs (tre_count >= 2*tlv-1, power
+of two, gsi_channel_data_valid); static trace -> ipa_trace (bsd/sys/trace.h macro). Confirmed: IPA base 0x5840000 and SRAM +0x7000
+(ipahal_get_reg_base, ipa3_init_sram), RPM_SMD_IPA_CLK 0x617069, all v4.2/GSI register fields, endpoint/channel map. Open: clock
+only in the active set, 100 MHz vs downstream 125, no msm-bus votes (all-6 hung later in boot with the full IPA set up).
+
+diff --git a/bsd/dev/spes_ipa.c b/bsd/dev/spes_ipa.c
+index 2023c4e..905d10b 100644
+--- a/bsd/dev/spes_ipa.c
++++ b/bsd/dev/spes_ipa.c
+@@ -78,8 +78,13 @@ extern int      spes_rpm_kvp(uint32_t set, uint32_t type, uint32_t id, uint32_t
+ 
+ /* live DT qcom,ipa@0x5800000: reg ipa-base 0x5800000+0x34000, gsi-base 0x5804000+0x28000, ee 0 */
+ #define IPA_REG_PA              0x05840000ull   /* CHECK: ipa-base + 0x40000 (downstream ipahal_get_reg_base() = 0x40000; sc7180 ipa-reg 0x1e40000 vs gsi 0x1e04000 has the same layout) */
++/* REVIEW: confirmed in the spes kernel tree: ipa_v3/ipahal/ipahal_reg.c ipahal_get_reg_base() returns 0x40000 and ipa_v3/ipa.c maps
++ * mmio = ipa_mem_base ("ipa-base" 0x5800000) + ipa_reg_base_ofst. Note: 0x5840000 lies outside the DT's ipa-base window (0x34000);
++ * downstream maps it anyway. The offsets themselves match Linux ipa_reg-v4.2.c. */
+ #define IPA_REG_SIZE            0x4000u         /* endpoint registers end at 0x840 + 0x70 * 31, IRQ registers at 0x3000 */
+ #define IPA_SRAM_PA             (IPA_REG_PA + 0x7000)  /* CHECK: "ipa-shared" = ipa-reg + 0x7000 on sc7180 (IPA v4.2); downstream SW_AREA_RAM_DIRECT_ACCESS_n = 0x7000 */
++/* REVIEW: confirmed: spes kernel ipa_v3/ipa.c ipa3_init_sram() uses wrapper_base + 0x40000 + SW_AREA_RAM_DIRECT_ACCESS_n(0x7000)
++ * + smem_restricted_bytes (= MEM_BADDR * 8 = ipa_mem_offset), exactly as mapped below; Linux ipa_mem.c also adds mem_offset. */
+ #define IPA_SRAM_SIZE           0x2000u         /* ipa_data-v4.2.c: IPA_MEM_END_MARKER at 0x2000 */
+ #define GSI_PA                  0x05804000ull
+ #define GSI_MAP_FROM            0xc000u         /* inter-EE masks (0xc020) ... EE 0 scratch (0x1f400) */
+@@ -94,14 +99,21 @@ extern int      spes_rpm_kvp(uint32_t set, uint32_t type, uint32_t id, uint32_t
+ #define IPA_FW_NAME             "ipa_fws"       /* live DT qcom,firmware-name = "ipa_fws" (scuba_ipa_fws.* differ in md5: other signing/SKU, not used) */
+ #define IPA_SMEM_ITEM           497u            /* ipa_data-v4.2.c smem_id */
+ #define IPA_SMEM_SIZE           0x2000u         /* ipa_data-v4.2.c smem_size; CHECK: live DT has no qcom,ipa-q6-smem-size */
++/* REVIEW: confirmed: without qcom,ipa-q6-smem-size the spes kernel uses IPA_SMEM_SIZE (8 * 1024) (ipa_v3/ipa_i.h, ipa.c) */
+ #define SMEM_HOST_APPS          0
+ #define SMEM_HOST_MODEM         1
+ 
+ /* IPA core clock: live DT clocks = <&rpmcc 0x0a> "core_clk" (qcom,rpmcc-bengal) */
+ #define RPM_SET_ACTIVE          0
+ #define RPM_TYPE_IPA_CLK        0x00617069u     /* CHECK: "ipa\0", Linux clk-smd-rpm.c QCOM_SMD_RPM_IPA_CLK; index 0x0a of rpmcc-bengal not verified to be ipa_clk */
++/* REVIEW: confirmed in the spes kernel: dt-bindings qcom,rpmcc.h RPM_SMD_IPA_CLK = 10 -> bengal_ipa_clk = DEFINE_CLK_SMD_RPM(bengal,
++ * ipa_clk, ipa_a_clk, QCOM_SMD_RPM_IPA_CLK 0x617069, id 0), key QCOM_RPM_SMD_KEY_RATE 0x007a484b (kHz). */
++/* REVIEW-OPEN: DT core_clk is ipa_clk (index 10, active AND sleep set), not ipa_a_clk (11); this driver votes the active set only.
++ * Fine while the APSS never enters RPM sleep; otherwise also vote the sleep set (set 1). */
+ #define RPM_KEY_RATE_KHZ        0x007a484bu     /* "KHz", as spes_gpu_backend.h uses for "clk2" */
+ #define IPA_CLK_KHZ             100000u         /* CHECK: ipa_data-v4.2.c core_clock_rate 100 MHz (sc7180); khaje downstream rates not read */
++/* REVIEW-OPEN: spes kernel ipa_v3/ipa_utils.c uses IPA_V4_0_CLK_RATE_* for v4.x: SVS2 60, SVS 125, NOMINAL 220, TURBO 250 MHz.
++ * 100 MHz is not one of them; the RPM rounds to a corner, but 125000 (SVS) would be the downstream-like choice. Not changed. */
+ 
+ /* GSI registers, EE 0 (Linux gsi_reg-v4.0.c; GSI_EE_AP = 0, per-EE stride 0x4000) */
+ #define GSI_INTER_EE_SRC_CH_IRQ_MSK     0xc020u
+@@ -208,9 +220,9 @@ extern int      spes_rpm_kvp(uint32_t set, uint32_t type, uint32_t id, uint32_t
+ #define MEM_CANARY_VAL          0xdeadbeefu     /* Linux ipa_mem.h IPA_MEM_CANARY_VAL */
+ #define MODEM_ROUTE_COUNT       8u              /* ipa_data-v4.2.c modem_route_count */
+ #define ROUTE_ENTRIES           (MEM_TABLE_SIZE / 8u)   /* 15 */
+-#define IPA_QMI_PLATFORM_MSM_ANDROID 3u         /* CHECK: ipa_qmi_msg.h enum ipa_platform_type (file not in the local copy) */
++#define IPA_QMI_PLATFORM_MSM_ANDROID 3u         /* REVIEW: verified, IPA_QMI_PLATFORM_TYPE_MSM_ANDROID = 0x3 (Linux ipa_qmi_msg.h) */
+ 
+-/* immediate commands (Linux ipa_cmd.h enum ipa_cmd_opcode; CHECK: header not in the local copy, values as HackiOS uses) */
++/* immediate commands (Linux ipa_cmd.h enum ipa_cmd_opcode). REVIEW: verified against ipa_cmd.h v6.12: 0x3/0x4/0x7/0x8/0x9/0x13 */
+ #define IPA_CMD_NONE            0u
+ #define IPA_CMD_IP_V4_FILTER_INIT 3u
+ #define IPA_CMD_IP_V6_FILTER_INIT 4u
+@@ -219,7 +231,9 @@ extern int      spes_rpm_kvp(uint32_t set, uint32_t type, uint32_t id, uint32_t
+ #define IPA_CMD_HDR_INIT_LOCAL  9u
+ #define IPA_CMD_DMA_SHARED_MEM  19u             /* v4.0+: pipeline-clear options in opcode bits 10:8, all 0 = hps clear, don't skip */
+ 
+-/* TRE (Linux gsi_trans.c) */
++/* TRE (Linux gsi_trans.c). REVIEW: verified: CHAIN bit 0, IEOT bit 9, BEI bit 10, TYPE 23:16, GSI_RE_XFER 2, GSI_RE_IMMD_CMD 3.
++ * REVIEW-OPEN: Linux also sets BEI on every TX/command TRE (bei = channel->toward_ipa); BEI only blocks the interrupt,
++ * the event is still written, so omitting it is harmless while everything is polled. */
+ #define TRE_FLAGS_CHAIN         (1u << 0)
+ #define TRE_FLAGS_IEOT          (1u << 9)
+ #define TRE_FLAGS_BEI           (1u << 10)
+@@ -228,7 +242,7 @@ extern int      spes_rpm_kvp(uint32_t set, uint32_t type, uint32_t id, uint32_t
+ #define GSI_RE_IMMD_CMD         0x3u
+ 
+ /* aggregation (Linux ipa_main.c / ipa_endpoint.c, pre-v4.5 counter timing) */
+-#define IPA_AGGR_GRANULARITY_US 500u            /* CHECK: IPA_AGGR_GRANULARITY lives in ipa.h (not in the local copy); 500 us in v6.12 */
++#define IPA_AGGR_GRANULARITY_US 500u            /* REVIEW: verified, IPA_AGGR_GRANULARITY 500 us (Linux ipa_endpoint.h, not ipa.h) */
+ #define IPA_AGGR_GRAN_VAL       15u             /* DIV_ROUND_CLOSEST(500 * 32000, 1e6) - 1 */
+ #define RX_BUFFER_SIZE          8192u           /* ipa_data-v4.2.c rx.buffer_size */
+ #define RX_AGGR_BYTE_LIMIT_KB   6u              /* soft limit: (8192 - 1500 MTU - 4 QMAP - margin) / 1024; Linux gets 6 too */
+@@ -285,7 +299,10 @@ struct ipa_chan {
+  */
+ static struct ipa_chan c_cmd = {
+ 	.name = "cmd-tx", .ch = 1, .ev = 0, .ep = 6, .tx = true, .command = true,
+-	.slots = 32, .tlv = 20, .buf_size = CMD_BUFFER_SIZE, .seq = 0x00,          /* IPA_SEQ_DMA */
++	.slots = 64, .tlv = 20, .buf_size = CMD_BUFFER_SIZE, .seq = 0x00,          /* IPA_SEQ_DMA */
++	/* REVIEW: slots 32 -> 64: tre_count must be >= 2 * tlv_count - 1 = 39 and a power of 2
++	 * (Linux gsi.c:gsi_channel_data_valid); 32 TREs with a 20-entry TLV FIFO is rejected there.
++	 * Same pool footprint (1 KB ring + 4 KB buffers, 4 KB granules). */
+ };
+ static struct ipa_chan c_lan = {
+ 	.name = "lan-rx", .ch = 2, .ev = 1, .ep = 8, .aggr = true, .status = true, .pad_align = 2,
+@@ -306,7 +323,7 @@ static vm_offset_t ipa_va, gsi_va, sram_va;
+ static uint32_t ipa_mem_offset, ipa_mem_size;
+ static struct ipa_dma tbl, zero;
+ static volatile bool ready, modem_started, clock_voted;
+-static bool trace;
++static bool ipa_trace;                         /* REVIEW: renamed from "trace": bsd/sys/trace.h defines a function-like macro trace(a, b, c) */
+ static uint8_t tx_mux = 1;                      /* CHECK: QMAP mux id = WDS Bind Mux Data Port mux_id (rmnet default 1) */
+ static lck_grp_t *ipa_grp;
+ static lck_mtx_t *tx_lock;
+@@ -545,6 +562,9 @@ ipa_fw_load(void)
+ 		}
+ 
+ 		/* metadata = headers + hash segment, physically contiguous (TZ reads it) */
++		/* REVIEW-OPEN: Linux qcom_mdt_read_metadata() takes the header size from phdrs[0].p_filesz and the hash from
++		 * phdrs[1] (and refuses other layouts); hsz here is e_phoff + e_phnum * 32. Both are 0xd4 for the phone's
++		 * ipa_fws.mdt per SPES-IPA-DRAFT.md, so no change; a different firmware file could differ. */
+ 		uint32_t hlen = ph[hash].p_filesz;
+ 		meta = (uint8_t *)spes_pool_alloc(hsz + hlen, &meta_pa);
+ 		if (meta == NULL) {
+@@ -684,7 +704,7 @@ gsi_command(bool ev, uint32_t id, uint32_t opcode, uint32_t want, const char *na
+  * IPA v4.2 quirk (Linux gsi.c gsi_generic_command(), gsi_isr_gp_int1()): the AP allocates the modem's
+  * channels. Completion is a global GP_INT1 with the result in CNTXT_SCRATCH_0 bits 7:5. Polled here:
+  * GP_INT1 is enabled in GLOB_IRQ_EN only for the command (the GSI interrupt type stays masked in
+- * CNTXT_TYPE_IRQ_MSK, so nothing reaches the GIC). CHECK: whether GLOB_IRQ_STTS latches GP_INT1 with
++ * CNTXT_TYPE_IRQ_MSK, so nothing reaches the GIC). REVIEW-OPEN (CHECK): whether GLOB_IRQ_STTS latches GP_INT1 with
+  * the type masked; we also accept a nonzero result field.
+  */
+ static bool
+@@ -778,11 +798,18 @@ gsi_channel_setup(struct ipa_chan *c)
+ 	/* QOS: command channel WRR_WEIGHT max (lowest priority) and prefetch buffers; others USE_ESCAPE_BUF_ONLY (bit 10, v4.0-v4.4) */
+ 	v = c->command ? 0xfu : (1u << 10);
+ 	gsi_wr(GSI_CH_C_QOS(ch), v);
+-	/* GPI scratch: max_outstanding_tre = tlv * 16 (word1 31:16), outstanding_threshold = 32 (word2 31:16); keep word4 15:0 */
+-	gsi_wr(GSI_CH_C_SCRATCH(ch, 0), (c->tlv * GSI_RING_ELEMENT_SIZE) << 16);
+-	gsi_wr(GSI_CH_C_SCRATCH(ch, 1), (2u * GSI_RING_ELEMENT_SIZE) << 16);
+-	gsi_wr(GSI_CH_C_SCRATCH(ch, 2), 0);
+-	gsi_wr(GSI_CH_C_SCRATCH(ch, 3), gsi_rd(GSI_CH_C_SCRATCH(ch, 3)) & 0xffffu);
++	/*
++	 * REVIEW: GPI scratch layout fixed. struct gsi_channel_scratch_gpi is { u64 reserved1; u16 reserved2;
++	 * u16 max_outstanding_tre; u16 reserved3; u16 outstanding_threshold; }, i.e. word1/word2 (SCRATCH_0/1)
++	 * are reserved, max_outstanding_tre = word3 (SCRATCH_2) 31:16, outstanding_threshold = word4 (SCRATCH_3)
++	 * 31:16, keep SCRATCH_3 15:0. The draft wrote both values one word too early and cleared the threshold.
++	 * (Linux gsi.c:gsi_channel_program + struct gsi_channel_scratch_gpi; same in downstream msm_gsi.h
++	 * struct gsi_gpi_channel_scratch of the spes kernel)
++	 */
++	gsi_wr(GSI_CH_C_SCRATCH(ch, 0), 0);
++	gsi_wr(GSI_CH_C_SCRATCH(ch, 1), 0);
++	gsi_wr(GSI_CH_C_SCRATCH(ch, 2), (c->tlv * GSI_RING_ELEMENT_SIZE) << 16);
++	gsi_wr(GSI_CH_C_SCRATCH(ch, 3), (2u * GSI_RING_ELEMENT_SIZE) << 16 | (gsi_rd(GSI_CH_C_SCRATCH(ch, 3)) & 0xffffu));
+ 	return true;
+ }
+ 
+@@ -898,7 +925,7 @@ ipa_cmd(const char *what, uint16_t opcode, const void *payload, uint32_t size)
+ 		gsi_log_error(what);
+ 		return false;
+ 	}
+-	if (trace) {
++	if (ipa_trace) {
+ 		printf(LOGP "%s (opcode %u): done, code %u\n", what, opcode, w.code);
+ 	}
+ 	return true;
+@@ -1175,7 +1202,7 @@ rx_event(struct ipa_chan *c, const struct gsi_event *e, void *ctx __unused)
+ 		len = c->buf_size;
+ 	}
+ 	c->bytes += len;
+-	if (trace) {
++	if (ipa_trace) {
+ 		printf(LOGP "%s: slot %u %u bytes code %u: %02x %02x %02x %02x %02x %02x %02x %02x\n", c->name, slot, len, e->code,
+ 		    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+ 	}
+@@ -1195,7 +1222,7 @@ rx_event(struct ipa_chan *c, const struct gsi_event *e, void *ctx __unused)
+ 				} else {
+ 					c->drops++;
+ 				}
+-			} else if (trace) {
++			} else if (ipa_trace) {
+ 				printf(LOGP "%s: QMAP command frame (%u bytes, mux %u)\n", c->name, pkt, mux);
+ 			}
+ 			at += QMAP_HDR_LEN + pkt;
+@@ -1248,7 +1275,7 @@ spes_ipa_tx(const void *ip, size_t len)
+ 	chan_doorbell(c);
+ 	c->packets++;
+ 	c->bytes += len;
+-	if (trace) {
++	if (ipa_trace) {
+ 		printf(LOGP "%s: %zu bytes mux %u\n", c->name, len, tx_mux);
+ 	}
+ 	lck_mtx_unlock(tx_lock);
+@@ -1431,7 +1458,7 @@ spes_ipa_init(void)
+ 	if (ipa_bootarg("modem_ipa_data", 0) != 1) {
+ 		return false;
+ 	}
+-	trace = ipa_bootarg("modem_ipa_trace", 0) != 0;
++	ipa_trace = ipa_bootarg("modem_ipa_trace", 0) != 0;
+ 	tx_mux = (uint8_t)ipa_bootarg("modem_ipa_mux", 1);
+ 
+ 	/* 0: power, mappings, read-only probe */
