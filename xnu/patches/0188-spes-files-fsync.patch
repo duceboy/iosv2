@@ -1,14 +1,17 @@
-spes USB file server durability (0188): fsync + F_FULLFSYNC before "OK"; sync twice before a reset.
+spes USB file server: truncate on PUT, fsync + F_FULLFSYNC before "OK", sync twice before a reset (0188).
 
-A launchd.plist PUT about five seconds before a USB "fastboot" reset reached HFS incomplete: the next boot's
-launchd_cache_loader sent it and launchd exited "No service cache" (initproc panic, 2026-11-17). The same
-file, rebuilt on the Mac, is byte-identical and plutil-valid, so the content was fine. PUT now calls
-VNOP_FSYNC(MNT_WAIT) and VNOP_IOCTL(F_FULLFSYNC) (HFS journal and device cache) before replying, and fails
-the PUT if the fsync fails; the attributes are set while the file is still open. reboot/fastboot run
-sync_internal(), wait 2 s, and sync again before the reset.
+Root cause (2026-11-17): the vnode_open() KPI does not truncate on O_TRUNC (open1() calls vnode_setsize
+itself after vn_open_auth). A launchd.plist PUT that was 9 bytes shorter than the file it replaced kept the
+old file's last 9 bytes, the binary plist trailer no longer matched, launchd_cache_loader sent it and
+launchd exited "No service cache" (initproc panic). Verified on a 16 GiB userdata snapshot: the start of
+the phone's file equals the new plist, the trailing 9 bytes equal the old file's end.
+
+PUT now calls vnode_setsize(vp, 0) after opening, like open1(). For durability it also calls
+VNOP_FSYNC(MNT_WAIT) and F_FULLFSYNC before replying (the PUT fails if the fsync fails) and sets the
+attributes while the file is still open; reboot/fastboot run sync_internal(), wait 2 s and sync again.
 
 diff --git a/bsd/dev/sweet_files.c b/bsd/dev/sweet_files.c
-index 2850dee..af27054 100644
+index 2850dee..b5dd965 100644
 --- a/bsd/dev/sweet_files.c
 +++ b/bsd/dev/sweet_files.c
 @@ -21,6 +21,7 @@
@@ -19,7 +22,22 @@ index 2850dee..af27054 100644
  #include <sys/kernel.h>
  #include <sys/kauth.h>
  #include <sys/kpi_socket.h>
-@@ -178,12 +179,25 @@ sf_put(socket_t so, const char *path, int mode, uint64_t size)
+@@ -160,6 +161,14 @@ sf_put(socket_t so, const char *path, int mode, uint64_t size)
+ 	vfs_context_t ctx = vfs_context_kernel();
+ 	vnode_t vp = NULLVP;
+ 	int err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, mode & 07777, 0, &vp, ctx);
++	/*
++	 * 0188: the vnode_open KPI does not truncate (open1() does that itself after vn_open_auth):
++	 * a shorter launchd.plist kept the old file's last 9 bytes and launchd panicked
++	 * ("No service cache", 2026-11-17). Cut the file to zero like open1().
++	 */
++	if (!err) {
++		err = vnode_setsize(vp, (off_t)0, 0, ctx);
++	}
+ 	uint64_t off = 0;
+ 	while (off < size) {
+ 		size_t chunk = (size_t)MIN((uint64_t)SF_BUF, size - off);
+@@ -178,12 +187,25 @@ sf_put(socket_t so, const char *path, int mode, uint64_t size)
  		}
  		off += chunk;
  	}
