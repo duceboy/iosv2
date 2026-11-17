@@ -5490,3 +5490,14 @@ Serving System Fehler 74 → SIM steckt nicht oder der Slot muss erst eingeschal
 - Mobilfunk-Menü fehlt: CommCenter läuft nicht (kein Apple-Baseband) – erwartet, siehe docs/OFFENE-TREIBER.md.
 - all-1-Ende war kein Absturz: Fastboot-Befehl kam an, Fastboot erschien nicht binnen 90 s (Skript jetzt 180 s).
   0198 wirkt: Touch errors=0, idle-ff 2264.
+
+### 2026-11-17 ~22:20 – all-3: SIM provisioniert, PIN verlangt; 0204/0205; MobileGestalt-Probe
+
+- all-3 (0203): „slot 2 USIM made the primary GW application“ (Ergebnis 0), danach primary GW 0x100 und App-Zustand
+  **„pin1 wanted“**. Nutzer gab die PIN (nur lokal im Image als Boot-Arg `modem_pin`, nie im Repo/Log). **0204** sendet UIM
+  Verify PIN einmal, nur bei ≥ 2 Restversuchen, ohne die PIN zu protokollieren.
+- **0205:** Befehl „fastboot“ hing in sync_internal(), sobald ADSP und Modem liefen (all-1, all-3) → Syncs auf Hilfs-Thread,
+  höchstens 8 s, danach Reset. CI 44175878576.
+- **userland/mgprobe** (eigener Code): fragt MobileGestalt auf dem Telefon ab. Nach dem Löschen des MG-Caches:
+  DeviceSupportsClosedLoopHaptics = true, camera-flash = true, HasBaseband = false, cellular-data = false,
+  ambient-light-sensor = false, proximity/gyro/accel/magnetometer = true.
