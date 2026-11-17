@@ -1,0 +1,18 @@
+spes: read modem_pin as text (0206).
+
+all-4: "modem_pin is not 4-8 digits; not sent": PE_parse_boot_argn stores an all-digit value as a number, so the buffer
+held binary bytes. PE_parse_boot_arg_str keeps it as text. No PIN try was used (0204 refused before sending).
+
+diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
+index 5dede21..da799eb 100644
+--- a/iokit/Kernel/arm/SpesModem.cpp
++++ b/iokit/Kernel/arm/SpesModem.cpp
+@@ -6257,7 +6257,7 @@ uim_rx(const uint8_t *d, uint32_t len)
+ 			if (state == 2 && !u_pin_sent && o + 7 + alen + 3 <= l) {
+ 				unsigned retries = v[o + 7 + alen + 2];
+ 				char pin[9] = { 0 };
+-				if (PE_parse_boot_argn("modem_pin", pin, sizeof(pin)) && pin[0] != 0) {
++				if (PE_parse_boot_arg_str("modem_pin", pin, sizeof(pin)) && pin[0] != 0) {      /* 0206: as text (argn makes "1260" a number) */
+ 					size_t pl = strnlen(pin, 8);
+ 					bool digits = pl >= 4;
+ 					for (size_t i = 0; i < pl; i++) {
