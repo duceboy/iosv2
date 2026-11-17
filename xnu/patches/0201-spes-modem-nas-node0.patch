@@ -1,0 +1,47 @@
+spes: NAS/UIM look also when the modem is QRTR node 0 (0201).
+
+hap-1 boot: NAS (port 28) and UIM (port 31) were announced, but 0200 took node 0 for "not seen yet" and never
+asked. Separate flags now.
+
+diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
+index b5d1f50..e4d7b3f 100644
+--- a/iokit/Kernel/arm/SpesModem.cpp
++++ b/iokit/Kernel/arm/SpesModem.cpp
+@@ -566,7 +566,7 @@ static struct { uint32_t svc, inst, node, port; } q_srv[64];
+ static unsigned q_srv_count, g_rx_msgs, g_tx_msgs, q_resumes;
+ static unsigned g_ms;                           /* watch time, for the log */
+ static uint32_t n_node, n_port, u_node, u_port;    /* 0200: NAS / UIM servers */
+-static bool n_on;                               /* 0200: modem_nas=1 */
++static bool n_on, n_have, u_have;               /* 0200: modem_nas=1; servers seen (node 0 is the modem) */
+ 
+ static uint32_t
+ rx_avail(void)
+@@ -870,10 +870,10 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 			wlfw_arrive(c->c, c->d);
+ 		} else if (c->a != 0) {
+ 			LOG("t=%u ms: service %x:%x port %x %s", g_ms, c->a, c->b, c->d, svc_name(c->a));
+-			if (c->a == 0x03 && n_node == 0) {          /* 0200 */
+-				n_node = c->c; n_port = c->d;
+-			} else if (c->a == 0x0B && u_node == 0) {
+-				u_node = c->c; u_port = c->d;
++			if (c->a == 0x03 && !n_have) {              /* 0201 */
++				n_node = c->c; n_port = c->d; n_have = true;
++			} else if (c->a == 0x0B && !u_have) {
++				u_node = c->c; u_port = c->d; u_have = true;
+ 			}
+ 		}
+ 		break;
+@@ -6124,11 +6124,11 @@ nas_tick(unsigned ms)
+ 	if (!n_on) {
+ 		return;
+ 	}
+-	if (u_node != 0 && !u_asked) {
++	if (u_have && !u_asked) {
+ 		u_asked = true;
+ 		nq_send(PORT_UIMC, u_node, u_port, 0x2F);
+ 	}
+-	if (n_node != 0 && (n_last_ms == 0 || ms - n_last_ms >= 30000)) {
++	if (n_have && (n_last_ms == 0 || ms - n_last_ms >= 30000)) {
+ 		n_last_ms = ms ? ms : 1;
+ 		nq_send(PORT_NASC, n_node, n_port, 0x24);
+ 		nq_send(PORT_NASC, n_node, n_port, 0x20);
