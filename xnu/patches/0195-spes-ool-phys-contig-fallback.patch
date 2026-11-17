@@ -1,0 +1,77 @@
+spes: physical-copy fallback for OOL data in physically contiguous memory (0195).
+
+0194 caught the failing CoreAnimation commits during app launches: SpringBoard sends ~11 MB
+(len 0xab4794) as virtual-copy OOL data from an IOKit mapping (alias 21) whose VM object is
+phys_contiguous with a device pager. vm_map_copyin refuses such objects outright
+(KERN_PROTECTION_FAILURE, "not supported for now" in vm_map.c) -> MACH_SEND_INVALID_MEMORY ->
+backboardd never gets the launch animation/snapshot, the app window does not appear and the user
+has to tap again. On Apple hardware these IOSurface buffers are ordinary pageable memory, so the
+virtual copy works there. When vm_map_copyin fails with KERN_PROTECTION_FAILURE (<= 64 MiB) the
+data is copied through a kernel buffer in the ipc copy map (copyin via the user mapping, then a
+virtual copy of the kernel buffer, as the MACH_MSG_PHYSICAL_COPY path does); a requested
+deallocate is honoured afterwards. Logs the first 20 fallbacks and every failure (capped at 60).
+
+diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
+index 7658c18..34fe3e9 100644
+--- a/osfmk/ipc/ipc_kmsg.c
++++ b/osfmk/ipc/ipc_kmsg.c
+@@ -4454,6 +4454,21 @@ spes_ool_fail_log(vm_map_t map, mach_vm_offset_t addr, mach_vm_size_t len,
+ 	vm_map_unlock_read(map);
+ }
+ 
++#define SPES_OOL_PHYS_MAX (64ULL << 20)
++static void
++spes_ool_phys_log(mach_vm_offset_t addr, mach_vm_size_t len, kern_return_t kr)
++{
++	static uint32_t spes_ool_phys;
++	char name[32] = "?";
++	uint32_t n = os_atomic_inc_orig(&spes_ool_phys, relaxed);
++	if (n >= 60 || (n >= 20 && kr == KERN_SUCCESS)) {
++		return;
++	}
++	proc_selfname(name, sizeof(name));
++	printf("SPES OOL: %s phys-copy fallback #%u addr 0x%llx len 0x%llx kr %d\n",
++	    name, n, (unsigned long long)addr, (unsigned long long)len, kr);
++}
++
+ static mach_msg_descriptor_t *
+ ipc_kmsg_copyin_ool_descriptor(
+ 	mach_msg_ool_descriptor_t *dsc,
+@@ -4546,6 +4561,37 @@ ipc_kmsg_copyin_ool_descriptor(
+ 		 */
+ 		kern_return_t kr = vm_map_copyin(map, addr,
+ 		    (vm_map_size_t)length, dealloc, copy);
++		if (kr == KERN_PROTECTION_FAILURE && length <= SPES_OOL_PHYS_MAX) {
++			/*
++			 * SPES: vm_map_copyin refuses physically contiguous (device pager) objects
++			 * ("not supported for now", vm_map.c).  On this port IOSurface / IOKit
++			 * mappings (alias 21) live in such memory, while on Apple hardware they are
++			 * ordinary pageable memory, so CoreAnimation commits that carry them as
++			 * virtual-copy OOL data failed with MACH_SEND_INVALID_MEMORY.  Fall back to
++			 * the physical-copy path: kernel buffer in the ipc copy map, copyin (which
++			 * goes through the user mapping), then a virtual copy of the kernel buffer.
++			 */
++			mach_vm_offset_t kbuf = 0;
++			if (mach_vm_allocate_kernel(ipc_kernel_copy_map, &kbuf, round_page(length),
++			    VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_IPC) == KERN_SUCCESS) {
++				if (copyin(addr, (char *)kbuf, length) == 0) {
++					if (!page_aligned(length)) {
++						(void) memset((void *)(kbuf + length), 0,
++						    round_page(length) - length);
++					}
++					kr = vm_map_copyin(ipc_kernel_copy_map, (vm_map_address_t)kbuf,
++					    (vm_map_size_t)length, TRUE, copy);
++					if (kr != KERN_SUCCESS) {
++						(void) mach_vm_deallocate(ipc_kernel_copy_map, kbuf, round_page(length));
++					} else if (dealloc) {
++						(void) mach_vm_deallocate(map, addr, length);
++					}
++				} else {
++					(void) mach_vm_deallocate(ipc_kernel_copy_map, kbuf, round_page(length));
++				}
++			}
++			spes_ool_phys_log(addr, length, kr);
++		}
+ 		if (kr != KERN_SUCCESS) {
+ 			spes_ool_fail_log(map, addr, length, copy_options, dealloc, kr, 2);
+ 			*mr = (kr == KERN_RESOURCE_SHORTAGE) ?
