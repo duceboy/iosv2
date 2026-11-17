@@ -101,6 +101,12 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   research/spes-ios-root.simg` (sparse 11.6 GB, SHA256 e3539d58...2515; round trip = raw image 46c8d16f...28d9),
   23/23 chunks OKAY, 326 s, log `research/flash-userdata-ios.log`. ABL stopped answering afterwards (as noted
   for spes) -> power + volume down. Evolution X's data is gone; way back: OrangeFox Format Data.
+- **Verification found the flash incomplete:** SHA256 of the first 16 GiB of userdata (OrangeFox, on device)
+  472dc23d... != image. 256 MiB / 4 MiB segment compares: blocks 0-3944 (4 MiB) correct, 3945-4095 (604 MiB,
+  incl. the HFS alternate volume header in the last 4 KiB) still old Android data -> the ABL did not commit the
+  last sparse piece (no DONT_CARE chunks in the image; zeros were FILL). Rewritten from OrangeFox with dd from
+  a file in /tmp (checksummed there), 23 + 128 blocks, conv=notrunc,fsync (user's go for each). **Now SHA256
+  of the first 16 GiB = 46c8d16f...28d9 = image.** Lesson: verify after every big flash, or dd from recovery.
 - Kernel CI 44010579866 (0173-0182, 10 patches applied) SHA256 b9066c3d...a81c (`xnu/out-spesn-4gb-c`).
   iOS image `shim/out/spes-ios.img` (e6275fd4...cd20): `SPES_MEMORY_FLOOR=0xa0000000 SPES_EXTRA_BOOTARGS=
   spesbattery=1 tools/build-spes-ios.sh`, rd=ufsroot0 ufsrw=1 rootrw=1 sweetlog=1, ADT with the D22AP /product
