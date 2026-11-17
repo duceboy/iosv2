@@ -1,0 +1,47 @@
+spes: idle 0xff touch frames are "no contact", not read errors (0198).
+
+mtl-1 boot without a single touch: 438 "SWEET TOUCH: report err=5" lines (one per 100 errors), i.e.
+~44000 idle reads where the FT3518 answered 0xff in the status byte (n = 15 > TOUCH_MAX -> EIO).
+Such a frame now releases (no-op when nothing is down) and is counted as idle-ff instead of an error,
+so the error counter (and the release after 10 errors) only reacts to real bad frames.
+
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index b420aa9..c35f4ef 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -102,6 +102,7 @@ static struct {
+ 	uint8_t d_fid1, d_fid2;
+ 	/* sweettouchdiag=2: polling statistics */
+ 	unsigned s_frames, s_errs, s_down, s_up, s_maxn;
++	unsigned s_idleff;      /* 0198: idle 0xff frames */
+ 	int s_lasterr, s_lastx, s_lasty;
+ 	uint8_t s_raw[12];
+ } st;
+@@ -512,6 +513,16 @@ touch_focaltech(void)
+ 		st.s_maxn = n;
+ 	}
+ 	if (n > TOUCH_MAX) {
++		/*
++		 * SPES 0198: with no finger the FT3518 answers 0xff in the status byte (n = 15) on most idle
++		 * reads (mtl-1 boot: 438 "report err=5" lines = ~44000 such reads without a single touch).
++		 * That is "no contact", not a bad frame: release, no error.
++		 */
++		if (buf[2] == 0xff && buf[3] == 0xff) {
++			st.s_idleff++;
++			touch_report(0, x, y);
++			return 0;
++		}
+ 		return EIO;
+ 	}
+ 	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
+@@ -2521,8 +2532,8 @@ touch_thread(void *arg, wait_result_t result)
+ 	while (!st.dead) {
+ 		/* Nonfatal RAM-root diagnostic: periodic input counters and coordinates. */
+ 		if (st.diag == 3 && ++polls % (poll_ms ? 500u : 10000u) == 0) {
+-			printf("SPES TOUCH: frames=%u errors=%u down=%u up=%u last=%d,%d active=%#x\n",
+-			    st.s_frames, st.s_errs, st.s_down, st.s_up,
++			printf("SPES TOUCH: frames=%u errors=%u idle-ff=%u down=%u up=%u last=%d,%d active=%#x\n",
++			    st.s_frames, st.s_errs, st.s_idleff, st.s_down, st.s_up,
+ 			    st.s_lastx, st.s_lasty, st.active);
+ 		}
+ 		if (st.diag == 2 && ++polls == 3000) {  /* ~30 s at 10 ms */
