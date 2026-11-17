@@ -5352,3 +5352,11 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   the only 420v surface of that boot (332x198, 2 planes, 131072 bytes).
 - Seen once (ios2, before the graphics stage); 0 mediaserverd crashes and 0 420v surfaces in gfx1 and the
   nine USB-era iOS boots since. Deferred per the plan ("if it persists"); watch for `fmt 0x34323076`.
+
+## 2026-11-17 11:25 – Vibration 0192/0193: LPG write path
+
+- vib-1 (spesvib=2, CI 44059480239): LPG = Lauf 2 (type 0x13/0x0b, 0xb341=07, 0xb344=ff, enable 0).
+- vib-2 (spesvib=3): all writes read back as written (0xb342=01, 0xb343=20, 0xb344=b3, 0xb345=01) except
+  ENABLE 0x84 -> 0x80: bit 2 (source select) is not kept on this SUBTYPE_PWM channel; bit 7 is. Driver stopped,
+  output off, 0xb341-0xb346 restored = before (logged). 0193 compares bits 7/1 only. Next: spesvib=3 again
+  with 0193, then spesvib=4 (100 ms) with the user holding the phone.
