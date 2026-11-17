@@ -5376,3 +5376,7 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   status 2 (no ack; only the first 4 failures are logged). User: one error message first, then connected;
   **Safari loads web pages normally.** Kernel unchanged (0193 build, CI 44062990696).
 - Open: what the first error message was; HTT tx failure statistics; COUNTRY_CODE/PHY_MODE/RSSI requests refused.
+- Second WLAN boot (user, 13:40): join takes ~15 s, no error message this time. Safari did not start on the first
+  tap and showed graphics errors, worked after 2-3 tries and then loads all pages. Share sheet hangs. Kernel log of
+  that boot: no MobileSafari/WebKit crash, 0 refused IOSurfaces, only syncdefaultsd (11x, known) and driverkitd
+  (1x SIG9, known) crash. Touch down=191 up=33 (up events missing) — possible cause of stuck UI; to check.
