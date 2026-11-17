@@ -1,0 +1,232 @@
+spes USB device mode (0183): sweet's DWC3 gadget (0072-0077) on SM6225, only with sweetusb=2.
+
+On the spes platform sweet_usb.c now uses the SM6225 addresses (live FDT + gcc-khaje.c): GCC 0x1400000,
+USB30_PRIM GDSC 0x1a004, CBCRs 0x1a010/0x1a014/0x1a018/0x1a084/0x1a080/0x1d008/0x9f000, DWC3 0x4e00000,
+QSCRATCH 0x4ef8800. The SM7150 QUSB2 PHY is not read and the SM6225 SNPS femto PHY is not written: ABL's
+overrides stay (run 1 on spesn: GDSC and clocks on, DWC3 3.30a halted). Before RUN_STOP the apps-SMMU
+stream 0x120 is passed through with SpesModem's smmu_identity (as WLAN 0x1a0 / audio 0x1C1; ios-flame
+found that ABL drops its stream match and the first DMA then resets the SoC); if that fails the
+controller stays halted. smmu_identity is serialized (USB and the modem thread). On spes the driver
+runs only with an explicit sweetusb=2, from the full UFS init and from the 0178 log-only diagnostic
+init; it brings up ue0 192.168.7.2/24 (CDC-ECM) and the UDP live log to 192.168.7.1:5140.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 28072c7..28769ca 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -815,11 +815,12 @@ sweet_ufs_init(void)
+ 		int keys = 0;
+ 		(void)PE_parse_boot_argn("sweetkeys", &keys, sizeof(keys));
+ 		if (keys == 1) sweet_keys_init();
+-		printf("SPES: PMIC keys %s; USB disabled\n", keys == 1 ? "requested" : "disabled");
++		printf("SPES: PMIC keys %s\n", keys == 1 ? "requested" : "disabled");
+ 		spes_cpufreq_init();
+ 		spes_vib_init();
+ 		spes_amp_init();
+ 		spes_usb_probe();
++		sweet_usb_probe();      /* 0183: SM6225 device mode only with sweetusb=2, else returns */
+ 		return 0;
+ 	}
+ 	sweet_keys_init();
+@@ -1008,6 +1009,7 @@ spes_ufs_probe(void)
+ 		 */
+ 		spes_vib_init();
+ 		spes_usb_probe();
++		sweet_usb_probe();      /* 0183: SM6225 device mode + live log only with sweetusb=2 */
+ 		return;
+ 	}
+ 	if (strcmp(root, "md0") != 0 || su.ready) {
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 9c42e45..c271af0 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -33,9 +33,11 @@
+ #include <net/kpi_interface.h>
+ #include <net/kpi_protocol.h>
+ #include <netinet/in.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
++extern bool spes_smmu_identity(uint32_t sid, uint32_t mask, const char *name);     /* SpesModem.cpp */
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+@@ -44,10 +46,12 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ #define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
+ #define CBCR_CLK_OFF            (1u << 31)
+ 
+-static const struct {
++struct usb_clk {
+ 	const char *name;
+ 	uint32_t    off;
+-} usb_cbcr[] = {
++};
++/* Same order on both SoCs: [0] master and [3] the config-NoC path gate the DWC3, [5] the PHY's AHB. */
++static const struct usb_clk usb_cbcr_sweet[] = {
+ 	{ "master", 0x0f010 },
+ 	{ "sleep", 0x0f014 },
+ 	{ "utmi", 0x0f018 },
+@@ -56,12 +60,50 @@ static const struct {
+ 	{ "ahb2phy", 0x6a004 },
+ 	{ "clkref", 0x8c010 },
+ };
++/*
++ * 0183: SM6225 (spes/spesn), Xiaomi gcc-khaje.c (all BRANCH_HALT, bit 31 = off) and the live FDT
++ * (gcc clock-controller@1400000, gdsc@141a004, ssusb@4e00000 core_base, QSCRATCH at core + 0xf8800).
++ * Run 1 on spesn (0176): GDSC and all seven on after fastboot boot, DWC3 3.30a halted.
++ */
++static const struct usb_clk usb_cbcr_spes[] = {
++	{ "master", 0x1a010 },
++	{ "sleep", 0x1a014 },
++	{ "mock-utmi", 0x1a018 },
++	{ "cfg-noc-axi", 0x1a084 },
++	{ "sys-noc-axi", 0x1a080 },
++	{ "ahb2phy", 0x1d008 },
++	{ "clkref", 0x9f000 },
++};
++#define USB_NCLK        (sizeof(usb_cbcr_sweet) / sizeof(usb_cbcr_sweet[0]))
++_Static_assert(sizeof(usb_cbcr_spes) == sizeof(usb_cbcr_sweet), "same clock list on both SoCs");
+ 
+ #define DWC3_PA                 0x0a600000
+ #define DWC3_SIZE               0x0000d000
+ #define QUSB2_PA                0x088e2000
+ #define QUSB2_SIZE              0x00000400
+ 
++/* The SoC this kernel runs on: sweet (SM7150) unless the ADT has /spes-platform (0183). */
++static struct {
++	bool                  spes;
++	uint32_t              gcc_pa, gcc_size, gdscr, dwc3_pa, qscratch_pa;
++	const struct usb_clk *cbcr;
++} usb_soc = { false, GCC_PA, GCC_SIZE, GCC_USB30_PRIM_GDSCR, DWC3_PA, 0x0a6f8800, usb_cbcr_sweet };
++
++static void
++usb_soc_select(void)
++{
++	DTEntry platform;
++	if (SecureDTLookupEntry(NULL, "/spes-platform", &platform) == kSuccess) {
++		usb_soc.spes = true;
++		usb_soc.gcc_pa = 0x01400000;
++		usb_soc.gcc_size = 0x000a0000;         /* through the clkref CBCR at 0x9f000 */
++		usb_soc.gdscr = 0x1a004;
++		usb_soc.dwc3_pa = 0x04e00000;
++		usb_soc.qscratch_pa = 0x04ef8800;
++		usb_soc.cbcr = usb_cbcr_spes;
++	}
++}
++
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -74,24 +116,28 @@ void
+ sweet_usb_probe(void)
+ {
+ 	int enabled = 1;
+-	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
++	uint32_t gdscr, cbcr[USB_NCLK];
+ 	bool clocks_on = true;
+ 
++	usb_soc_select();
+ 	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		return;
+ 	}
+-	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	if (usb_soc.spes && enabled < 2) {
++		return;         /* 0183: on spes only an explicit sweetusb=2 (spesusb=1 is the read-only probe) */
++	}
++	vm_offset_t gcc = ml_io_map(usb_soc.gcc_pa, usb_soc.gcc_size);
+ 	if (gcc == 0) {
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
+-	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	gdscr = usb_rd(gcc, usb_soc.gdscr);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+-	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+-		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
+-		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
++	for (unsigned i = 0; i < USB_NCLK; i++) {
++		cbcr[i] = usb_rd(gcc, usb_soc.cbcr[i].off);
++		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_soc.cbcr[i].name, cbcr[i],
+ 		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
+ 	}
+ 	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
+@@ -100,7 +146,7 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
+ 		return;
+ 	}
+-	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	vm_offset_t dwc = ml_io_map(usb_soc.dwc3_pa, DWC3_SIZE);
+ 	if (dwc == 0) {
+ 		printf("SWEET USB: DWC3 map failed\n");
+ 		return;
+@@ -116,6 +162,9 @@ sweet_usb_probe(void)
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
++	if (usb_soc.spes) {
++		return;         /* SM6225's HS PHY is SNPS femto, not QUSB2; never touched here (ABL overrides kept) */
++	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+ 		return;
+@@ -164,7 +213,7 @@ sweet_usb_probe(void)
+  * session; Linux dwc3-qcom forces that in software when the charger
+  * reports a cable (dwc3_qcom_vbus_override_enable).
+  */
+-#define QSCRATCH_PA             0x0a6f8800
++#define QSCRATCH_PA             (usb_soc.qscratch_pa)
+ #define QSCRATCH_HS_PHY_CTRL    0x10
+ #define   UTMI_OTG_VBUS_VALID   (1u << 20)
+ #define   SW_SESSVLD_SEL        (1u << 28)
+@@ -878,6 +927,16 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+ 	}
+ 
++	/*
++	 * 0183: on SM6225 the DWC3's DMA goes through the apps SMMU (stream 0x120, live FDT iommus).
++	 * ABL drops its stream match when it exits (ios-flame, same qsmmu-v500 with skip-init); an
++	 * unmatched stream on the first DMA resets the SoC. Pass the stream through first, as for
++	 * WLAN (0x1a0) and audio (0x1C1); without it the controller is not started.
++	 */
++	if (usb_soc.spes && !spes_smmu_identity(0x120, 0, "USB")) {
++		printf("SWEET USB: no SMMU stream for USB (0x120); controller left halted\n");
++		return;
++	}
+ 	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+ 		delay(1000);
+diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
+index ba50de3..80a7e74 100644
+--- a/iokit/Kernel/arm/SpesModem.cpp
++++ b/iokit/Kernel/arm/SpesModem.cpp
+@@ -3552,8 +3552,27 @@ smmu_sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
+ 	return ((id ^ sid) & ~(m | mask) & 0x7FFF) == 0;
+ }
+ 
++static bool smmu_identity_locked(uint32_t sid, uint32_t mask, const char *name);
++
++/*
++ * 0183: USB (bsd/dev/sweet_usb.c) and the modem thread may both look for a free SMR/context bank;
++ * one at a time, or both could take the same slot. A spin flag (no lock object to allocate early).
++ */
++static volatile UInt32 smmu_busy;
++
+ static bool
+ smmu_identity(uint32_t sid, uint32_t mask, const char *name)
++{
++	while (!OSCompareAndSwap(0, 1, &smmu_busy)) {
++		IOSleep(1);
++	}
++	bool ok = smmu_identity_locked(sid, mask, name);
++	OSCompareAndSwap(1, 0, &smmu_busy);
++	return ok;
++}
++
++static bool
++smmu_identity_locked(uint32_t sid, uint32_t mask, const char *name)
+ {
+ 	volatile uint8_t *s = (volatile uint8_t *)ml_io_map(SMMU_PA, SMMU_SIZE);
+ 	if (s == NULL) {
