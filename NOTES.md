@@ -5558,3 +5558,12 @@ soll aus launchd.plist (beim nächsten erreichbaren Boot). CI 44187398152.
   AegirPoster: in all-8 21 Abstürze von AegirPoster (Erd-Hintergrund, Metal), in all-5 keiner. **0215** nimmt 0209 zurück und legt
   /dev/spes-screen nicht mehr an (0208 hat beim Lesen den Kernel eingefroren, Nutzer: verwerfen). Metal-clients jetzt
   `* -backboardd -AegirPoster`. Video-Fix muss neu überlegt werden.
+
+### 2026-11-18 ~00:55 – Fastboot-Rückweg: dritter Fehlschlag → 0216 PS_HOLD-Weg
+
+all-8 (Kernel 0212, PAS-Shutdown 0207): nach „sync done“ loggte SpesAudio noch die GLINK-Kanäle (ADSP fiel weg), dann stand der Kernel;
+Fastboot kam nicht (USB-Gerät blieb aufgezählt). Eingetragen in docs/OFFENE-TREIBER.md. **0216**: wie Linux msm-poweroff — PON
+PS_HOLD_RST_CTL (0x85A) Typ 1 (Warmstart), CTL2 (0x85B) Bit 7, jeweils zurückgelesen (Freigabeliste um genau diese zwei Bytes
+erweitert; Vorlage Xiaomi qpnp-power-on.c qpnp_pon_reset_config), dann 0 nach PS_HOLD 0x440b000 (Live-DT qcom,pshold); PSCI als
+Rückfall. `spesreset=2` Standard auf spes, 1 = PAS-Shutdown (0207), 0 = nur PSCI. CI 44202506575. all-9 (0215) wartet auf Fastboot
+durch den Nutzer.
