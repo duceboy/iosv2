@@ -145,6 +145,13 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   extensions and `ir3_lexer.c` fails (UTIL_ARCH_LITTLE_ENDIAN unset, Dl_info/dladdr undeclared). Remove Homebrew
   flex or keep it out of PATH, and delete research/mesa-build/build-spes (meson caches the flex path). bison from
   Homebrew (3.8.2; Mesa wants > 2.3). SDK used here: iPhoneOS 27.2 with -target arm64-apple-ios16.0.
+- **Graphics stage built on the Mac (2026-11-17):** `tools/build-spes-mesa-macos.sh` with HackiOS userland
+  `oosexgang/hackios-xnu-userland` 906425b (patches/scripts reviewed: Mesa sources only, redwood-drm = RedwoodGPU
+  IOKit calls, no network/exec) and iPhoneOS 27.2 SDK: 1134/1134 steps, 48 s ->
+  `research/mesa-build/out/libOSMesa.8.dylib` (SHA256 f7f5266f8ff4641d...); `tools/build-spes-eagl-macos.sh` ->
+  `libredwood-gl.dylib` (4e0962ddc4705988...; mkeagl 409 entries: 356 passed on, 30 by hand, 23 missing). Both
+  minos 16.0 / sdk 27.2, ad-hoc signed. All undefined symbols (223 / 451) are exported by the iOS 16.7.16 shared
+  cache (checked against the IPSW's cache). Not installed yet.
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
