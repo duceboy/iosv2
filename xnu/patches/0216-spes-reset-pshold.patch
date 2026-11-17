@@ -1,0 +1,123 @@
+spes: reset through PS_HOLD after a PMIC warm-reset config, like Linux (0216; spesreset=2 default on spes).
+
+all-5, all-6, all-9: with the ADSP and the modem up, the "fastboot" command reset through PSCI never reached fastboot; with the 0207
+PAS shutdown the kernel stopped right after the ADSP went down. Linux reboots through msm-poweroff: qpnp_pon_reset_config(
+WARM_RESET) programs PON PS_HOLD_RST_CTL (0x85A: type 1) and _CTL2 (0x85B: enable bit 7, gen2) and then writes 0 to PS_HOLD
+(live DT qcom,pshold 0x440b000). The allow-list (spes_spmi_allow.h) gains exactly these two bytes (user: PMIC writes allowed with
+a Linux template and read-back); every write is read back. PSCI stays the fallback 2 s later; spesreset=1 = the 0207 PAS shutdown,
+0 = PSCI only. The PON restart reason (SOFT_RB_SPARE) is set before, as since 0186.
+
+diff --git a/bsd/dev/spes_spmi_allow.h b/bsd/dev/spes_spmi_allow.h
+index dc08042..a7e71c8 100644
+--- a/bsd/dev/spes_spmi_allow.h
++++ b/bsd/dev/spes_spmi_allow.h
+@@ -15,11 +15,21 @@
+ #define SPES_PON_SOFT_RB_SPARE  0x88Fu
+ #define SPES_PON_SUBTYPE        0x805u
+ 
+-/* true only for SID 0, address 0x88F, exactly one byte. */
++/*
++ * 0216 (user: PMIC writes allowed with a Linux template, read-back and restore of the starting values): PON
++ * PS_HOLD_RST_CTL (base + 0x5A) and PS_HOLD_RST_CTL2 (base + 0x5B), Xiaomi qpnp-power-on.c qpnp_pon_reset_config():
++ * reset type WARM_RESET (1) in CTL[3:0], enable bit 7 of CTL2 (gen2), so that pulling PS_HOLD low resets the SoC like
++ * Linux's msm-poweroff does. Only these two bytes besides SOFT_RB_SPARE.
++ */
++#define SPES_PON_PS_HOLD_RST_CTL   0x85Au
++#define SPES_PON_PS_HOLD_RST_CTL2  0x85Bu
++
++/* true only for SID 0, addresses 0x88F, 0x85A, 0x85B, exactly one byte. */
+ static inline bool
+ spes_spmi_write_allowed(uint32_t sid, uint32_t addr, uint32_t len)
+ {
+-	return sid == SPES_PON_SID && addr == SPES_PON_SOFT_RB_SPARE && len == 1;
++	return sid == SPES_PON_SID && len == 1 &&
++	       (addr == SPES_PON_SOFT_RB_SPARE || addr == SPES_PON_PS_HOLD_RST_CTL || addr == SPES_PON_PS_HOLD_RST_CTL2);
+ }
+ 
+ /*
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index d6d3eb2..aa0a015 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -231,6 +231,43 @@ spes_pon_set_bootloader(void)
+ 	return 0;
+ }
+ 
++/*
++ * 0216: PS_HOLD reset type = warm reset, as Linux qpnp_pon_reset_config(PON_POWER_OFF_WARM_RESET) on PON gen2: CTL2 bit 7
++ * off, 500 us, CTL[3:0] = 1, CTL2 bit 7 on; every write read back. 0 = configured (then a low PS_HOLD warm-resets).
++ */
++int spes_pon_pshold_warm(void);
++int
++spes_pon_pshold_warm(void)
++{
++	uint8_t sub = 0, c1 = 0, c2 = 0, b = 0xff;
++	if (sweet_spmi_init() != 0 || sweet_spmi_read(0, 0x805, &sub) != 0 || (sub != 0x04 && sub != 0x05) ||
++	    sweet_spmi_read(0, SPES_PON_PS_HOLD_RST_CTL, &c1) != 0 || sweet_spmi_read(0, SPES_PON_PS_HOLD_RST_CTL2, &c2) != 0) {
++		printf("SPES PON: PS_HOLD config not readable / not gen2 (sub %#x)\n", sub);
++		return -1;
++	}
++	printf("SPES PON: PS_HOLD_RST_CTL %#x CTL2 %#x before\n", c1, c2);
++	uint8_t v2 = (uint8_t)(c2 & ~0x80u), v1 = (uint8_t)((c1 & ~0x0fu) | 0x01u), v3 = (uint8_t)(c2 | 0x80u);
++	if (sweet_spmi_write(0, SPES_PON_PS_HOLD_RST_CTL2, v2) != 0 ||
++	    sweet_spmi_read(0, SPES_PON_PS_HOLD_RST_CTL2, &b) != 0 || b != v2) {
++		printf("SPES PON: CTL2 disable failed (%#x)\n", b);
++		return -1;
++	}
++	delay(500);
++	if (sweet_spmi_write(0, SPES_PON_PS_HOLD_RST_CTL, v1) != 0 ||
++	    sweet_spmi_read(0, SPES_PON_PS_HOLD_RST_CTL, &b) != 0 || (b & 0x0fu) != 0x01u) {
++		printf("SPES PON: CTL type failed (%#x), CTL2 back to %#x\n", b, c2);
++		(void)sweet_spmi_write(0, SPES_PON_PS_HOLD_RST_CTL2, c2);
++		return -1;
++	}
++	if (sweet_spmi_write(0, SPES_PON_PS_HOLD_RST_CTL2, v3) != 0 ||
++	    sweet_spmi_read(0, SPES_PON_PS_HOLD_RST_CTL2, &b) != 0 || !(b & 0x80u)) {
++		printf("SPES PON: CTL2 enable failed (%#x)\n", b);
++		return -1;
++	}
++	printf("SPES PON: PS_HOLD -> warm reset (CTL %#x CTL2 %#x)\n", v1, b);
++	return 0;
++}
++
+ /*
+  * 0185: log the PM6125 PON registers the "reboot to fastboot" reason would use, READ ONLY: revision
+  * (0x801), type (0x804), subtype (0x805; 4/5 = gen2) and SOFT_RB_SPARE (0x88F), plus the value the
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index c3586e2..05b050a 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -950,11 +950,29 @@ ud_reset(bool bootloader)
+ 			printf("SWEET USB: IMEM restart_reason %#x\n", *(volatile uint32_t *)(imem + SPES_IMEM_RESTART));
+ 		}
+ 	}
+-	/* 0207: shut the modem and the ADSP down first (Linux stops its remoteprocs on reboot); all-5 reset with both up
+-	 * but never reached fastboot */
++	/*
++	 * 0216: spesreset=2 (default on spes): PS_HOLD low after configuring the PMIC for a warm reset, as Linux
++	 * msm-poweroff (live DT qcom,pshold 0x440b000). all-5/6/9: PSCI SYSTEM_RESET with the ADSP and modem up never
++	 * reached fastboot, and the 0207 PAS shutdown stopped the kernel. PSCI stays the fallback.
++	 */
+ 	{
+-		extern void spes_dsps_shutdown(void);
+-		spes_dsps_shutdown();
++		int mode = usb_soc.spes ? 2 : 0;
++		PE_parse_boot_argn("spesreset", &mode, sizeof(mode));
++		extern int spes_pon_pshold_warm(void);
++		if (mode == 2 && spes_pon_pshold_warm() == 0) {
++			vm_offset_t ph = ml_io_map(0x0440b000, 0x1000);
++			if (ph != 0) {
++				printf("SWEET USB: PS_HOLD low\n");
++				ud_sleep_ms(300);
++				*(volatile uint32_t *)ph = 0;
++				__asm__ volatile ("dsb sy" ::: "memory");
++				ud_sleep_ms(2000);
++				printf("SWEET USB: still running 2 s after PS_HOLD low: PSCI\n");
++			}
++		} else if (mode == 1) {
++			extern void spes_dsps_shutdown(void);
++			spes_dsps_shutdown();       /* 0207 path, opt-in now */
++		}
+ 	}
+ 	printf("SWEET USB: PSCI SYSTEM_RESET\n");
+ 	ud_sleep_ms(300);
