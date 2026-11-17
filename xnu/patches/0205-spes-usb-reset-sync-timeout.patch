@@ -1,0 +1,58 @@
+spes: pre-reset syncs on a helper thread, at most 8 s (0205).
+
+all-1 and all-3 (ADSP and modem up): the USB "fastboot" command set the PON reason, then the command thread never came
+back from sync_internal(), so the phone never reset and the user had to hold Power+Vol-. The two syncs (0188) now run
+on their own thread; the command thread waits up to 8 s and resets either way, logging which.
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index ba06b05..283f02b 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -906,6 +906,20 @@ ud_psci_reset(void)
+ 	}
+ }
+ 
++
++/* 0205: the pre-reset syncs on their own thread, so a stuck sync cannot keep the phone from resetting */
++static volatile int ud_sync_done;
++static void
++ud_sync_thread(void *arg __unused, wait_result_t w __unused)
++{
++	(void)sync_internal();
++	ud_sleep_ms(2000);
++	(void)sync_internal();
++	ud_sync_done = 1;
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ static void
+ ud_cmd_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -973,10 +987,22 @@ ud_cmd_thread(__unused void *arg, __unused wait_result_t wr)
+ 		if (!reset) {
+ 			continue;
+ 		}
+-		/* 0188: twice, with time for HFS's journal and the UFS cache in between */
+-		(void)sync_internal();
+-		ud_sleep_ms(2000);
+-		(void)sync_internal();
++		/*
++		 * 0188: twice, with time for HFS's journal and the UFS cache in between. 0205: on a helper
++		 * thread, waited for at most 8 s: with the ADSP and the modem up (all-1, all-3) the command
++		 * thread never came back from sync_internal() and the phone never reset.
++		 */
++		ud_sync_done = 0;
++		{
++			thread_t st;
++			if (kernel_thread_start(ud_sync_thread, NULL, &st) == KERN_SUCCESS) {
++				thread_deallocate(st);
++				for (int w = 0; w < 80 && !ud_sync_done; w++) {
++					ud_sleep_ms(100);
++				}
++			}
++		}
++		printf("SWEET USB: sync %s\n", ud_sync_done ? "done" : "still running after 8 s: resetting anyway");
+ 		ud_sleep_ms(500);                   /* reply and last log lines out over USB */
+ 		if (bootloader) {
+ 			vm_offset_t imem = ml_io_map(SPES_IMEM_PAGE, 0x1000);

@@ -1,0 +1,70 @@
+spes: verify SIM PIN1 from a local boot-arg (0204, modem_pin=, never logged).
+
+all-3: after 0203 the slot-2 USIM became the primary GW application and asked for PIN1. With modem_pin=<4-8 digits>
+the card status handler sends UIM Verify PIN (0x26: session primary GW, PIN1) once, only when the card reports at least
+2 tries left; the PIN is never printed (the log says only that it was sent and the result with tries left) and the
+buffers are cleared. The boot-arg lives only in locally built images (shim/out is not in git).
+
+diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
+index 5b42f97..5dede21 100644
+--- a/iokit/Kernel/arm/SpesModem.cpp
++++ b/iokit/Kernel/arm/SpesModem.cpp
+@@ -6181,7 +6181,7 @@ nas_rx(const uint8_t *d, uint32_t len)
+ }
+ 
+ static uint32_t u_last_ms;
+-static bool d_online_sent, n_reg_sent, u_switched, u_provisioned, u_card_ready;
++static bool d_online_sent, n_reg_sent, u_switched, u_provisioned, u_card_ready, u_pin_sent;
+ #define PORT_DMSC           0x4007
+ 
+ /* send a request with prepared TLV bytes (body = TLVs) */
+@@ -6222,6 +6222,12 @@ uim_rx(const uint8_t *d, uint32_t len)
+ 		memcpy(&res, r, 2);
+ 		memcpy(&err, r + 2, 2);
+ 	}
++	if (msg == 0x26) {
++		const uint8_t *rt = qm_find(d, len, 0x10, &l);          /* retries left: verify, unblock */
++		LOG("uim: PIN verify result %u error %u, tries left %d", res, err, rt != NULL && l >= 1 ? (int)rt[0] : -1);
++		u_last_ms = g_ms > 25000 ? g_ms - 25000 : 1;
++		return;
++	}
+ 	if (msg != 0x2F || res != 0) {
+ 		LOG("uim: msg %#x result %u error %u", msg, res, err);
+ 		return;
+@@ -6247,6 +6253,36 @@ uim_rx(const uint8_t *d, uint32_t len)
+ 		for (unsigned a = 0; a < napp && o + 7 <= l; a++) {
+ 			unsigned type = v[o], state = v[o + 1], alen = v[o + 6];
+ 			LOG("uim:   app %u type %u state %s", a, type, state < 8 ? as[state] : "?");
++			/* 0204: PIN1 wanted -> Verify PIN once from boot-arg modem_pin (never logged), only with >= 2 tries left */
++			if (state == 2 && !u_pin_sent && o + 7 + alen + 3 <= l) {
++				unsigned retries = v[o + 7 + alen + 2];
++				char pin[9] = { 0 };
++				if (PE_parse_boot_argn("modem_pin", pin, sizeof(pin)) && pin[0] != 0) {
++					size_t pl = strnlen(pin, 8);
++					bool digits = pl >= 4;
++					for (size_t i = 0; i < pl; i++) {
++						digits = digits && pin[i] >= '0' && pin[i] <= '9';
++					}
++					if (!digits) {
++						LOG("uim: modem_pin is not 4-8 digits; not sent");
++					} else if (retries < 2) {
++						LOG("uim: PIN1 has %u tries left; not risking it", retries);
++					} else {
++						uint8_t t[4 + 3 + 2 + 8];
++						unsigned n = 0;
++						t[n++] = 0x01; t[n++] = 2; t[n++] = 0; t[n++] = 0; t[n++] = 0;   /* session: primary GW, no AID */
++						t[n++] = 0x02; t[n++] = (uint8_t)(2 + pl); t[n++] = 0;
++						t[n++] = 1; t[n++] = (uint8_t)pl;                               /* PIN1 */
++						memcpy(t + n, pin, pl);
++						n += (unsigned)pl;
++						u_pin_sent = true;
++						LOG("uim: PIN1 wanted (%u tries left): verifying the PIN from modem_pin", retries);
++						nq_send_tlv(PORT_UIMC, u_node, u_port, 0x26, t, (uint16_t)n);
++						bzero(t, sizeof(t));
++					}
++				}
++				bzero(pin, sizeof(pin));
++			}
+ 			if (card == 1 && state == 7 && ready_slot == 0) {
+ 				ready_slot = sl + 1;
+ 			}
