@@ -7,10 +7,20 @@ technology, signal (dBm, LTE SNR), card and application states. Nothing is set; 
 ICCID, IMEI, AIDs) is requested or logged.
 
 diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
-index 80a7e74..a728672 100644
+diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
+index 80a7e74..b5d1f50 100644
 --- a/iokit/Kernel/arm/SpesModem.cpp
 +++ b/iokit/Kernel/arm/SpesModem.cpp
-@@ -868,6 +868,11 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+@@ -565,6 +565,8 @@ static bool q_hello_sent, q_hello_rx, q_announced;
+ static struct { uint32_t svc, inst, node, port; } q_srv[64];
+ static unsigned q_srv_count, g_rx_msgs, g_tx_msgs, q_resumes;
+ static unsigned g_ms;                           /* watch time, for the log */
++static uint32_t n_node, n_port, u_node, u_port;    /* 0200: NAS / UIM servers */
++static bool n_on;                               /* 0200: modem_nas=1 */
+ 
+ static uint32_t
+ rx_avail(void)
+@@ -868,6 +870,11 @@ qrtr_rx(const uint8_t *p, uint32_t len)
  			wlfw_arrive(c->c, c->d);
  		} else if (c->a != 0) {
  			LOG("t=%u ms: service %x:%x port %x %s", g_ms, c->a, c->b, c->d, svc_name(c->a));
@@ -22,7 +32,7 @@ index 80a7e74..a728672 100644
  		}
  		break;
  	case QRTR_TYPE_DATA:
-@@ -6074,6 +6079,143 @@ svc_announce(void)
+@@ -6074,6 +6081,143 @@ svc_announce(void)
  	LOG("t=%u ms: announced pd-mapper 0x40, tftp 0x1000, rmtfs 0x0e", g_ms);
  }
  
@@ -37,9 +47,9 @@ index 80a7e74..a728672 100644
 + */
 +#define PORT_NASC           0x4005
 +#define PORT_UIMC           0x4006
-+static uint32_t n_node, n_port, u_node, u_port, n_last_ms;
++static uint32_t n_last_ms;
 +static uint16_t n_txn = 0x100;
-+static bool n_on, u_asked;
++static bool u_asked;
 +
 +static void
 +nq_send(uint32_t port_from, uint32_t node, uint32_t port, uint16_t msg)
@@ -166,7 +176,7 @@ index 80a7e74..a728672 100644
  static bool
  svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *data, uint32_t len)
  {
-@@ -6087,6 +6229,14 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+@@ -6087,6 +6231,14 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
  		wlfw_rx(data, len);
  		return true;
  	}
@@ -181,7 +191,7 @@ index 80a7e74..a728672 100644
  	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
  		return tftp_session(dst_port, data, len);
  	}
-@@ -6195,6 +6345,7 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+@@ -6195,6 +6347,7 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
  			}
  			ipa_last = v;
  		}
@@ -189,7 +199,7 @@ index 80a7e74..a728672 100644
  		IOSleep(1);
  	}
  	LOG("watch done: slave-kernel %08x, %s", sk_last, ready ? "READY" : "NOT ready");
-@@ -6382,6 +6533,11 @@ spes_soc_map(void)
+@@ -6382,6 +6535,11 @@ spes_soc_map(void)
  	state = -1;
  	soc_lock = IOLockAlloc();
  	(void)PE_parse_boot_argn("modem_part", fw_part, sizeof(fw_part));
