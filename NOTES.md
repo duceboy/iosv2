@@ -152,6 +152,19 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   `libredwood-gl.dylib` (4e0962ddc4705988...; mkeagl 409 entries: 356 passed on, 30 by hand, 23 missing). Both
   minos 16.0 / sdk 27.2, ad-hoc signed. All undefined symbols (223 / 451) are exported by the iOS 16.7.16 shared
   cache (checked against the IPSW's cache). Not installed yet.
+- **EAGL graphics stage installed into the phone's root (block delta, 2026-11-17):** fresh 16 GiB snapshot from
+  OrangeFox `research/spes-phone-root-20261117a.img` (phone = file 164e63c3...2358), APFS clone mounted RW
+  (owners off, no sudo): `/redwood/lib/libOSMesa.8.dylib` + `libredwood-gl.dylib` (0755), `/usr/libexec/backboardd`
+  replaced in place by `tools/stage-spes-eagl.py` output (weak LC_LOAD_WEAK_DYLIB on libredwood-gl, ad-hoc signed
+  with its own entitlements; original 7aa6f8bf..., patched 998e4465...; staging research/eagl-stage-20261117).
+  fsck_hfs -fn OK. `research/eagl-delta-20261117`: 32 changed MiB (blocks 0..14888), verified against the phone,
+  applied with per-block readback; afterwards SHA256 of the first 16 GiB on the phone = clone (ae112bed...b5c9).
+  Rollback: `tools/apply-ios-root-delta.py research/eagl-delta-20261117 --rollback --apply` (only while no other
+  iOS writes happened, or after rechecking).
+- Graphics image `shim/out/spes-ios-graphics-1.img` (79cdeabc...): `SPES_MEMORY_FLOOR=0xa0000000 SWEET_CPUS=4
+  SWEET_EXTRA_ARGS="modem=1 wifi=1 modem_part=modem_b spesbattery=1" tools/build-spes-ios-graphics.sh` ->
+  spesgpu=1 spesgpuprobe=1 spesgpu_mhz=300 glsync=1 sweetkeys=1 sweetfb_hz=60, wlan_mac from the serial (kept local,
+  never written here).
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
