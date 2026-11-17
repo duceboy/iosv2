@@ -1,0 +1,1630 @@
+spes: IPA 4.2 data path, first draft, read-only first (0210; modem_ipa_data=1 [modem_ipa_readonly=1]).
+
+bsd/dev/spes_ipa.c + spes_ipa.h (draft, docs/SPES-IPA-DRAFT.md): port of HackiOS hakios.ipa.c (IPA 4.11) to IPA 4.2 /
+GSI 2.0 with Linux v6.12 drivers/net/ipa (ipa_data-v4.2.c, ipa_reg-v4.2.c, gsi_reg-v4.0.c) and the live DT (ipa 0x5800000,
+gsi 0x5804000, ipa_fws PAS 15 at 0x56600000). Order as Linux ipa_probe: clock vote, mappings, read-only probe (FLAVOR_0,
+SHARED_MEM_SIZE), SMMU 0x140, SMEM 497, hardware config, firmware (from /usr/share/firmware/spes/ipa on the iOS root,
+never in git), GSI rings/channels for AP channels 1/2/0/3, endpoints, empty filter/route tables, LAN RX, poll thread; QMAP
+TX/RX with spes_ipa_rx_hook. Every unsure value carries a CHECK comment. Called from SpesModem before the modem boots;
+nothing without modem_ipa_data=1, and modem_ipa_readonly=1 stops after the clock vote and the read-only probe (first run).
+Still missing: IPA QMI handshake, WDA/DPM/WDS, the en1 interface (docs/OFFENE-TREIBER.md).
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 2012dd1..dd7890a 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/redwood_apple80211.c	standard
+ bsd/dev/spes_sta.c		standard
+ bsd/dev/spes_vib.c		standard
+ bsd/dev/spes_screen.c		standard
++bsd/dev/spes_ipa.c		standard
+ bsd/dev/spes_cpufreq.c		standard
+ bsd/dev/spes_amp.c		standard
+ bsd/dev/spes_usb.c		standard
+diff --git a/bsd/dev/spes_ipa.c b/bsd/dev/spes_ipa.c
+new file mode 100644
+index 0000000..7f15368
+--- /dev/null
++++ b/bsd/dev/spes_ipa.c
+@@ -0,0 +1,1577 @@
++/*
++ * spes (SM6225 "khaje") IPA 4.2 data path between this processor and the modem.
++ * DRAFT - not built, not run. Nothing happens without boot-arg modem_ipa_data=1.
++ *
++ * The IPA ("IP accelerator", hw-ver 0x10 = v4.2 in the live DT) moves IP packets between the modem
++ * and this processor. Its DMA engine, the GSI, has per-execution-environment channels: a channel is a
++ * ring of 16-byte transfer elements (TREs) this processor fills; the GSI writes one 16-byte event per
++ * finished TRE into the channel's event ring. A doorbell register says how far the TRE ring is
++ * filled; the event ring's context register 4 says how far the GSI has written events. No interrupt
++ * is used: a kernel thread polls (as HackiOS hakios.ipa.c does on SM7325).
++ *
++ * AP endpoints/channels for IPA v4.2 (Linux v6.12 drivers/net/ipa/data/ipa_data-v4.2.c):
++ *   command TX  endpoint 6, channel 1  immediate commands to the IPA (tables, header area, zeroing)
++ *   LAN RX      endpoint 8, channel 2  default route and exceptions (looked at, dropped)
++ *   modem TX    endpoint 1, channel 0  IP packets to the modem, behind a 4-byte QMAP header
++ *   modem RX    endpoint 9, channel 3  QMAP-framed packets from the modem, aggregated per buffer
++ * The modem's channels (EE 1: channels 0..3) must be ALLOCATED by this processor on IPA v4.2 (Linux
++ * gsi.c: modem_alloc = version == IPA_VERSION_4_2, GENERIC_CMD ALLOCATE_CHANNEL).
++ *
++ * Init order (Linux ipa_probe(): ipa_config() -> ipa_firmware_load() -> ipa_setup()):
++ *   0  gate, clock vote (RPM SMD "ipa"), register mappings, read-only probe (modem_ipa_readonly=1 stops here)
++ *   1  SMMU identity context for the IPA's AP stream (SID 0x140, live DT ipa_smmu_ap)
++ *   2  SMEM item 497 (0x2000 bytes) for the modem's filter tables (Linux ipa_smem_init())
++ *   3  ipa_config(): hardware config, local-memory canaries, endpoint availability (FLAVOR_0), resource groups
++ *   4  firmware: TrustZone PAS id 15, ipa_fws.mdt/.b00-.b04 into reserved memory 0x56600000 (live DT qcom,ipa_fws)
++ *   5  gsi_setup(): interrupts off, event rings + channels allocated/programmed, modem channels allocated
++ *   6  endpoints programmed, command channel started, ipa_mem_setup(), ipa_table_setup(),
++ *      LAN RX started, default route -> endpoint 8
++ *   7  poll thread; spes_ipa_modem_start() later starts the two modem data channels
++ *
++ * Memory the IPA/GSI reads or writes comes from SpesModem's pool (spes_pool_alloc(): physically
++ * contiguous, below 4 GiB, write-combined = Normal non-cacheable, zeroed), so no cache maintenance is
++ * needed, only barriers before doorbells. The IPA reaches it through an identity SMMU context.
++ * Register addresses: IPA registers at ipa-base + 0x40000 (downstream ipa3 maps ipa-base +
++ * ipa_reg_base_ofst; the ipa_fws ELF has a segment at 0x585e000 inside that window), GSI at gsi-base.
++ *
++ * Every value I am not sure about carries a CHECK comment naming its source.
++ *
++ * Boot-args:  modem_ipa_data=1 (on), modem_ipa_readonly=1 (stop after the read probe),
++ *             modem_ipa_clk=0 (do not vote the IPA clock; assume it is on), modem_ipa_trace=1 (per packet),
++ *             modem_ipa_fw=0 (do not load firmware; only if GSI is already enabled), modem_ipa_mux=N (QMAP mux, 1).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/kauth.h>
++#include <sys/uio.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <machine/machine_routines.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#include "spes_ipa.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t thread);
++/* SpesModem.cpp (extern "C") */
++extern bool     spes_soc_map(void);
++extern void    *spes_pool_alloc(uint64_t size, uint64_t *pa);
++extern bool     spes_smmu_identity(uint32_t sid, uint32_t mask, const char *name);
++extern uint64_t spes_scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1);
++extern void    *spes_smem_partition(uint16_t a, uint16_t b);
++extern void    *spes_smem_get(void *part, uint16_t item, uint32_t *size);
++extern void    *spes_smem_alloc(void *part, uint16_t item, uint32_t size);
++/* sweet_touch.c: one RPM SMD key/value request over the GLINK RPM link the GPU probe opened */
++extern int      spes_rpm_kvp(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++
++#define LOGP                    "SPES IPA: "
++
++/* ---------------------------------------------------------------- hardware facts */
++
++/* live DT qcom,ipa@0x5800000: reg ipa-base 0x5800000+0x34000, gsi-base 0x5804000+0x28000, ee 0 */
++#define IPA_REG_PA              0x05840000ull   /* CHECK: ipa-base + 0x40000 (downstream ipahal_get_reg_base() = 0x40000; sc7180 ipa-reg 0x1e40000 vs gsi 0x1e04000 has the same layout) */
++#define IPA_REG_SIZE            0x4000u         /* endpoint registers end at 0x840 + 0x70 * 31, IRQ registers at 0x3000 */
++#define IPA_SRAM_PA             (IPA_REG_PA + 0x7000)  /* CHECK: "ipa-shared" = ipa-reg + 0x7000 on sc7180 (IPA v4.2); downstream SW_AREA_RAM_DIRECT_ACCESS_n = 0x7000 */
++#define IPA_SRAM_SIZE           0x2000u         /* ipa_data-v4.2.c: IPA_MEM_END_MARKER at 0x2000 */
++#define GSI_PA                  0x05804000ull
++#define GSI_MAP_FROM            0xc000u         /* inter-EE masks (0xc020) ... EE 0 scratch (0x1f400) */
++#define GSI_MAP_SIZE            0x14000u
++
++#define IPA_SMMU_SID            0x140u          /* live DT ipa_smmu_ap: iommus = <&apps_smmu 0x140 0x0> (wlan cb 0x141, uc cb 0x142) */
++#define IPA_SMMU_MASK           0x0u
++#define IPA_PAS_ID              15u             /* live DT qcom,ipa_fws: qcom,pas-id = <0x0f>; Linux ipa_main.c IPA_PAS_ID 15 */
++#define IPA_FW_CARVE_PA         0x56600000u     /* live DT pil_ipa_fw_mem: ipa_fw_region@56600000, no-map */
++#define IPA_FW_CARVE_SIZE       0x00010000u
++#define IPA_FW_DIR              "/usr/share/firmware/spes/ipa/"   /* CHECK: not in modem_b; copy vendor/firmware/ipa_fws.* onto the iOS root (never into git) */
++#define IPA_FW_NAME             "ipa_fws"       /* live DT qcom,firmware-name = "ipa_fws" (scuba_ipa_fws.* differ in md5: other signing/SKU, not used) */
++#define IPA_SMEM_ITEM           497u            /* ipa_data-v4.2.c smem_id */
++#define IPA_SMEM_SIZE           0x2000u         /* ipa_data-v4.2.c smem_size; CHECK: live DT has no qcom,ipa-q6-smem-size */
++#define SMEM_HOST_APPS          0
++#define SMEM_HOST_MODEM         1
++
++/* IPA core clock: live DT clocks = <&rpmcc 0x0a> "core_clk" (qcom,rpmcc-bengal) */
++#define RPM_SET_ACTIVE          0
++#define RPM_TYPE_IPA_CLK        0x00617069u     /* CHECK: "ipa\0", Linux clk-smd-rpm.c QCOM_SMD_RPM_IPA_CLK; index 0x0a of rpmcc-bengal not verified to be ipa_clk */
++#define RPM_KEY_RATE_KHZ        0x007a484bu     /* "KHz", as spes_gpu_backend.h uses for "clk2" */
++#define IPA_CLK_KHZ             100000u         /* CHECK: ipa_data-v4.2.c core_clock_rate 100 MHz (sc7180); khaje downstream rates not read */
++
++/* GSI registers, EE 0 (Linux gsi_reg-v4.0.c; GSI_EE_AP = 0, per-EE stride 0x4000) */
++#define GSI_INTER_EE_SRC_CH_IRQ_MSK     0xc020u
++#define GSI_INTER_EE_SRC_EV_CH_IRQ_MSK  0xc024u
++#define GSI_CH_C_CNTXT_0(c)     (0x1c000u + 0x80u * (c))
++#define GSI_CH_C_CNTXT_1(c)     (0x1c004u + 0x80u * (c))
++#define GSI_CH_C_CNTXT_2(c)     (0x1c008u + 0x80u * (c))
++#define GSI_CH_C_CNTXT_3(c)     (0x1c00cu + 0x80u * (c))
++#define GSI_CH_C_QOS(c)         (0x1c05cu + 0x80u * (c))
++#define GSI_CH_C_SCRATCH(c, n)  (0x1c060u + 0x80u * (c) + 4u * (n))
++#define GSI_EV_CH_E_CNTXT(e, n) (0x1d000u + 0x80u * (e) + 4u * (n))   /* n = 0..4, 8..13 */
++#define GSI_CH_C_DOORBELL_0(c)  (0x1e000u + 0x08u * (c))
++#define GSI_EV_CH_E_DOORBELL_0(e) (0x1e100u + 0x08u * (e))
++#define GSI_STATUS              0x1f000u        /* bit 0 ENABLED */
++#define GSI_CH_CMD              0x1f008u        /* chid 7:0, opcode 31:24 */
++#define GSI_EV_CH_CMD           0x1f010u
++#define GSI_GENERIC_CMD         0x1f018u        /* opcode 4:0, chid 9:5, ee 13:10 */
++#define GSI_HW_PARAM_2          0x1f040u        /* NUM_CH_PER_EE 7:3, NUM_EV_PER_EE 12:8 */
++#define GSI_CNTXT_TYPE_IRQ_MSK  0x1f088u
++#define GSI_CNTXT_SRC_CH_IRQ_MSK 0x1f098u
++#define GSI_CNTXT_SRC_EV_CH_IRQ_MSK 0x1f09cu
++#define GSI_CNTXT_SRC_CH_IRQ_CLR 0x1f0a0u
++#define GSI_CNTXT_SRC_EV_CH_IRQ_CLR 0x1f0a4u
++#define GSI_CNTXT_SRC_IEOB_IRQ_MSK 0x1f0b8u
++#define GSI_CNTXT_SRC_IEOB_IRQ_CLR 0x1f0c0u
++#define GSI_CNTXT_GLOB_IRQ_STTS 0x1f100u
++#define GSI_CNTXT_GLOB_IRQ_EN   0x1f108u
++#define GSI_CNTXT_GLOB_IRQ_CLR  0x1f110u
++#define GSI_CNTXT_GSI_IRQ_STTS  0x1f118u
++#define GSI_CNTXT_GSI_IRQ_EN    0x1f120u
++#define GSI_CNTXT_INTSET        0x1f180u
++#define GSI_ERROR_LOG           0x1f200u
++#define GSI_ERROR_LOG_CLR       0x1f210u
++#define GSI_CNTXT_SCRATCH_0     0x1f400u        /* GENERIC_EE_RESULT 7:5 */
++
++#define GSI_CH_ALLOCATE         0x0u            /* gsi_reg.h enum gsi_ch_cmd_opcode */
++#define GSI_CH_START            0x1u
++#define GSI_CH_STOP             0x2u
++#define GSI_CH_RESET            0x9u
++#define GSI_CH_DE_ALLOC         0xau
++#define GSI_EVT_ALLOCATE        0x0u
++#define GSI_GENERIC_ALLOCATE_CHANNEL 0x2u       /* gsi_reg.h enum gsi_generic_cmd_opcode */
++#define GSI_EE_MODEM            1u
++#define GSI_MODEM_CHANNELS      4u              /* ipa_data-v4.2.c: modem channels 0 (ep 4), 1 (ep 5), 2 (ep 10), 3 (ep 11) */
++#define GENERIC_EE_SUCCESS      1u
++#define GENERIC_EE_INCORRECT_CHANNEL_STATE 2u
++#define GENERIC_EE_RETRY        6u
++#define GLOB_ERROR_INT          (1u << 0)
++#define GLOB_GP_INT1            (1u << 1)
++#define CH_STATE_NOT_ALLOCATED  0u
++#define CH_STATE_ALLOCATED      1u
++#define CH_STATE_STARTED        2u
++#define EV_STATE_NOT_ALLOCATED  0u
++#define EV_STATE_ALLOCATED      1u
++#define GSI_CHANNEL_TYPE_GPI    2u
++#define GSI_RING_ELEMENT_SIZE   16u
++#define GSI_EVT_RING_INT_MODT   32u             /* gsi.c: 1 ms at 32 kHz */
++
++/* IPA registers (Linux ipa_reg-v4.2.c) */
++#define IPA_COMP_CFG            0x003cu
++#define IPA_CLKON_CFG           0x0044u
++#define IPA_ROUTE               0x0048u
++#define IPA_SHARED_MEM_SIZE     0x0054u         /* MEM_SIZE 15:0, MEM_BADDR 31:16, 8-byte units */
++#define IPA_QSB_MAX_WRITES      0x0074u
++#define IPA_QSB_MAX_READS       0x0078u
++#define IPA_FILT_ROUT_HASH_EN   0x0148u
++#define IPA_BCR                 0x01d0u
++#define IPA_LOCAL_PKT_PROC_CNTXT 0x01e8u
++#define IPA_COUNTER_CFG         0x01f0u
++#define IPA_TX_CFG              0x01fcu
++#define IPA_FLAVOR_0            0x0210u
++#define IPA_IDLE_INDICATION_CFG 0x0240u
++#define IPA_SRC_RSRC_GRP_01(t)  (0x0400u + 0x20u * (t))
++#define IPA_DST_RSRC_GRP_01(t)  (0x0500u + 0x20u * (t))
++#define IPA_ENDP_INIT_CFG(e)    (0x0808u + 0x70u * (e))
++#define IPA_ENDP_INIT_NAT(e)    (0x080cu + 0x70u * (e))
++#define IPA_ENDP_INIT_HDR(e)    (0x0810u + 0x70u * (e))
++#define IPA_ENDP_INIT_HDR_EXT(e) (0x0814u + 0x70u * (e))
++#define IPA_ENDP_INIT_HDR_METADATA_MASK(e) (0x0818u + 0x70u * (e))
++#define IPA_ENDP_INIT_MODE(e)   (0x0820u + 0x70u * (e))
++#define IPA_ENDP_INIT_AGGR(e)   (0x0824u + 0x70u * (e))
++#define IPA_ENDP_INIT_HOL_BLOCK_EN(e) (0x082cu + 0x70u * (e))
++#define IPA_ENDP_INIT_DEAGGR(e) (0x0834u + 0x70u * (e))
++#define IPA_ENDP_INIT_RSRC_GRP(e) (0x0838u + 0x70u * (e))
++#define IPA_ENDP_INIT_SEQ(e)    (0x083cu + 0x70u * (e))
++#define IPA_ENDP_STATUS(e)      (0x0840u + 0x70u * (e))
++
++/* IPA local memory map, IPA v4.2 (ipa_data-v4.2.c ipa_mem_local_data); offsets before adding mem_offset */
++#define MEM_V4_FILTER           0x0290u         /* 0x78 bytes; hashed variants have size 0 (no hashing on v4.2) */
++#define MEM_V6_FILTER           0x0318u
++#define MEM_V4_ROUTE            0x03a0u
++#define MEM_V6_ROUTE            0x0428u
++#define MEM_TABLE_SIZE          0x0078u
++#define MEM_MODEM_HEADER        0x04a8u
++#define MEM_MODEM_HEADER_SIZE   0x0140u         /* no AP header region on v4.2 */
++#define MEM_MODEM_PROC_CTX      0x05f0u
++#define MEM_AP_PROC_CTX         0x07f0u
++#define MEM_PROC_CTX_SIZE       0x0200u
++#define MEM_STATS_QUOTA_MODEM   0x0a50u
++#define MEM_STATS_QUOTA_SIZE    0x0060u
++#define MEM_MODEM               0x0bf0u
++#define MEM_MODEM_SIZE          0x140cu
++#define MEM_END                 0x2000u
++#define MEM_CANARY_VAL          0xdeadbeefu     /* Linux ipa_mem.h IPA_MEM_CANARY_VAL */
++#define MODEM_ROUTE_COUNT       8u              /* ipa_data-v4.2.c modem_route_count */
++#define ROUTE_ENTRIES           (MEM_TABLE_SIZE / 8u)   /* 15 */
++#define IPA_QMI_PLATFORM_MSM_ANDROID 3u         /* CHECK: ipa_qmi_msg.h enum ipa_platform_type (file not in the local copy) */
++
++/* immediate commands (Linux ipa_cmd.h enum ipa_cmd_opcode; CHECK: header not in the local copy, values as HackiOS uses) */
++#define IPA_CMD_NONE            0u
++#define IPA_CMD_IP_V4_FILTER_INIT 3u
++#define IPA_CMD_IP_V6_FILTER_INIT 4u
++#define IPA_CMD_IP_V4_ROUTING_INIT 7u
++#define IPA_CMD_IP_V6_ROUTING_INIT 8u
++#define IPA_CMD_HDR_INIT_LOCAL  9u
++#define IPA_CMD_DMA_SHARED_MEM  19u             /* v4.0+: pipeline-clear options in opcode bits 10:8, all 0 = hps clear, don't skip */
++
++/* TRE (Linux gsi_trans.c) */
++#define TRE_FLAGS_CHAIN         (1u << 0)
++#define TRE_FLAGS_IEOT          (1u << 9)
++#define TRE_FLAGS_BEI           (1u << 10)
++#define TRE_FLAGS_TYPE(t)       ((uint32_t)(t) << 16)
++#define GSI_RE_XFER             0x2u
++#define GSI_RE_IMMD_CMD         0x3u
++
++/* aggregation (Linux ipa_main.c / ipa_endpoint.c, pre-v4.5 counter timing) */
++#define IPA_AGGR_GRANULARITY_US 500u            /* CHECK: IPA_AGGR_GRANULARITY lives in ipa.h (not in the local copy); 500 us in v6.12 */
++#define IPA_AGGR_GRAN_VAL       15u             /* DIV_ROUND_CLOSEST(500 * 32000, 1e6) - 1 */
++#define RX_BUFFER_SIZE          8192u           /* ipa_data-v4.2.c rx.buffer_size */
++#define RX_AGGR_BYTE_LIMIT_KB   6u              /* soft limit: (8192 - 1500 MTU - 4 QMAP - margin) / 1024; Linux gets 6 too */
++#define RX_AGGR_TIME_TICKS      1u              /* aggr_time_limit 500 us / 500 us */
++#define TX_BUFFER_SIZE          2048u           /* QMAP header + up to 1500-byte IP packet (+ room) */
++#define CMD_BUFFER_SIZE         64u             /* largest payload is 24 bytes */
++#define ZERO_SIZE               0x2000u         /* >= MEM_MODEM_SIZE and the header area */
++#define QMAP_HDR_LEN            4u
++
++/* ---------------------------------------------------------------- state */
++
++struct ipa_dma {
++	uint8_t         *va;
++	uint64_t        pa;
++	uint32_t        size;
++};
++
++struct gsi_tre {
++	uint64_t        addr;
++	uint16_t        len_opcode;
++	uint16_t        reserved;
++	uint32_t        flags;
++} __attribute__((packed));
++
++struct gsi_event {
++	uint64_t        xfer_ptr;
++	uint16_t        len;
++	uint8_t         reserved1;
++	uint8_t         code;
++	uint16_t        reserved2;
++	uint8_t         type;
++	uint8_t         chid;
++} __attribute__((packed));
++
++struct ipa_chan {
++	const char      *name;
++	uint8_t         ch, ev, ep;             /* GSI channel, event ring (Linux allocates lowest free in endpoint-name order), IPA endpoint */
++	bool            tx, command, qmap, aggr, close_eof, status;
++	uint8_t         pad_align, status_ep;
++	uint16_t        seq;                    /* ENDP_INIT_SEQ (TX only) */
++	uint32_t        slots, tlv, buf_size;
++	uint32_t        max_out;                /* outstanding TREs: slots - (tlv - 1) (Linux gsi_channel_tre_max()), at most slots - 1 */
++	struct ipa_dma  ring, evring, bufs;
++	uint32_t        next;                   /* next TRE index to fill (free running) */
++	uint32_t        done;                   /* next TRE index whose completion is expected */
++	uint32_t        events;                 /* next event index to read */
++	bool            started;
++	uint64_t        packets, bytes, drops, errors;
++};
++
++/*
++ * Ring sizes are smaller than Linux's (256/512) to keep the pool use near 600 KB; TLV counts are Linux's.
++ * Event rings: one per channel, same length as the TRE ring (Linux: event_count = tre_count).
++ */
++static struct ipa_chan c_cmd = {
++	.name = "cmd-tx", .ch = 1, .ev = 0, .ep = 6, .tx = true, .command = true,
++	.slots = 32, .tlv = 20, .buf_size = CMD_BUFFER_SIZE, .seq = 0x00,          /* IPA_SEQ_DMA */
++};
++static struct ipa_chan c_lan = {
++	.name = "lan-rx", .ch = 2, .ev = 1, .ep = 8, .aggr = true, .status = true, .pad_align = 2,
++	.slots = 16, .tlv = 6, .buf_size = RX_BUFFER_SIZE,
++};
++static struct ipa_chan c_mtx = {
++	.name = "modem-tx", .ch = 0, .ev = 2, .ep = 1, .tx = true, .qmap = true,
++	.status = true, .status_ep = 10,        /* CHECK: Linux v4.2 sends AP_MODEM_TX status to MODEM_AP_RX (ep 10); HackiOS sends none */
++	.slots = 64, .tlv = 8, .buf_size = TX_BUFFER_SIZE, .seq = 0x0806,         /* 1_PASS_SKIP_LAST_UC | REP DMA_PARSER << 8 */
++};
++static struct ipa_chan c_mrx = {
++	.name = "modem-rx", .ch = 3, .ev = 3, .ep = 9, .qmap = true, .aggr = true, .close_eof = true,
++	.slots = 32, .tlv = 6, .buf_size = RX_BUFFER_SIZE,
++};
++static struct ipa_chan *const chans[4] = { &c_cmd, &c_lan, &c_mtx, &c_mrx };   /* Linux endpoint-name order: event rings 0..3 */
++
++static vm_offset_t ipa_va, gsi_va, sram_va;
++static uint32_t mem_offset, mem_size;
++static struct ipa_dma tbl, zero;
++static volatile bool ready, modem_started, clock_voted;
++static bool trace;
++static uint8_t tx_mux = 1;                      /* CHECK: QMAP mux id = WDS Bind Mux Data Port mux_id (rmnet default 1) */
++static lck_grp_t *ipa_grp;
++static lck_mtx_t *tx_lock;
++static int ipa_sleep_chan;
++static uint32_t gsi_ch_count, gsi_ev_count;
++
++void (*spes_ipa_rx_hook)(const void *ip, size_t len, uint8_t mux);
++
++/* ---------------------------------------------------------------- small helpers */
++
++static inline void
++ipa_dsb(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline uint32_t
++ipa_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(ipa_va + off);
++}
++
++static inline void
++ipa_wr(uint32_t off, uint32_t v)
++{
++	ipa_dsb();
++	*(volatile uint32_t *)(ipa_va + off) = v;
++	ipa_dsb();
++}
++
++static inline uint32_t
++gsi_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(gsi_va + (off - GSI_MAP_FROM));
++}
++
++static inline void
++gsi_wr(uint32_t off, uint32_t v)
++{
++	ipa_dsb();
++	*(volatile uint32_t *)(gsi_va + (off - GSI_MAP_FROM)) = v;
++	ipa_dsb();
++}
++
++static void
++ipa_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&ipa_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint32_t
++ipa_bootarg(const char *name, uint32_t dflt)
++{
++	uint32_t v = dflt;
++	(void)PE_parse_boot_argn(name, &v, sizeof(v));
++	return v;
++}
++
++/* Pool memory: contiguous, < 4 GiB, Normal non-cacheable, zeroed (SpesModem pool_alloc(): 4 KB granules). */
++static bool
++ipa_dma_alloc(struct ipa_dma *d, uint32_t size)
++{
++	uint64_t pa = 0;
++	void *va = spes_pool_alloc(size, &pa);
++
++	if (va == NULL || pa == 0 || (pa >> 32) != 0) {
++		return false;
++	}
++	d->va = (uint8_t *)va;
++	d->pa = pa;
++	d->size = size;
++	return true;
++}
++
++/* 32-bit copy into device memory (ml_io_map): no DC ZVA / unaligned accesses there. */
++static void
++io_copy(vm_offset_t dst, const uint8_t *src, uint32_t n)
++{
++	uint32_t i = 0, w;
++	for (; i + 4 <= n; i += 4) {
++		memcpy(&w, src + i, 4);
++		*(volatile uint32_t *)(dst + i) = w;
++	}
++	if (i < n) {
++		w = 0;
++		memcpy(&w, src + i, n - i);
++		*(volatile uint32_t *)(dst + i) = w;
++	}
++	ipa_dsb();
++}
++
++static void
++io_zero(vm_offset_t dst, uint32_t n)
++{
++	for (uint32_t i = 0; i + 4 <= n; i += 4) {
++		*(volatile uint32_t *)(dst + i) = 0;
++	}
++	ipa_dsb();
++}
++
++/* ---------------------------------------------------------------- firmware files (iOS root fs) */
++
++/* Size of a firmware file, or -1. Waits up to 60 s for the root file system (the modem thread may run first). */
++static int64_t
++fw_size(const char *path)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	off_t size = 0;
++	int err = ENOENT;
++
++	for (unsigned tries = 0; tries < 120; tries++) {
++		err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++		if (err == 0) {
++			break;
++		}
++		ipa_sleep_ms(500);
++	}
++	if (err != 0) {
++		return -1;
++	}
++	err = vnode_size(vp, &size, ctx);
++	vnode_close(vp, FREAD, ctx);
++	return err == 0 ? (int64_t)size : -1;
++}
++
++/* n bytes from offset off into normal (cacheable or Normal-NC) kernel memory. */
++static bool
++fw_read(const char *path, uint64_t off, void *dst, uint32_t n)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int resid = 0, err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++
++	if (err != 0) {
++		return false;
++	}
++	err = vn_rdwr(UIO_READ, vp, (caddr_t)dst, (int)n, (off_t)off, UIO_SYSSPACE, IO_UNIT,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	vnode_close(vp, FREAD, ctx);
++	return err == 0 && resid == 0;
++}
++
++/* ---------------------------------------------------------------- PAS load of ipa_fws (Linux qcom_mdt_load + ipa_firmware_load) */
++
++#define SCM_FN(svc, cmd)        (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))   /* as SpesModem.cpp/SpesAudio.cpp */
++#define SCM_SVC_PIL             0x02u
++#define PIL_INIT_IMAGE          0x01u
++#define PIL_MEM_SETUP           0x02u
++#define PIL_AUTH_RESET          0x05u
++#define PIL_SHUTDOWN            0x06u
++#define PIL_IS_SUPPORTED        0x07u
++#define SCM_ARG_RW              2u
++#define PT_LOAD                 1u
++#define MDT_TYPE_MASK           (7u << 24)
++#define MDT_TYPE_HASH           (2u << 24)
++#define MDT_RELOCATABLE         (1u << 27)
++
++struct ipa_elf32_ehdr {
++	uint8_t  e_ident[16];
++	uint16_t e_type, e_machine;
++	uint32_t e_version, e_entry, e_phoff, e_shoff, e_flags;
++	uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
++} __attribute__((packed));
++
++struct ipa_elf32_phdr {
++	uint32_t p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align;
++} __attribute__((packed));
++
++static bool
++phdr_loadable(const struct ipa_elf32_phdr *p)
++{
++	return p->p_type == PT_LOAD && p->p_memsz != 0 && (p->p_flags & MDT_TYPE_MASK) != MDT_TYPE_HASH;
++}
++
++/*
++ * The phone's ipa_fws.mdt (7020 bytes) = ELF header + 5 phdrs (0xd4) followed directly by the hash
++ * segment (0x1a98): Linux qcom_mdt_read_metadata()'s "split, hash packed after the headers" case.
++ * Loadable segments b02..b04: paddr 0x0/0x4000/0x4080, relocatable (flag bit 27) -> placed at
++ * 0x56600000 + paddr, PAS mem_setup(15, 0x56600000, 0x5000). TrustZone then copies them into GSI
++ * IRAM (vaddr 0x5808000) and the IPA (vaddr 0x585e000) and starts the GSI.
++ */
++static bool
++ipa_fw_load(void)
++{
++	char path[96];
++	uint8_t *mdt = NULL, *bounce = NULL, *meta = NULL;
++	uint64_t meta_pa = 0, res = 0, st;
++	uint32_t min_a = 0xffffffffu, max_a = 0, hash = 0xffffffffu, bounce_size = 0;
++	bool relocate = false, ok = false;
++	vm_offset_t carve = 0;
++	int64_t mdt_size;
++
++	snprintf(path, sizeof(path), "%s%s.mdt", IPA_FW_DIR, IPA_FW_NAME);
++	mdt_size = fw_size(path);
++	if (mdt_size <= (int64_t)sizeof(struct ipa_elf32_ehdr) || mdt_size > 0x10000) {
++		printf(LOGP "%s: not found or bad size (%lld)\n", path, mdt_size);
++		return false;
++	}
++	mdt = kalloc_data((vm_size_t)mdt_size, Z_WAITOK | Z_ZERO);
++	if (mdt == NULL || !fw_read(path, 0, mdt, (uint32_t)mdt_size)) {
++		printf(LOGP "%s: not readable\n", path);
++		goto out;
++	}
++	{
++		struct ipa_elf32_ehdr *eh = (struct ipa_elf32_ehdr *)mdt;
++		uint64_t hsz = eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(struct ipa_elf32_phdr);
++
++		if (memcmp(eh->e_ident, "\177ELF", 4) != 0 || eh->e_ident[4] != 1 || hsz > (uint64_t)mdt_size ||
++		    eh->e_phentsize != sizeof(struct ipa_elf32_phdr)) {
++			printf(LOGP "%s: bad ELF header\n", path);
++			goto out;
++		}
++		struct ipa_elf32_phdr *ph = (struct ipa_elf32_phdr *)(mdt + eh->e_phoff);
++		for (uint32_t i = 0; i < eh->e_phnum; i++) {
++			if ((ph[i].p_flags & MDT_TYPE_MASK) == MDT_TYPE_HASH) {
++				hash = i;
++			}
++			if (!phdr_loadable(&ph[i])) {
++				continue;
++			}
++			relocate = relocate || (ph[i].p_flags & MDT_RELOCATABLE) != 0;
++			min_a = MIN(min_a, ph[i].p_paddr);
++			max_a = MAX(max_a, ph[i].p_paddr + ph[i].p_memsz);
++			bounce_size = MAX(bounce_size, ph[i].p_filesz);
++		}
++		max_a = (max_a + 0xfffu) & ~0xfffu;     /* qcom_mdt_load: ALIGN(.., SZ_4K) */
++		printf(LOGP "fw: %u phdrs, hash %u, paddr %#x..%#x, relocatable %u\n", eh->e_phnum, hash, min_a, max_a, relocate);
++		if (hash == 0xffffffffu || min_a > max_a || max_a - min_a > IPA_FW_CARVE_SIZE ||
++		    (!relocate && (min_a < IPA_FW_CARVE_PA || max_a > IPA_FW_CARVE_PA + IPA_FW_CARVE_SIZE))) {
++			printf(LOGP "fw: no hash segment or segments outside %#x+%#x\n", IPA_FW_CARVE_PA, IPA_FW_CARVE_SIZE);
++			goto out;
++		}
++
++		/* metadata = headers + hash segment, physically contiguous (TZ reads it) */
++		uint32_t hlen = ph[hash].p_filesz;
++		meta = (uint8_t *)spes_pool_alloc(hsz + hlen, &meta_pa);
++		if (meta == NULL) {
++			printf(LOGP "fw: no pool memory for metadata\n");
++			goto out;
++		}
++		memcpy(meta, mdt, hsz);
++		if (hsz + hlen == (uint64_t)mdt_size) {
++			memcpy(meta + hsz, mdt + hsz, hlen);                       /* packed after the headers */
++		} else if ((uint64_t)ph[hash].p_offset + hlen <= (uint64_t)mdt_size) {
++			memcpy(meta + hsz, mdt + ph[hash].p_offset, hlen);         /* at its file offset */
++		} else {
++			snprintf(path, sizeof(path), "%s%s.b%02u", IPA_FW_DIR, IPA_FW_NAME, hash);
++			if (fw_size(path) != (int64_t)hlen || !fw_read(path, 0, meta + hsz, hlen)) {
++				printf(LOGP "fw: %s not readable\n", path);
++				goto out;
++			}
++		}
++		ipa_dsb();
++
++		st = spes_scm(SCM_FN(SCM_SVC_PIL, PIL_IS_SUPPORTED), 1, IPA_PAS_ID, 0, 0, &res);
++		printf(LOGP "fw: PAS %u supported: ret=%llx res=%llx (informational)\n", IPA_PAS_ID, st, res);
++		st = spes_scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), IPA_PAS_ID, meta_pa, 0, &res);
++		printf(LOGP "fw: init_image ret=%llx res=%llx (meta %llu bytes @%#llx)\n", st, res, hsz + hlen, meta_pa);
++		if (st != 0 || res != 0) {
++			goto out;
++		}
++		if (relocate) {
++			st = spes_scm(SCM_FN(SCM_SVC_PIL, PIL_MEM_SETUP), 3, IPA_PAS_ID, IPA_FW_CARVE_PA, max_a - min_a, &res);
++			printf(LOGP "fw: mem_setup(%#x, %#x) ret=%llx res=%llx\n", IPA_FW_CARVE_PA, max_a - min_a, st, res);
++			if (st != 0 || res != 0) {
++				goto shutdown;
++			}
++		}
++
++		/* the carveout: device mapping, only while copying (TZ owns it after auth_and_reset) */
++		carve = ml_io_map(IPA_FW_CARVE_PA, IPA_FW_CARVE_SIZE);
++		bounce = bounce_size != 0 ? kalloc_data(bounce_size, Z_WAITOK) : NULL;
++		if (carve == 0 || (bounce_size != 0 && bounce == NULL)) {
++			printf(LOGP "fw: carveout map or bounce buffer failed\n");
++			goto shutdown;
++		}
++		for (uint32_t i = 0; i < eh->e_phnum; i++) {
++			if (!phdr_loadable(&ph[i])) {
++				continue;
++			}
++			uint32_t at = relocate ? ph[i].p_paddr - min_a : ph[i].p_paddr - IPA_FW_CARVE_PA;
++			if (ph[i].p_filesz != 0) {
++				snprintf(path, sizeof(path), "%s%s.b%02u", IPA_FW_DIR, IPA_FW_NAME, i);
++				if (fw_size(path) != (int64_t)ph[i].p_filesz || !fw_read(path, 0, bounce, ph[i].p_filesz)) {
++					printf(LOGP "fw: %s not readable (want %u bytes)\n", path, ph[i].p_filesz);
++					goto shutdown;
++				}
++				io_copy(carve + at, bounce, ph[i].p_filesz);
++			}
++			if (ph[i].p_memsz > ph[i].p_filesz) {
++				io_zero(carve + at + ((ph[i].p_filesz + 3u) & ~3u), (ph[i].p_memsz - ph[i].p_filesz) & ~3u);
++			}
++		}
++		printf(LOGP "fw: segments copied to %#x\n", IPA_FW_CARVE_PA);
++
++		st = spes_scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, IPA_PAS_ID, 0, 0, &res);
++		printf(LOGP "fw: auth_and_reset ret=%llx res=%llx\n", st, res);
++		ok = st == 0 && res == 0;
++		if (ok) {
++			goto out;
++		}
++	}
++shutdown:
++	st = spes_scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, IPA_PAS_ID, 0, 0, &res);
++	printf(LOGP "fw: PAS shutdown after failure ret=%llx res=%llx\n", st, res);
++out:
++	/* (ml_io_map space is not returned: XNU has no unmap for it; one 64 KB window) */
++	if (bounce != NULL) {
++		kfree_data(bounce, bounce_size);
++	}
++	if (mdt != NULL) {
++		kfree_data(mdt, (vm_size_t)mdt_size);
++	}
++	return ok;
++}
++
++/* ---------------------------------------------------------------- GSI */
++
++static inline uint32_t
++ch_state(uint32_t ch)
++{
++	return (gsi_rd(GSI_CH_C_CNTXT_0(ch)) >> 20) & 0xfu;
++}
++
++static inline uint32_t
++ev_state(uint32_t ev)
++{
++	return (gsi_rd(GSI_EV_CH_E_CNTXT(ev, 0)) >> 20) & 0xfu;
++}
++
++static void
++gsi_log_error(const char *what)
++{
++	uint32_t log = gsi_rd(GSI_ERROR_LOG);
++
++	/* ERROR_LOG: arg3 3:0 arg2 7:4 arg1 11:8 code 15:12 virt_idx 23:19 type 27:24 ee 31:28 (gsi_reg-v4.0.c) */
++	printf(LOGP "%s: GSI status %#x error log %#x (code %u type %u ee %u idx %u args %u/%u/%u) glob %#x gsi %#x\n", what,
++	    gsi_rd(GSI_STATUS), log, (log >> 12) & 0xf, (log >> 24) & 0xf, log >> 28, (log >> 19) & 0x1f,
++	    (log >> 8) & 0xf, (log >> 4) & 0xf, log & 0xf, gsi_rd(GSI_CNTXT_GLOB_IRQ_STTS), gsi_rd(GSI_CNTXT_GSI_IRQ_STTS));
++	if (log != 0) {
++		gsi_wr(GSI_ERROR_LOG, 0);
++		gsi_wr(GSI_ERROR_LOG_CLR, 0xffffffffu);
++	}
++}
++
++/* A channel or event-ring command, polled until the state is `want` (50 ms; Linux waits for the CH_CTRL interrupt). */
++static bool
++gsi_command(bool ev, uint32_t id, uint32_t opcode, uint32_t want, const char *name)
++{
++	uint32_t state = 0xffu;
++
++	gsi_wr(ev ? GSI_EV_CH_CMD : GSI_CH_CMD, (id & 0xffu) | opcode << 24);
++	for (unsigned us = 0; us < 50000; us += 50) {
++		state = ev ? ev_state(id) : ch_state(id);
++		if (state == want) {
++			break;
++		}
++		delay(50);
++	}
++	/* the completion is also latched as a (masked) interrupt source: clear it */
++	gsi_wr(ev ? GSI_CNTXT_SRC_EV_CH_IRQ_CLR : GSI_CNTXT_SRC_CH_IRQ_CLR, 1u << id);
++	if (state != want) {
++		printf(LOGP "%s: %s command %#x on %u: state %u, wanted %u\n", name, ev ? "event ring" : "channel", opcode, id, state, want);
++		gsi_log_error(name);
++		return false;
++	}
++	return true;
++}
++
++/*
++ * IPA v4.2 quirk (Linux gsi.c gsi_generic_command(), gsi_isr_gp_int1()): the AP allocates the modem's
++ * channels. Completion is a global GP_INT1 with the result in CNTXT_SCRATCH_0 bits 7:5. Polled here:
++ * GP_INT1 is enabled in GLOB_IRQ_EN only for the command (the GSI interrupt type stays masked in
++ * CNTXT_TYPE_IRQ_MSK, so nothing reaches the GIC). CHECK: whether GLOB_IRQ_STTS latches GP_INT1 with
++ * the type masked; we also accept a nonzero result field.
++ */
++static bool
++gsi_modem_channel_alloc(uint32_t chid)
++{
++	for (unsigned attempt = 0; attempt < 5; attempt++) {
++		uint32_t result = 0, v = gsi_rd(GSI_CNTXT_SCRATCH_0);
++
++		gsi_wr(GSI_CNTXT_GLOB_IRQ_CLR, GLOB_GP_INT1);
++		gsi_wr(GSI_CNTXT_GLOB_IRQ_EN, GLOB_ERROR_INT | GLOB_GP_INT1);
++		gsi_wr(GSI_CNTXT_SCRATCH_0, v & ~(7u << 5));
++		gsi_wr(GSI_GENERIC_CMD, (GSI_GENERIC_ALLOCATE_CHANNEL & 0x1fu) | (chid & 0x1fu) << 5 | (GSI_EE_MODEM & 0xfu) << 10);
++		for (unsigned us = 0; us < 50000; us += 50) {
++			result = (gsi_rd(GSI_CNTXT_SCRATCH_0) >> 5) & 7u;
++			if (result != 0 || (gsi_rd(GSI_CNTXT_GLOB_IRQ_STTS) & GLOB_GP_INT1) != 0) {
++				result = (gsi_rd(GSI_CNTXT_SCRATCH_0) >> 5) & 7u;
++				break;
++			}
++			delay(50);
++		}
++		gsi_wr(GSI_CNTXT_GLOB_IRQ_CLR, GLOB_GP_INT1);
++		gsi_wr(GSI_CNTXT_GLOB_IRQ_EN, 0);
++		if (result == GENERIC_EE_SUCCESS || result == GENERIC_EE_INCORRECT_CHANNEL_STATE) {
++			printf(LOGP "modem channel %u allocated (result %u)\n", chid, result);
++			return true;
++		}
++		if (result != GENERIC_EE_RETRY) {
++			printf(LOGP "modem channel %u: generic allocate result %u\n", chid, result);
++			gsi_log_error("generic cmd");
++			return false;
++		}
++		delay(1000);
++	}
++	printf(LOGP "modem channel %u: generic allocate kept asking for retry\n", chid);
++	return false;
++}
++
++/* Linux gsi_irq_setup(): interrupts (not MSI), every source masked; nothing is handled, the rings are polled. */
++static void
++gsi_irqs_off(void)
++{
++	gsi_wr(GSI_CNTXT_INTSET, 1);
++	gsi_wr(GSI_CNTXT_TYPE_IRQ_MSK, 0);
++	gsi_wr(GSI_CNTXT_SRC_CH_IRQ_MSK, 0);
++	gsi_wr(GSI_CNTXT_SRC_EV_CH_IRQ_MSK, 0);
++	gsi_wr(GSI_CNTXT_GLOB_IRQ_EN, 0);
++	gsi_wr(GSI_CNTXT_SRC_IEOB_IRQ_MSK, 0);
++	gsi_wr(GSI_INTER_EE_SRC_CH_IRQ_MSK, 0);
++	gsi_wr(GSI_INTER_EE_SRC_EV_CH_IRQ_MSK, 0);
++	gsi_wr(GSI_CNTXT_GSI_IRQ_EN, 0);
++}
++
++static inline uint32_t
++ring_addr(const struct ipa_chan *c, const struct ipa_dma *r, uint32_t index)
++{
++	return (uint32_t)r->pa + (index % c->slots) * GSI_RING_ELEMENT_SIZE;
++}
++
++/* Linux gsi_evt_ring_program() + gsi_channel_program() for the GPI protocol, GSI as used by IPA v4.2. */
++static bool
++gsi_channel_setup(struct ipa_chan *c)
++{
++	uint32_t e = c->ev, ch = c->ch, v;
++
++	if (ev_state(e) != EV_STATE_NOT_ALLOCATED || ch_state(ch) != CH_STATE_NOT_ALLOCATED) {
++		/* CHECK: Linux refuses too; a warm restart would need STOP/RESET/DE_ALLOC first */
++		printf(LOGP "%s: event ring %u state %u, channel %u state %u: not fresh, refusing\n", c->name, e, ev_state(e), ch, ch_state(ch));
++		return false;
++	}
++	if (!gsi_command(true, e, GSI_EVT_ALLOCATE, EV_STATE_ALLOCATED, c->name)) {
++		return false;
++	}
++	gsi_wr(GSI_EV_CH_E_CNTXT(e, 0), GSI_CHANNEL_TYPE_GPI | (1u << 16) /* EV_INTYPE: IRQ */ | GSI_RING_ELEMENT_SIZE << 24);
++	gsi_wr(GSI_EV_CH_E_CNTXT(e, 1), c->slots * GSI_RING_ELEMENT_SIZE);
++	gsi_wr(GSI_EV_CH_E_CNTXT(e, 2), (uint32_t)c->evring.pa);
++	gsi_wr(GSI_EV_CH_E_CNTXT(e, 3), (uint32_t)(c->evring.pa >> 32));
++	gsi_wr(GSI_EV_CH_E_CNTXT(e, 8), GSI_EVT_RING_INT_MODT | 1u << 16 /* EV_MODC */);
++	for (uint32_t n = 9; n <= 13; n++) {
++		gsi_wr(GSI_EV_CH_E_CNTXT(e, n), 0);   /* no MSI, no read-pointer updates */
++	}
++	gsi_wr(GSI_EV_CH_E_DOORBELL_0(e), ring_addr(c, &c->evring, c->slots - 1));   /* "last processed": index 0 - 1 */
++
++	if (!gsi_command(false, ch, GSI_CH_ALLOCATE, CH_STATE_ALLOCATED, c->name)) {
++		return false;
++	}
++	/* CNTXT_0: protocol GPI 2:0, DIR bit 3 (toward IPA), EE 7:4 = 0, ERINDEX 18:14, ELEMENT_SIZE 31:24 */
++	gsi_wr(GSI_CH_C_CNTXT_0(ch), GSI_CHANNEL_TYPE_GPI | (c->tx ? 1u << 3 : 0) | (uint32_t)e << 14 | GSI_RING_ELEMENT_SIZE << 24);
++	gsi_wr(GSI_CH_C_CNTXT_1(ch), c->slots * GSI_RING_ELEMENT_SIZE);
++	gsi_wr(GSI_CH_C_CNTXT_2(ch), (uint32_t)c->ring.pa);
++	gsi_wr(GSI_CH_C_CNTXT_3(ch), (uint32_t)(c->ring.pa >> 32));
++	/* QOS: command channel WRR_WEIGHT max (lowest priority) and prefetch buffers; others USE_ESCAPE_BUF_ONLY (bit 10, v4.0-v4.4) */
++	v = c->command ? 0xfu : (1u << 10);
++	gsi_wr(GSI_CH_C_QOS(ch), v);
++	/* GPI scratch: max_outstanding_tre = tlv * 16 (word1 31:16), outstanding_threshold = 32 (word2 31:16); keep word4 15:0 */
++	gsi_wr(GSI_CH_C_SCRATCH(ch, 0), (c->tlv * GSI_RING_ELEMENT_SIZE) << 16);
++	gsi_wr(GSI_CH_C_SCRATCH(ch, 1), (2u * GSI_RING_ELEMENT_SIZE) << 16);
++	gsi_wr(GSI_CH_C_SCRATCH(ch, 2), 0);
++	gsi_wr(GSI_CH_C_SCRATCH(ch, 3), gsi_rd(GSI_CH_C_SCRATCH(ch, 3)) & 0xffffu);
++	return true;
++}
++
++/* Fill TRE `index` (two 64-bit stores into Normal-NC memory); the doorbell is rung separately. */
++static void
++tre_fill(struct ipa_chan *c, uint32_t index, uint64_t addr, uint16_t len_opcode, uint32_t flags)
++{
++	volatile uint64_t *t = (volatile uint64_t *)(c->ring.va + (index % c->slots) * GSI_RING_ELEMENT_SIZE);
++
++	t[0] = addr;
++	t[1] = (uint64_t)len_opcode | (uint64_t)flags << 32;
++}
++
++static inline void
++chan_doorbell(struct ipa_chan *c)
++{
++	ipa_dsb();                                      /* TREs and buffers visible before the doorbell */
++	gsi_wr(GSI_CH_C_DOORBELL_0(c->ch), ring_addr(c, &c->ring, c->next));
++}
++
++static inline uint64_t
++buf_pa(const struct ipa_chan *c, uint32_t index)
++{
++	return c->bufs.pa + (uint64_t)(index % c->slots) * c->buf_size;
++}
++
++static inline uint8_t *
++buf_va(const struct ipa_chan *c, uint32_t index)
++{
++	return c->bufs.va + (size_t)(index % c->slots) * c->buf_size;
++}
++
++typedef void (*event_fn)(struct ipa_chan *c, const struct gsi_event *e, void *ctx);
++
++/*
++ * Consume the events written since last time. EV_CH_E_CNTXT_4 is where the GSI will write next
++ * (Linux gsi_channel_update()); afterwards the event doorbell gets the last event read.
++ */
++static unsigned
++chan_events(struct ipa_chan *c, event_fn fn, void *ctx)
++{
++	uint32_t rp = gsi_rd(GSI_EV_CH_E_CNTXT(c->ev, 4)), base = (uint32_t)c->evring.pa, index;
++	unsigned n = 0;
++
++	if (rp < base || rp >= base + c->slots * GSI_RING_ELEMENT_SIZE) {
++		if (c->errors++ < 4) {
++			printf(LOGP "%s: event pointer %#x outside the ring %#x\n", c->name, rp, base);
++		}
++		return 0;
++	}
++	__asm__ volatile ("dsb ld" ::: "memory");
++	index = (rp - base) / GSI_RING_ELEMENT_SIZE;
++	while (c->events % c->slots != index) {
++		volatile uint64_t *w = (volatile uint64_t *)(c->evring.va + (c->events % c->slots) * GSI_RING_ELEMENT_SIZE);
++		struct gsi_event e;
++		uint64_t w0 = w[0], w1 = w[1];
++
++		memcpy(&e, &w0, 8);
++		memcpy((uint8_t *)&e + 8, &w1, 8);
++		fn(c, &e, ctx);
++		c->events++;
++		n++;
++	}
++	if (n != 0) {
++		gsi_wr(GSI_EV_CH_E_DOORBELL_0(c->ev), ring_addr(c, &c->evring, c->events - 1));
++	}
++	return n;
++}
++
++/* ---------------------------------------------------------------- IPA immediate commands */
++
++struct cmd_wait {
++	uint64_t        tre_pa;
++	bool            done;
++	uint8_t         code;
++};
++
++static void
++cmd_event(struct ipa_chan *c, const struct gsi_event *e, void *ctx)
++{
++	struct cmd_wait *w = (struct cmd_wait *)ctx;
++
++	if (e->xfer_ptr == w->tre_pa) {
++		w->done = true;
++		w->code = e->code;
++	}
++	c->done++;
++}
++
++/* One immediate command, payload copied into the slot's buffer; waits up to 200 ms for its event. */
++static bool
++ipa_cmd(const char *what, uint16_t opcode, const void *payload, uint32_t size)
++{
++	struct ipa_chan *c = &c_cmd;
++	struct cmd_wait w = { .tre_pa = c->ring.pa + (c->next % c->slots) * GSI_RING_ELEMENT_SIZE };
++
++	if (size > c->buf_size || c->next - c->done >= c->max_out) {
++		printf(LOGP "%s: command does not fit (size %u, outstanding %u)\n", what, size, c->next - c->done);
++		return false;
++	}
++	memcpy(buf_va(c, c->next), payload, size);
++	tre_fill(c, c->next, buf_pa(c, c->next), opcode, TRE_FLAGS_TYPE(GSI_RE_IMMD_CMD) | TRE_FLAGS_IEOT);
++	c->next++;
++	chan_doorbell(c);
++	for (unsigned us = 0; us < 200000 && !w.done; us += 100) {
++		chan_events(c, cmd_event, &w);
++		if (!w.done) {
++			delay(100);
++		}
++	}
++	if (!w.done) {
++		printf(LOGP "%s (opcode %u): no completion in 200 ms, channel state %u\n", what, opcode, ch_state(c->ch));
++		gsi_log_error(what);
++		return false;
++	}
++	if (trace) {
++		printf(LOGP "%s (opcode %u): done, code %u\n", what, opcode, w.code);
++	}
++	return true;
++}
++
++/* DMA_SHARED_MEM from the zero buffer: zero `size` bytes of local memory at `offset` (Linux ipa_cmd_dma_shared_mem_add). */
++static bool
++ipa_cmd_zero(const char *what, uint32_t offset, uint32_t size)
++{
++	struct __attribute__((packed)) {
++		uint16_t clear_after_read, size, local_addr, flags;
++		uint64_t system_addr;
++	} p;
++
++	if (size == 0 || size > ZERO_SIZE || mem_offset + offset > 0xffffu) {
++		return false;
++	}
++	p.clear_after_read = 0;
++	p.size = (uint16_t)size;
++	p.local_addr = (uint16_t)(mem_offset + offset);
++	p.flags = 0;                                    /* direction 0: write to IPA */
++	p.system_addr = zero.pa;
++	return ipa_cmd(what, IPA_CMD_DMA_SHARED_MEM, &p, sizeof(p));
++}
++
++/* Linux ipa_mem_setup(): header area (modem header only on v4.2), zero both proc-ctx areas and the modem area, proc-ctx base. */
++static bool
++ipa_mem_setup(void)
++{
++	struct __attribute__((packed)) {
++		uint64_t hdr_table_addr;
++		uint32_t flags, reserved;
++	} h;
++
++	h.hdr_table_addr = zero.pa;
++	h.flags = (MEM_MODEM_HEADER_SIZE & 0xfffu) | ((mem_offset + MEM_MODEM_HEADER) & 0xffffu) << 12;
++	h.reserved = 0;
++	if (!ipa_cmd("hdr init local", IPA_CMD_HDR_INIT_LOCAL, &h, sizeof(h)) ||
++	    !ipa_cmd_zero("zero modem proc ctx", MEM_MODEM_PROC_CTX, MEM_PROC_CTX_SIZE) ||
++	    !ipa_cmd_zero("zero ap proc ctx", MEM_AP_PROC_CTX, MEM_PROC_CTX_SIZE) ||
++	    !ipa_cmd_zero("zero modem mem", MEM_MODEM, MEM_MODEM_SIZE)) {
++		return false;
++	}
++	ipa_wr(IPA_LOCAL_PKT_PROC_CNTXT, (mem_offset + MEM_MODEM_PROC_CTX) & 0x1ffffu);   /* IPA_BASE_ADDR 16:0, multiple of 8 */
++	return true;
++}
++
++/*
++ * Linux ipa_table_init() + ipa_table_setup() for v4.2 (no hashing): one buffer with the 8-byte zero
++ * rule, the filter bitmap, then ROUTE_ENTRIES addresses of the zero rule. Filtering endpoints
++ * (filter_support): AP_MODEM_TX 1 and MODEM_AP_TX 4 -> bitmap (BIT(1) | BIT(4)) << 1 (bit 0 = global
++ * filtering, unused), filter table = bitmap + 2 entries. Route tables 15 entries each. The unused
++ * filter-region tail is zeroed by DMA_SHARED_MEM.
++ */
++#define FILTERED_EPS            ((1ull << 1) | (1ull << 4))
++#define FILTER_COUNT            2u
++
++static bool
++ipa_table_cmd(const char *what, uint16_t opcode, bool filter, uint32_t offset)
++{
++	struct __attribute__((packed)) {
++		uint64_t hash_rules_addr, flags, nhash_rules_addr;
++	} p;
++	uint32_t count = filter ? 1u + FILTER_COUNT : ROUTE_ENTRIES, size = count * 8u;
++
++	if (mem_offset + offset > 0xffffu) {
++		return false;
++	}
++	p.hash_rules_addr = 0;                          /* hash size 0: hash address/offset ignored */
++	p.flags = ((uint64_t)size & 0xfffu) << 28 | ((uint64_t)(mem_offset + offset) & 0xffffu) << 40;
++	p.nhash_rules_addr = tbl.pa + (filter ? 8u : 16u);   /* skip the zero rule (and the bitmap for routes) */
++	if (!ipa_cmd(what, opcode, &p, sizeof(p))) {
++		return false;
++	}
++	return !filter || ipa_cmd_zero("zero filter tail", offset + size, MEM_TABLE_SIZE - size);
++}
++
++static bool
++ipa_table_setup(void)
++{
++	volatile uint64_t *t = (volatile uint64_t *)tbl.va;
++
++	t[0] = 0;                                       /* zero rule (pool memory: 4 KB aligned >= 128-byte rule alignment) */
++	t[1] = FILTERED_EPS << 1;
++	for (uint32_t i = 0; i < ROUTE_ENTRIES; i++) {
++		t[2 + i] = tbl.pa;
++	}
++	ipa_dsb();
++	return ipa_table_cmd("v4 route init", IPA_CMD_IP_V4_ROUTING_INIT, false, MEM_V4_ROUTE) &&
++	       ipa_table_cmd("v6 route init", IPA_CMD_IP_V6_ROUTING_INIT, false, MEM_V6_ROUTE) &&
++	       ipa_table_cmd("v4 filter init", IPA_CMD_IP_V4_FILTER_INIT, true, MEM_V4_FILTER) &&
++	       ipa_table_cmd("v6 filter init", IPA_CMD_IP_V6_FILTER_INIT, true, MEM_V6_FILTER);
++}
++
++/* ---------------------------------------------------------------- IPA configuration (Linux ipa_config) */
++
++/* ipa_hardware_config() for v4.2 */
++static void
++ipa_hw_config(void)
++{
++	ipa_wr(IPA_BCR, 0);                                             /* backward_compat 0 (ipa_data-v4.2.c) */
++	ipa_wr(IPA_TX_CFG, ipa_rd(IPA_TX_CFG) & ~(1u << 12));           /* PA_MASK_EN off (v4.1..v4.4) */
++	ipa_wr(IPA_CLKON_CFG, (1u << 28) | (1u << 29));                 /* CLKON_GLOBAL | GLOBAL_2X_CLK (v4.0..v4.4) */
++	ipa_wr(IPA_COMP_CFG, ipa_rd(IPA_COMP_CFG) | (1u << 15) | (1u << 7) | (1u << 8));   /* MULTI_AXI_MASTERS_DIS, INORDER_RD/WR_DIS */
++	ipa_wr(IPA_QSB_MAX_WRITES, 8);                                  /* ipa_qsb_data: max_writes 8 */
++	ipa_wr(IPA_QSB_MAX_READS, 12);                                  /* max_reads 12, no beat limit */
++	ipa_wr(IPA_COUNTER_CFG, IPA_AGGR_GRAN_VAL << 4);                /* AGGR_GRANULARITY 8:4 */
++	ipa_wr(IPA_FILT_ROUT_HASH_EN, 0);                               /* v4.2: no hashed tables */
++	ipa_wr(IPA_IDLE_INDICATION_CFG, 256);                           /* debounce 256, CONST_NON_IDLE off */
++}
++
++/* ipa_mem_config(): canaries before regions that have them (direct SRAM access). */
++static void
++ipa_mem_canaries(void)
++{
++	static const struct { uint16_t offset, count; } c[] = {
++		{ 0x0288, 2 }, { 0x0290, 2 }, { 0x0310, 2 }, { 0x0318, 2 }, { 0x0398, 2 }, { 0x03a0, 2 },
++		{ 0x0420, 2 }, { 0x0428, 2 }, { 0x04a8, 2 }, { 0x05f0, 2 }, { 0x09f8, 2 }, { 0x0a50, 2 },
++		{ 0x2000, 1 },
++	};
++	for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
++		for (unsigned k = 1; k <= c[i].count; k++) {
++			*(volatile uint32_t *)(sram_va + c[i].offset - 4u * k) = MEM_CANARY_VAL;
++		}
++	}
++	ipa_dsb();
++}
++
++/* ipa_endpoint_config(): our endpoints exist and point the right way (FLAVOR_0). */
++static bool
++ipa_endpoints_available(void)
++{
++	uint32_t v = ipa_rd(IPA_FLAVOR_0);
++	uint32_t tx_count = (v >> 8) & 0x1fu, rx_count = (v >> 16) & 0x1fu, rx_base = (v >> 24) & 0xfu;
++
++	printf(LOGP "FLAVOR_0 %#x: %u consumer (TX) pipes, %u producer (RX) pipes from %u\n", v, tx_count, rx_count, rx_base);
++	for (unsigned i = 0; i < 4; i++) {
++		const struct ipa_chan *c = chans[i];
++		bool ok = c->tx ? c->ep < tx_count : (c->ep >= rx_base && c->ep < rx_base + rx_count);
++		if (!ok) {
++			printf(LOGP "%s: endpoint %u not available in that direction\n", c->name, c->ep);
++			return false;
++		}
++	}
++	return true;
++}
++
++/* ipa_resource_config(): one source and one destination group (ipa_data-v4.2.c); X = group 0, Y = group 1 (absent: 0). */
++static void
++ipa_resource_config(void)
++{
++	static const uint8_t src[5][2] = { { 3, 63 }, { 3, 3 }, { 10, 10 }, { 1, 1 }, { 5, 5 } };
++	static const uint8_t dst[2][2] = { { 3, 3 }, { 1, 63 } };
++
++	for (unsigned t = 0; t < 5; t++) {
++		ipa_wr(IPA_SRC_RSRC_GRP_01(t), (uint32_t)src[t][0] | (uint32_t)src[t][1] << 8);
++	}
++	for (unsigned t = 0; t < 2; t++) {
++		ipa_wr(IPA_DST_RSRC_GRP_01(t), (uint32_t)dst[t][0] | (uint32_t)dst[t][1] << 8);
++	}
++}
++
++/*
++ * ipa_endpoint_program() for v4.2. Differences from Linux, on purpose: no checksum offload (CFG 0;
++ * Linux sets CS_OFFLOAD_UL/DL and a 4-byte csum header on the modem TX endpoint), so the QMAP header
++ * is 4 bytes both ways and the modem must be told QMAP without checksum (WDA Set Data Format).
++ * CHECK: if the modem insists on MAPv4 checksum, CFG/HDR_LEN must follow Linux (HDR_LEN 8 on TX).
++ */
++static void
++ipa_endpoint_program(const struct ipa_chan *c)
++{
++	uint32_t ep = c->ep, v;
++
++	ipa_wr(IPA_ENDP_INIT_CFG(ep), 0);
++	if (c->tx) {
++		ipa_wr(IPA_ENDP_INIT_NAT(ep), 0);       /* NAT bypass (TX only) */
++	}
++	v = 0;
++	if (c->qmap) {
++		v = QMAP_HDR_LEN | 1u << 6;             /* HDR_LEN 5:0, HDR_OFST_METADATA_VALID (metadata at 0 for TX) */
++		if (!c->tx) {
++			v |= 1u << 7;                   /* HDR_OFST_METADATA 12:7 = 1: mux_id byte */
++			v |= 1u << 19 | 2u << 20;       /* HDR_OFST_PKT_SIZE_VALID, HDR_OFST_PKT_SIZE 25:20 = 2: pkt_len */
++		}
++	}
++	ipa_wr(IPA_ENDP_INIT_HDR(ep), v);
++	v = 0;
++	if (c->qmap) {
++		v = 1;                                  /* HDR_ENDIANNESS: big */
++		if (!c->tx) {
++			v |= 1u << 1 | 1u << 3;         /* HDR_TOTAL_LEN_OR_PAD_VALID (pad), HDR_PAYLOAD_LEN_INC_PADDING */
++		}
++	}
++	if (!c->tx) {
++		v |= (uint32_t)c->pad_align << 10;      /* HDR_PAD_TO_ALIGNMENT 13:10 (LAN RX: ilog2(4)) */
++	}
++	ipa_wr(IPA_ENDP_INIT_HDR_EXT(ep), v);
++	if (!c->tx) {
++		ipa_wr(IPA_ENDP_INIT_HDR_METADATA_MASK(ep), c->qmap ? 0xff000000u : 0);   /* cpu_to_be32(0xff) */
++	}
++	if (c->tx) {
++		ipa_wr(IPA_ENDP_INIT_MODE(ep), c->command ? (3u | (uint32_t)c_lan.ep << 4) : 0);   /* DMA to LAN RX / BASIC */
++	}
++	v = 0;
++	if (c->aggr && !c->tx) {
++		v = 1u /* ENABLE_AGGR */ | 4u << 2 /* GENERIC */ | RX_AGGR_BYTE_LIMIT_KB << 5 | RX_AGGR_TIME_TICKS << 10 |
++		    (c->close_eof ? 1u << 21 /* SW_EOF_ACTIVE */ : 0);
++	}
++	ipa_wr(IPA_ENDP_INIT_AGGR(ep), v);               /* TX: BYPASS (Linux v4.2 has no aggregation on AP_MODEM_TX) */
++	if (!c->tx) {
++		ipa_wr(IPA_ENDP_INIT_HOL_BLOCK_EN(ep), 0);
++	} else {
++		ipa_wr(IPA_ENDP_INIT_DEAGGR(ep), 0);
++	}
++	ipa_wr(IPA_ENDP_INIT_RSRC_GRP(ep), 0);
++	if (c->tx) {
++		ipa_wr(IPA_ENDP_INIT_SEQ(ep), c->seq);
++	}
++	v = 0;
++	if (c->status) {
++		v = 1u;                                 /* STATUS_EN; STATUS_LOCATION 0: status precedes the packet */
++		if (c->tx) {
++			v |= (uint32_t)c->status_ep << 1;   /* STATUS_ENDP 5:1 */
++		}
++	}
++	ipa_wr(IPA_ENDP_STATUS(ep), v);
++}
++
++/* ---------------------------------------------------------------- data path */
++
++static void
++rx_post(struct ipa_chan *c)
++{
++	tre_fill(c, c->next, buf_pa(c, c->next), (uint16_t)c->buf_size, TRE_FLAGS_TYPE(GSI_RE_XFER) | TRE_FLAGS_IEOT);
++	c->next++;
++}
++
++static bool
++chan_start(struct ipa_chan *c)
++{
++	if (!gsi_command(false, c->ch, GSI_CH_START, CH_STATE_STARTED, c->name)) {
++		return false;
++	}
++	c->started = true;
++	if (!c->tx) {
++		while (c->next - c->done < c->max_out) {
++			rx_post(c);
++		}
++		chan_doorbell(c);
++	}
++	return true;
++}
++
++/* One receive buffer finished: QMAP frames (modem RX) or status+packets (LAN RX, dropped); the slot is posted again. */
++static void
++rx_event(struct ipa_chan *c, const struct gsi_event *e, void *ctx __unused)
++{
++	uint64_t off = e->xfer_ptr - c->ring.pa;
++	uint32_t slot = (uint32_t)(off / GSI_RING_ELEMENT_SIZE), len = e->len;
++	const uint8_t *b;
++
++	if (e->xfer_ptr < c->ring.pa || slot >= c->slots) {
++		if (c->errors++ < 4) {
++			printf(LOGP "%s: event for TRE %#llx outside ring %#llx\n", c->name, e->xfer_ptr, c->ring.pa);
++		}
++		return;
++	}
++	if (slot != c->done % c->slots && c->errors++ < 4) {
++		printf(LOGP "%s: slot %u done, expected %u\n", c->name, slot, c->done % c->slots);
++	}
++	c->done++;
++	b = c->bufs.va + (size_t)slot * c->buf_size;
++	if (len > c->buf_size) {
++		len = c->buf_size;
++	}
++	c->bytes += len;
++	if (trace) {
++		printf(LOGP "%s: slot %u %u bytes code %u: %02x %02x %02x %02x %02x %02x %02x %02x\n", c->name, slot, len, e->code,
++		    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
++	}
++	if (c->qmap) {
++		for (uint32_t at = 0; at + QMAP_HDR_LEN <= len;) {
++			uint32_t cmd = b[at] & 0x80u, pad = b[at] & 0x3fu, mux = b[at + 1];
++			uint32_t pkt = (uint32_t)b[at + 2] << 8 | b[at + 3];   /* includes padding (HDR_PAYLOAD_LEN_INC_PADDING) */
++
++			if (pkt == 0 || at + QMAP_HDR_LEN + pkt > len || pad > pkt) {
++				break;
++			}
++			if (cmd == 0) {
++				c->packets++;
++				void (*hook)(const void *, size_t, uint8_t) = spes_ipa_rx_hook;
++				if (hook != NULL) {
++					hook(b + at + QMAP_HDR_LEN, pkt - pad, (uint8_t)mux);
++				} else {
++					c->drops++;
++				}
++			} else if (trace) {
++				printf(LOGP "%s: QMAP command frame (%u bytes, mux %u)\n", c->name, pkt, mux);
++			}
++			at += QMAP_HDR_LEN + pkt;
++		}
++	} else {
++		c->packets++;                                   /* LAN RX: counted, dropped */
++	}
++	rx_post(c);
++	chan_doorbell(c);
++}
++
++static void
++tx_event(struct ipa_chan *c, const struct gsi_event *e, void *ctx __unused)
++{
++	uint32_t slot = (uint32_t)((e->xfer_ptr - c->ring.pa) / GSI_RING_ELEMENT_SIZE);
++
++	if (slot != c->done % c->slots && c->errors++ < 4) {
++		printf(LOGP "%s: TX slot %u done, expected %u (code %u)\n", c->name, slot, c->done % c->slots, e->code);
++	}
++	c->done++;
++}
++
++int
++spes_ipa_tx(const void *ip, size_t len)
++{
++	struct ipa_chan *c = &c_mtx;
++	uint8_t *b;
++
++	if (!ready || !modem_started) {
++		return ENODEV;
++	}
++	if (len == 0 || len + QMAP_HDR_LEN > c->buf_size || len > 0xffffu) {
++		return EMSGSIZE;
++	}
++	lck_mtx_lock(tx_lock);
++	chan_events(c, tx_event, NULL);
++	if (c->next - c->done >= c->max_out) {
++		c->drops++;
++		lck_mtx_unlock(tx_lock);
++		return ENOBUFS;
++	}
++	b = buf_va(c, c->next);
++	b[0] = 0;                                       /* data frame, pad 0 */
++	b[1] = tx_mux;
++	b[2] = (uint8_t)(len >> 8);                     /* pkt_len, big-endian, without padding */
++	b[3] = (uint8_t)len;
++	memcpy(b + QMAP_HDR_LEN, ip, len);
++	tre_fill(c, c->next, buf_pa(c, c->next), (uint16_t)(len + QMAP_HDR_LEN), TRE_FLAGS_TYPE(GSI_RE_XFER) | TRE_FLAGS_IEOT);
++	c->next++;
++	chan_doorbell(c);
++	c->packets++;
++	c->bytes += len;
++	if (trace) {
++		printf(LOGP "%s: %zu bytes mux %u\n", c->name, len, tx_mux);
++	}
++	lck_mtx_unlock(tx_lock);
++	return 0;
++}
++
++void
++spes_ipa_set_mux(uint8_t mux)
++{
++	tx_mux = mux;
++}
++
++static void
++ipa_poll_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (;;) {
++		if (modem_started) {
++			chan_events(&c_mrx, rx_event, NULL);    /* only this thread consumes RX: no lock */
++			lck_mtx_lock(tx_lock);
++			chan_events(&c_mtx, tx_event, NULL);
++			lck_mtx_unlock(tx_lock);
++		}
++		chan_events(&c_lan, rx_event, NULL);
++		ipa_sleep_ms(1);                                /* aggregation closes after 500 us anyway */
++	}
++}
++
++bool
++spes_ipa_modem_start(void)
++{
++	if (!ready) {
++		return false;
++	}
++	if (modem_started) {
++		return true;
++	}
++	/* Linux ipa_open(): AP_MODEM_TX then AP_MODEM_RX */
++	if (!chan_start(&c_mtx) || !chan_start(&c_mrx)) {
++		printf(LOGP "modem channels do not start\n");
++		return false;
++	}
++	ipa_dsb();
++	modem_started = true;
++	printf(LOGP "modem data channels started (TX ep %u ch %u, RX ep %u ch %u, mux %u)\n", c_mtx.ep, c_mtx.ch, c_mrx.ep, c_mrx.ch, tx_mux);
++	return true;
++}
++
++/* ---------------------------------------------------------------- info for the QMI side */
++
++bool
++spes_ipa_ready(void)
++{
++	return ready;
++}
++
++bool
++spes_ipa_clock_on(void)
++{
++	return clock_voted;
++}
++
++void
++spes_ipa_modem_endpoints(uint32_t *to_modem, uint32_t *from_modem)
++{
++	*to_modem = c_mtx.ep;                           /* 1: IPA consumer pipe (DPM hardware data port) */
++	*from_modem = c_mrx.ep;                         /* 9: IPA producer pipe */
++}
++
++bool
++spes_ipa_modem_info(struct spes_ipa_modem_info *m)
++{
++	if (!ready || m == NULL) {
++		return false;
++	}
++	memset(m, 0, sizeof(*m));
++	m->platform_type = IPA_QMI_PLATFORM_MSM_ANDROID;
++	m->hdr_tbl_start = mem_offset + MEM_MODEM_HEADER;
++	m->hdr_tbl_end = m->hdr_tbl_start + MEM_MODEM_HEADER_SIZE - 1;
++	m->v4_route_start = mem_offset + MEM_V4_ROUTE;
++	m->v4_route_end = MODEM_ROUTE_COUNT - 1;
++	m->v6_route_start = mem_offset + MEM_V6_ROUTE;
++	m->v6_route_end = MODEM_ROUTE_COUNT - 1;
++	m->v4_filter_start = mem_offset + MEM_V4_FILTER;
++	m->v6_filter_start = mem_offset + MEM_V6_FILTER;
++	m->modem_mem_start = mem_offset + MEM_MODEM;
++	m->modem_mem_size = MEM_MODEM_SIZE;
++	m->ctrl_comm_dest_end_pt = c_mrx.ep;
++	m->hdr_proc_ctx_start = mem_offset + MEM_MODEM_PROC_CTX;
++	m->hdr_proc_ctx_end = m->hdr_proc_ctx_start + MEM_PROC_CTX_SIZE - 1;
++	m->hw_stats_quota_base = mem_offset + MEM_STATS_QUOTA_MODEM;
++	m->hw_stats_quota_size = mem_offset + MEM_STATS_QUOTA_SIZE;   /* sic: Linux ipa_qmi.c adds mem_offset to the size */
++	m->skip_uc_load = false;                        /* CHECK: true after the modem's DRIVER_INIT_COMPLETE (uC loaded) */
++	return true;
++}
++
++void
++spes_ipa_status(char *out, size_t size)
++{
++	snprintf(out, size, "ready %u modem %u; tx %llu pkts %llu B %llu drop; rx %llu pkts %llu B %llu drop; lan %llu; err %llu/%llu/%llu; "
++	    "ch states %u/%u/%u/%u", ready, modem_started, c_mtx.packets, c_mtx.bytes, c_mtx.drops, c_mrx.packets, c_mrx.bytes, c_mrx.drops,
++	    c_lan.packets, c_mtx.errors, c_mrx.errors, c_lan.errors,
++	    gsi_va ? ch_state(c_cmd.ch) : 0xff, gsi_va ? ch_state(c_lan.ch) : 0xff, gsi_va ? ch_state(c_mtx.ch) : 0xff,
++	    gsi_va ? ch_state(c_mrx.ch) : 0xff);
++}
++
++/* ---------------------------------------------------------------- init */
++
++/* Read-only look: what the IPA and GSI say before anything is written. */
++static void
++ipa_probe_log(const char *when)
++{
++	uint32_t shm = ipa_rd(IPA_SHARED_MEM_SIZE), hw2 = gsi_rd(GSI_HW_PARAM_2);
++
++	printf(LOGP "%s: SHARED_MEM_SIZE %#x (base %#x, size %#x) FLAVOR_0 %#x COMP_CFG %#x ROUTE %#x\n", when, shm,
++	    8u * (shm >> 16), 8u * (shm & 0xffffu), ipa_rd(IPA_FLAVOR_0), ipa_rd(IPA_COMP_CFG), ipa_rd(IPA_ROUTE));
++	printf(LOGP "%s: GSI_STATUS %#x (%s) HW_PARAM_2 %#x (%u ch/EE, %u ev/EE) ERROR_LOG %#x\n", when, gsi_rd(GSI_STATUS),
++	    (gsi_rd(GSI_STATUS) & 1u) ? "enabled" : "NOT enabled", hw2, (hw2 >> 3) & 0x1fu, (hw2 >> 8) & 0x1fu, gsi_rd(GSI_ERROR_LOG));
++	printf(LOGP "%s: AP ch states %u %u %u %u, ev states %u %u %u %u\n", when, ch_state(0), ch_state(1), ch_state(2), ch_state(3),
++	    ev_state(0), ev_state(1), ev_state(2), ev_state(3));
++}
++
++static bool
++ipa_alloc_all(void)
++{
++	if (!ipa_dma_alloc(&tbl, 4096) || !ipa_dma_alloc(&zero, ZERO_SIZE)) {
++		return false;
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		struct ipa_chan *c = chans[i];
++		uint32_t ring = c->slots * GSI_RING_ELEMENT_SIZE;
++
++		/* ring base must be a multiple of the ring size (Linux gsi_ring_alloc); pool granules are 4 KB, rings <= 4 KB */
++		if (ring > 4096 || (c->slots & (c->slots - 1)) != 0 ||
++		    !ipa_dma_alloc(&c->ring, ring) || !ipa_dma_alloc(&c->evring, ring) ||
++		    !ipa_dma_alloc(&c->bufs, c->slots * c->buf_size)) {
++			printf(LOGP "%s: no pool memory\n", c->name);
++			return false;
++		}
++		c->max_out = c->slots - (c->tlv - 1);
++		if (c->max_out > c->slots - 1) {
++			c->max_out = c->slots - 1;
++		}
++	}
++	return true;
++}
++
++/* SMEM item 497 for the modem's filter tables (Linux ipa_smem_init(): qcom_smem_alloc(QCOM_SMEM_HOST_MODEM, ...)). */
++static void
++ipa_smem_item(void)
++{
++	void *part = spes_smem_partition(SMEM_HOST_APPS, SMEM_HOST_MODEM);
++	uint32_t size = 0;
++	void *p;
++
++	if (part == NULL) {
++		printf(LOGP "SMEM apps<->modem partition not found; item %u not made\n", IPA_SMEM_ITEM);
++		return;
++	}
++	if ((p = spes_smem_get(part, IPA_SMEM_ITEM, &size)) != NULL) {
++		printf(LOGP "SMEM item %u already there (%u bytes)\n", IPA_SMEM_ITEM, size);
++		return;
++	}
++	p = spes_smem_alloc(part, IPA_SMEM_ITEM, IPA_SMEM_SIZE);
++	if (p != NULL) {
++		memset(p, 0, IPA_SMEM_SIZE);            /* SMEM is mapped write-combined (Normal NC) by SpesModem */
++	}
++	printf(LOGP "SMEM item %u (%#x bytes): %s\n", IPA_SMEM_ITEM, IPA_SMEM_SIZE, p != NULL ? "made, zeroed" : "FAILED");
++}
++
++bool
++spes_ipa_init(void)
++{
++	static bool tried;
++	thread_t thread;
++
++	if (tried) {
++		return ready;
++	}
++	tried = true;
++	if (ipa_bootarg("modem_ipa_data", 0) != 1) {
++		return false;
++	}
++	trace = ipa_bootarg("modem_ipa_trace", 0) != 0;
++	tx_mux = (uint8_t)ipa_bootarg("modem_ipa_mux", 1);
++
++	/* 0: power, mappings, read-only probe */
++	if (ipa_bootarg("modem_ipa_clk", 1) != 0) {
++		/* CHECK: RPM resource/rate (see RPM_TYPE_IPA_CLK); without a running IPA clock every register access below can hang the bus */
++		if (spes_rpm_kvp(RPM_SET_ACTIVE, RPM_TYPE_IPA_CLK, 0, RPM_KEY_RATE_KHZ, IPA_CLK_KHZ) != 0) {
++			printf(LOGP "IPA clock vote failed: not touching the IPA\n");
++			return false;
++		}
++		clock_voted = true;
++		printf(LOGP "IPA clock voted (%u kHz, active set)\n", IPA_CLK_KHZ);
++	} else {
++		printf(LOGP "modem_ipa_clk=0: no clock vote, assuming the IPA is clocked\n");
++	}
++	ipa_va = ml_io_map(IPA_REG_PA, IPA_REG_SIZE);
++	gsi_va = ml_io_map(GSI_PA + GSI_MAP_FROM, GSI_MAP_SIZE);
++	if (ipa_va == 0 || gsi_va == 0) {
++		printf(LOGP "register mapping failed\n");
++		return false;
++	}
++	ipa_probe_log("before");
++	{
++		uint32_t shm = ipa_rd(IPA_SHARED_MEM_SIZE);
++		mem_offset = 8u * (shm >> 16);
++		mem_size = 8u * (shm & 0xffffu);
++	}
++	if (ipa_bootarg("modem_ipa_readonly", 0) != 0) {
++		printf(LOGP "modem_ipa_readonly=1: stopping after the read probe\n");
++		return false;
++	}
++	if (mem_size < MEM_END || mem_offset + MEM_END > 0x10000u) {
++		/* CHECK: ipa_mem_config() only warns when the size is smaller; here we refuse (the canaries would land outside) */
++		printf(LOGP "local memory %#x+%#x does not hold the v4.2 layout (%#x): stopping\n", mem_offset, mem_size, MEM_END);
++		return false;
++	}
++	sram_va = ml_io_map(IPA_SRAM_PA + mem_offset, IPA_SRAM_SIZE);
++	if (sram_va == 0 || !spes_soc_map() || !ipa_alloc_all()) {
++		printf(LOGP "SRAM map, SoC map or pool allocation failed\n");
++		return false;
++	}
++	ipa_grp = lck_grp_alloc_init("spes_ipa", LCK_GRP_ATTR_NULL);
++	tx_lock = lck_mtx_alloc_init(ipa_grp, LCK_ATTR_NULL);
++
++	/* 1: SMMU, 2: SMEM item */
++	if (!spes_smmu_identity(IPA_SMMU_SID, IPA_SMMU_MASK, "IPA")) {
++		printf(LOGP "no SMMU stream for the IPA (sid %#x): stopping\n", IPA_SMMU_SID);
++		return false;
++	}
++	ipa_smem_item();
++
++	/* 3: ipa_config() */
++	if (!ipa_endpoints_available()) {
++		return false;
++	}
++	ipa_hw_config();
++	ipa_mem_canaries();
++	ipa_resource_config();
++
++	/* 4: firmware */
++	if ((gsi_rd(GSI_STATUS) & 1u) == 0) {
++		if (ipa_bootarg("modem_ipa_fw", 1) == 0 || !ipa_fw_load()) {
++			printf(LOGP "GSI not enabled and no firmware loaded: stopping\n");
++			return false;
++		}
++		for (unsigned ms = 0; ms < 1000 && (gsi_rd(GSI_STATUS) & 1u) == 0; ms += 10) {
++			ipa_sleep_ms(10);
++		}
++	} else {
++		printf(LOGP "GSI already enabled: firmware not loaded again\n");
++	}
++	if ((gsi_rd(GSI_STATUS) & 1u) == 0) {
++		gsi_log_error("after firmware");
++		return false;
++	}
++
++	/* 5: gsi_setup() */
++	gsi_irqs_off();
++	{
++		uint32_t hw2 = gsi_rd(GSI_HW_PARAM_2);
++		gsi_ch_count = (hw2 >> 3) & 0x1fu;
++		gsi_ev_count = (hw2 >> 8) & 0x1fu;
++	}
++	gsi_wr(GSI_ERROR_LOG, 0);
++	for (unsigned i = 0; i < 4; i++) {
++		struct ipa_chan *c = chans[i];
++		if (c->ch >= gsi_ch_count || c->ev >= gsi_ev_count) {
++			printf(LOGP "%s: channel %u / event ring %u beyond GSI counts %u/%u\n", c->name, c->ch, c->ev, gsi_ch_count, gsi_ev_count);
++			return false;
++		}
++		if (!gsi_channel_setup(c)) {
++			return false;
++		}
++	}
++	for (uint32_t m = 0; m < GSI_MODEM_CHANNELS; m++) {
++		if (!gsi_modem_channel_alloc(m)) {
++			return false;
++		}
++	}
++
++	/* 6: ipa_endpoint_setup(), command channel, ipa_mem_setup(), ipa_table_setup(), LAN RX, default route */
++	for (unsigned i = 0; i < 4; i++) {
++		ipa_endpoint_program(chans[i]);
++	}
++	if (!chan_start(&c_cmd) || !ipa_mem_setup() || !ipa_table_setup()) {
++		printf(LOGP "command channel / memory / table setup failed\n");
++		return false;
++	}
++	if (!chan_start(&c_lan)) {
++		return false;
++	}
++	/* ROUTE: DEF_PIPE 5:1 = LAN RX, DEF_HDR_TABLE, FRAG_DEF_PIPE 21:17 = LAN RX, DEF_RETAIN_HDR */
++	ipa_wr(IPA_ROUTE, (uint32_t)c_lan.ep << 1 | 1u << 6 | (uint32_t)c_lan.ep << 17 | 1u << 24);
++
++	ipa_dsb();
++	ready = true;
++	ipa_probe_log("after");
++	if (kernel_thread_start(ipa_poll_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf(LOGP "poll thread did not start\n");
++	}
++	printf(LOGP "IPA set up: cmd ep %u, LAN ep %u, modem TX ep %u, modem RX ep %u; local memory at %#x; waiting for QMI before "
++	    "spes_ipa_modem_start()\n", c_cmd.ep, c_lan.ep, c_mtx.ep, c_mrx.ep, mem_offset);
++	return true;
++}
++
++#else /* !ARM64_BOARD_CONFIG_SWEET */
++#include <sys/cdefs.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include "spes_ipa.h"
++void (*spes_ipa_rx_hook)(const void *ip, size_t len, uint8_t mux);
++bool spes_ipa_init(void) { return false; }
++bool spes_ipa_ready(void) { return false; }
++bool spes_ipa_modem_start(void) { return false; }
++int spes_ipa_tx(const void *ip __unused, size_t len __unused) { return 19 /* ENODEV */; }
++void spes_ipa_set_mux(uint8_t mux __unused) {}
++bool spes_ipa_modem_info(struct spes_ipa_modem_info *m __unused) { return false; }
++void spes_ipa_modem_endpoints(uint32_t *a, uint32_t *b) { *a = 0; *b = 0; }
++bool spes_ipa_clock_on(void) { return false; }
++void spes_ipa_status(char *out, size_t size) { if (size) { out[0] = 0; } }
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
+index dddf3c7..cb7a35f 100644
+--- a/iokit/Kernel/arm/SpesModem.cpp
++++ b/iokit/Kernel/arm/SpesModem.cpp
+@@ -564,6 +564,7 @@ static uint32_t q_ver = 1, q_modem_node = QRTR_NODE_BCAST;
+ static bool q_hello_sent, q_hello_rx, q_announced;
+ static struct { uint32_t svc, inst, node, port; } q_srv[64];
+ static unsigned q_srv_count, g_rx_msgs, g_tx_msgs, q_resumes;
++extern "C" bool spes_ipa_init(void);              /* 0210, bsd/dev/spes_ipa.c */
+ static unsigned g_ms;                           /* watch time, for the log */
+ static bool g_modem_up;                         /* 0207: PAS-booted, shut down before a reset */
+ static uint32_t n_node, n_port, u_node, u_port;    /* 0200: NAS / UIM servers */
+@@ -6807,6 +6808,11 @@ spes_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 		LOG("wifi: no SMMU stream for WLAN, the radio stays off");
+ 		wifi_on = 0;
+ 	}
++	{
++		/* 0210: IPA before the modem boots (modem_ipa_data=1; modem_ipa_readonly=1 stops after the clock vote and
++		 * the read-only probe). Nothing happens without the boot-arg. */
++		(void)spes_ipa_init();
++	}
+ 	if (modem_boot()) {
+ 		modem_watch(smem_partition(0, 1), watch);
+ 	}
