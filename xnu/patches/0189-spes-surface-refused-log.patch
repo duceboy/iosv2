@@ -1,0 +1,29 @@
+spes graphics: log the whole request of refused IOSurface creates (0189, diagnostic only).
+
+backboardd's creates are refused about 1000 times a boot (1105x1160, 256x1, 129x129; pixel format 0,
+8 keys, kIOReturnBadArgument, size still 0 = sweet_surface_layout failed). The first eight refused
+requests are now printed with their property dictionary to see which check fails. No behaviour change.
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index a8a17df..9237805 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1019,6 +1019,18 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		 * WebKit's GPU process leaves its tiles empty (all19: 0 of 1024 sampled pixels at every
+ 		 * unlock). What it asked for, before ten-bit formats became BGRA, and the whole request.
+ 		 */
++		/*
++		 * 0189: backboardd's refused creates (~1000 a boot, 1105x1160/256x1/129x129, fmt 0,
++		 * 8 keys -> kIOReturnBadArgument): the whole request of the first few, to see which check.
++		 */
++		static uint32_t failed_props;
++		if (ret != kIOReturnSuccess && failed_props < 8) {
++			OSSerialize *fser = OSSerialize::withCapacity(1024);
++			failed_props++;
++			IOLog("SWEET SURF: refused %s request #%u (0x%x): %.900s\n", name, failed_props, ret,
++			    fser != NULL && props->serialize(fser) ? fser->text() : "(no text)");
++			OSSafeReleaseNULL(fser);
++		}
+ 		static uint32_t web_props;
+ 		uint32_t asked = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
+ 		if (web && (asked != s->pixelFormat || web_props < 12)) {
