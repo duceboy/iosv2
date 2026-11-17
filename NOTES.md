@@ -125,6 +125,20 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   Likely slow, not dead: the author's first boot after an LS reset took ~15 min, and before 0170 "hours",
   because MobileGestalt waited up to 5 s per lookup without `local-mac-address` on the wlan node, which only
   RedwoodWLAN sets (needs modem=1 wifi=1). Our image had neither.
+- **MILESTONE 2026-11-17 05:30: iOS 16.7.16 LOCK SCREEN AND HOME SCREEN ON THE spesn 4 GB PHONE.** Boot 2,
+  `shim/out/spes-ios-2.img` (f6af9b54...be5d): same kernel/layout plus `cpus=4 modem=1 wifi=1 modem_part=modem_b
+  sweetsample=SpringBoard,lsd,backboardd` (SPES_CPUS=4 in build-spes-ios.sh). User: Apple logo, lock screen after
+  ~2 min, swipe up -> home screen with app icons; touch very jerky; wallpaper shows pixel errors; Control Center
+  etc. appear but do not work. Ran ~7 min. Log `research/logs/ios2.txt` (342467 B, flush #40):
+  4/4 Gold CPUs (0x100-0x103, PSCI CPU_ON rc 0). Modem up (pool 0x9c000000), WLAN mission mode, scans,
+  RedwoodWLAN registered (local-mac-address -> MobileGestalt no longer waits; LS rebuild finished). SpringBoard,
+  backboardd, lsd, wifid once each. Restarts: fairplayd.H2/bluetoothd 40 each, wifip2pd 26, syncdefaultsd 14.
+  CRASHes: syncdefaultsd x13 (SIGABRT, uncaught ObjC exception in an XPC handler: iCloud KVS, no account),
+  webbookmarksd x2 (SIGABRT), driverkitd SIG9 (as before), **mediaserverd SIGBUS once** in H264SW.videocodec
+  right after `SWEET SURF: mediaserverd create ... 332x198 fmt 420v planes 2` (far in an r-x mapping -> the planar
+  IOSurface mapping; to investigate), restarted. Display: first frames shown directly from scanout pool slots
+  (0x90014450/0x91014450), then "frame copied by the processor" (slow path). Touch: 31470 frames, 6037 errors,
+  58 taps. Battery 15 samples temp_in 34 C.
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
