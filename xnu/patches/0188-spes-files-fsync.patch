@@ -1,0 +1,64 @@
+spes USB file server durability (0188): fsync + F_FULLFSYNC before "OK"; sync twice before a reset.
+
+A launchd.plist PUT about five seconds before a USB "fastboot" reset reached HFS incomplete: the next boot's
+launchd_cache_loader sent it and launchd exited "No service cache" (initproc panic, 2026-11-17). The same
+file, rebuilt on the Mac, is byte-identical and plutil-valid, so the content was fine. PUT now calls
+VNOP_FSYNC(MNT_WAIT) and VNOP_IOCTL(F_FULLFSYNC) (HFS journal and device cache) before replying, and fails
+the PUT if the fsync fails; the attributes are set while the file is still open. reboot/fastboot run
+sync_internal(), wait 2 s, and sync again before the reset.
+
+diff --git a/bsd/dev/sweet_files.c b/bsd/dev/sweet_files.c
+index 2850dee..af27054 100644
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -21,6 +21,7 @@
+ #include <sys/fcntl.h>
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
++#include <sys/vnode_if.h>
+ #include <sys/kernel.h>
+ #include <sys/kauth.h>
+ #include <sys/kpi_socket.h>
+@@ -178,12 +179,25 @@ sf_put(socket_t so, const char *path, int mode, uint64_t size)
+ 		}
+ 		off += chunk;
+ 	}
+-	if (vp != NULLVP) {
+-		vnode_close(vp, FWRITE, ctx);
+-	}
+ 	if (!err) {
+ 		err = sf_setattr(path, mode, true);
+ 	}
++	if (vp != NULLVP) {
++		/*
++		 * 0188: on the disk before "OK", journal and UFS write cache included (F_FULLFSYNC):
++		 * a launchd.plist PUT a few seconds before a reset reached HFS incomplete and launchd
++		 * panicked ("No service cache").
++		 */
++		int serr = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++		int ferr = VNOP_IOCTL(vp, F_FULLFSYNC, NULL, 0, ctx);
++		if (!err && serr) {
++			err = serr;
++		}
++		if (ferr && ferr != ENOTSUP && ferr != ENOTTY) {
++			printf("SWEET FILES: F_FULLFSYNC %s -> %d\n", path, ferr);
++		}
++		vnode_close(vp, FWRITE, ctx);
++	}
+ 	return err;
+ }
+ 
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index e755607..ba06b05 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -973,6 +973,9 @@ ud_cmd_thread(__unused void *arg, __unused wait_result_t wr)
+ 		if (!reset) {
+ 			continue;
+ 		}
++		/* 0188: twice, with time for HFS's journal and the UFS cache in between */
++		(void)sync_internal();
++		ud_sleep_ms(2000);
+ 		(void)sync_internal();
+ 		ud_sleep_ms(500);                   /* reply and last log lines out over USB */
+ 		if (bootloader) {
