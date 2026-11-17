@@ -5544,3 +5544,17 @@ soll aus launchd.plist (beim nächsten erreichbaren Boot). CI 44187398152.
   (Testplan 7 Läufe). Gate modem_ipa_data=1 ohne readonly.
 - Reihenfolge der Tests: (1) all-6: IPA readonly + en1-Testmodus (+ Countdown 0207), (2) IPA voll (Firmware, GSI), (3) QMI-Handshake,
   (4) Session. Läufe brauchen Fastboot ohne Hände: erst ab einem Kernel mit 0207 sicher.
+
+### 2026-11-18 ~00:40 – IPA läuft vollständig an (all-6), Boot-Arg-Längen-Falle, Schwarzbild-Suche
+
+- **Boot-Args werden bei 608 Bytes abgeschnitten** (XNU BOOT_LINE_LENGTH): all-6 hatte 678 → `modem_ipa_readonly=1`, `modem_cell…`
+  und `wlan_mac` (stand am Ende) kamen nie an. Build-Skript: wlan_mac zuerst, keepsyms/-enable_kprintf_spam/ufslogsecs raus,
+  Abbruch bei > 600 Bytes.
+- **all-6: IPA vollständig eingerichtet** (unbeabsichtigt, s. o.): Takt-Vote, FLAVOR_0 0x8090811, Local Memory 0x20a8, Firmware über
+  PAS 15 geladen (auth_and_reset 0), GSI enabled, Modem-Kanäle 0–3 und AP-Kanäle angelegt, ERROR_LOG 0. Danach blieb das System
+  später im Boot stehen (vermutlich fehlende msm-bus-Votes o. Ä.) → IPA bis auf Weiteres nur mit Absicht.
+- 0213: Review-Fixes am IPA-Entwurf (GPI-Scratch-Register, Befehlskanal 64 TREs, trace→ipa_trace).
+- **Schwarzes Display in all-7 und all-8** (all-8 = Boot-Args von all-5, Kernel mit 0207–0212). Verdacht 0209 (Plane-bpr +0x10) bzw.
+  AegirPoster: in all-8 21 Abstürze von AegirPoster (Erd-Hintergrund, Metal), in all-5 keiner. **0215** nimmt 0209 zurück und legt
+  /dev/spes-screen nicht mehr an (0208 hat beim Lesen den Kernel eingefroren, Nutzer: verwerfen). Metal-clients jetzt
+  `* -backboardd -AegirPoster`. Video-Fix muss neu überlegt werden.
