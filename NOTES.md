@@ -68,6 +68,22 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   HSPHY overrides read back as 0xa6/0x85/0x16 per byte (DT sequence 0x61/0x08/0x2d not applied by ABL;
   femto registers read as the byte replicated in all four lanes). GPIO 31 on tile 0xd00000: cfg
   0x200 = GPIO function, output, 2 mA, out 0 (matches Linux's usb_switch 0 = data lines to the SoC).
+- **Run 2 (gpu-display + spesbattery=1 spesvib=2 spesusb=1, observed from sweetlog, 2026-11-17):**
+  `shim/out/spes-gpu-display-floor0xa0000000-log.img` (a6f11b9f...ef53). The phone booted Evolution X once
+  before the log was pulled (power key released too early); the log area was checked byte by byte: header
+  (SWEETLOG v1, 18253 bytes, flush #11) + run 2 text + zero padding + run 1's leftover blocks identical to
+  the run 1 read + zeros -> Android did not write it. User saw the green rectangle top left.
+  GPU: RPM GLINK up, rwcx/rwmx votes ACKed, CX/GX GDSC on, RBBM idle, SMMU CB0 TTBR0 0xa3d14000 (kernel
+  RAM below 4 GiB), SQE loaded, CP_ME_INIT PASSED, CP_MEM_WRITE scratch 0xcafe0001, ZAP PIL init/mem/
+  auth st=0, SECURE_MODE PASS, `framebuffer PASS pixels=1024/1024 color=0xff00ff00`. Touch as run 1.
+  Battery (0179, ABL state, phone on USB): SM5602 raw soc 0x6432 volt 0x4a82 cur 0x138 -> 100 %,
+  4450 mV, **+152 mA while charging** (Linux sign confirmed both ways: + charging, - discharging).
+  bq2589x 0x00-0x14 under XNU: 26 06 15 1a 07 21 9a 8d 03 44 73 | 56 00 14 6b 6a 3e 80 00 26 0c ->
+  IINLIM 2000 mA, ICHG 448 mA, VREG 4448 mV, watchdog off, REG0B charging (fast), ADC one-shot (VBUSV/
+  ICHGR stale) -> **the ABL leaves the charger charging at <= 448 mA; XNU does not stop it**.
+  LPG (0180, SPMI arb 0x50010000, 256 APIDs): type 0x13 subtype 0x0b; all zero except 0xb341 = 0x07
+  (PWM_SIZE_CLK) and 0xb344 = 0xff (VALUE_LSB); enable 0 (ABL state, not Linux's 50000/42500 ns).
+  USB/GPIO 31 as run 1.
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
