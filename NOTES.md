@@ -84,6 +84,19 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   LPG (0180, SPMI arb 0x50010000, 256 APIDs): type 0x13 subtype 0x0b; all zero except 0xb341 = 0x07
   (PWM_SIZE_CLK) and 0xb344 = 0xff (VALUE_LSB); enable 0 (ABL state, not Linux's 50000/42500 ns).
   USB/GPIO 31 as run 1.
+- **Run 3 (wifi, `modem_part=modem_b`, observed from sweetlog, 2026-11-17):** `shim/out/spes-wifi-probe-
+  floor0xa0000000-log.img` (5b6db1a8...091c). Log intact (SWEETLOG v1, 27162 bytes, flush #17).
+  **0174:** `SpesModem: pool 0x9c000000+0x1000000 (kernel RAM covers the default)`. **0177:** firmware from
+  modem_b accepted (hash from modem.b01, init_image/mem_setup/auth_and_reset ret 0), MODEM READY, glink/qrtr
+  up, 44 services, rmtfs on modemst1/2 (reads 3, writes 3 "not kept" = RAM only, no EFS write), tftp writes
+  in RAM. WLFW up (chip_id 130, WLAN.HL.3.2.4-01022, bdwlan.bin 26328 B), MSA assignment refused as on
+  Topaz, **WLAN FIRMWARE READY, mission mode, HTC/WMI/HTT ready, passive scan found 9 networks**
+  (names/BSSIDs not recorded here). fw MAC 00:00:00:00:00:00 (no MAC set yet, cf. tools/spes_wlan_mac.py).
+- SM5602 temperature calibration point (OrangeFox, on USB): Linux 30.0 degC, TEMPERATURE_IN 0x0022 (34 degC,
+  chip), TEMPERATURE_EX raw 0x9eef/0x9ef0 (one point: no conversion yet). 0182 logs both every 30 s.
+- iOS root built by the user on the Mac: `research/spes-ios-root.img` (16 GiB HFSX, fsck_hfs OK, SHA256
+  46c8d16f039144907ac058caf27c5dd88c569b93248640005439c2a742e628d9). D22AP ADT source
+  `research/ipsw-x/d22ap.adt` extracted (IM4P -> LZFSE). Not written to the phone yet.
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
