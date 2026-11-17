@@ -7,7 +7,6 @@ technology, signal (dBm, LTE SNR), card and application states. Nothing is set; 
 ICCID, IMEI, AIDs) is requested or logged.
 
 diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
-diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
 index 80a7e74..b5d1f50 100644
 --- a/iokit/Kernel/arm/SpesModem.cpp
 +++ b/iokit/Kernel/arm/SpesModem.cpp
