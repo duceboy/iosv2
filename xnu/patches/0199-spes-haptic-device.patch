@@ -1,0 +1,231 @@
+spes: /dev/redwood-haptic, the motor for iOS's haptics (0199, spesvib=5).
+
+iOS plays its haptics as audio on the "Actuator" device; HackiOS's HAL plug-in (userland/src/
+audio_plugin.c, MIT) writes those 16-bit mono samples to /dev/redwood-haptic. With spesvib=5 the PM6125
+LPG is set up once exactly as stage 4 (0192/0193: allow-listed SID 1 registers, every write read back)
+and left on; the motor then follows GPIO 36. A write whose peak is above 1200/32767 keeps the motor on
+for 30 ms more; a kernel thread switches GPIO 36 every 4 ms. At most 1000 ms on in one stretch, then
+1000 ms off. If the LPG setup fails, no node is made and nothing is ever switched on.
+
+diff --git a/bsd/dev/spes_vib.c b/bsd/dev/spes_vib.c
+index 0fd0267..4587ab9 100644
+--- a/bsd/dev/spes_vib.c
++++ b/bsd/dev/spes_vib.c
+@@ -21,6 +21,12 @@ extern int sweet_spmi_init(void);
+ extern int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);   /* sweet_spmi.c, 0186 */
+ #include "spes_lpg.h"                                                     /* 0192 */
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/errno.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/thread.h>
++#include <machine/atomic.h>
+ void spes_vib_init(void);
+ 
+ /*
+@@ -134,6 +140,39 @@ lpg_log(const char *when)
+ 	    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+ }
+ 
++
++/* 0199: the stage-4 LPG setup alone (checks, every write read back), output left on. 0 = ready. */
++static int
++spes_vib_lpg_setup(void)
++{
++	uint8_t type = 0, sub = 0;
++	if (sweet_spmi_init() != 0 || sweet_spmi_read(SPES_LPG_SID, SPES_LPG_BASE + 4, &type) != 0 ||
++	    sweet_spmi_read(SPES_LPG_SID, SPES_LPG_BASE + 5, &sub) != 0 || type != 0x13 || sub != 0x0b) {
++		printf("SPES HAPTIC: LPG not as expected (type %#x subtype %#x)\n", type, sub);
++		return -1;
++	}
++	lpg_log("before (haptic)");
++	int err = 0;
++	err = err ? err : lpg_masked(SPES_LPG_SIZE_CLK, SPES_LPG_SIZE_CLK_MASK, SPES_LPG_SIZE_CLK_VAL);
++	err = err ? err : lpg_masked(SPES_LPG_PREDIV_CLK, SPES_LPG_PREDIV_MASK, SPES_LPG_PREDIV_VAL);
++	err = err ? err : lpg_masked(SPES_LPG_VALUE_MSB, SPES_LPG_MSB_MASK, (uint8_t)(SPES_LPG_VALUE >> 8));
++	err = err ? err : lpg_put(SPES_LPG_VALUE_LSB, (uint8_t)(SPES_LPG_VALUE & 0xff), true);
++	err = err ? err : lpg_put(SPES_LPG_SYNC, 0x01, false);
++	err = err ? err : lpg_masked(SPES_LPG_TYPE_CONFIG, SPES_LPG_GLITCH_BIT, SPES_LPG_GLITCH_BIT);
++	if (!err) {
++		uint8_t old = 0, back = 0xff, want;
++		err = sweet_spmi_read(SPES_LPG_SID, SPES_LPG_ENABLE, &old) != 0 ? -1 : 0;
++		want = spes_lpg_masked(old, SPES_LPG_ENABLE_MASK, SPES_LPG_ENABLE_ON);
++		err = err ? err : lpg_put(SPES_LPG_ENABLE, want, false);
++		err = err ? err : (sweet_spmi_read(SPES_LPG_SID, SPES_LPG_ENABLE, &back) != 0 ? -1 : 0);
++		if (!err && (back & SPES_LPG_ENABLE_KEPT) != (want & SPES_LPG_ENABLE_KEPT)) {
++			err = -1;
++		}
++	}
++	lpg_log(err ? "haptic setup FAILED" : "haptic: PWM on, motor follows GPIO 36");
++	return err;
++}
++
+ static void
+ spes_vib_lpg_run(uint32_t buzz_ms)
+ {
+@@ -205,6 +244,153 @@ spes_vib_lpg_run(uint32_t buzz_ms)
+ 	lpg_log(same ? "restored (0xb341-0xb346 = before)" : "NOT fully restored");
+ }
+ 
++
++/*
++ * 0199, spesvib=5: the motor for iOS's haptics. The LPG is set up once exactly as stage 4 (0192/0193,
++ * same allow-listed SID 1 registers, every write read back) and left on; the motor then runs only while
++ * GPIO 36 is high. /dev/redwood-haptic takes what iOS plays on its "Actuator" audio device (16-bit mono
++ * samples from the HAL plug-in, HackiOS userland/src/audio_plugin.c actuator_write()): a write whose peak
++ * is above HAP_THRESH keeps the motor on for HAP_HOLD_MS more. A thread checks every 4 ms. Limits: at most
++ * HAP_MAX_MS on in one stretch, then HAP_MAX_MS off; if the LPG setup fails nothing is ever switched on.
++ */
++#define HAP_THRESH      1200            /* |sample| of 32767 */
++#define HAP_HOLD_MS     30
++#define HAP_MAX_MS      1000
++static vm_offset_t hap_east;
++static uint32_t hap_cfg0, hap_io0;
++static volatile uint64_t hap_until_us;
++static uint32_t hap_writes, hap_loud;
++static bool hap_ready;
++
++static uint64_t
++hap_now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++static void
++hap_enable(bool on)
++{
++	if (on) {
++		vib_wr(hap_east, VIB_IO, (vib_rd(hap_east, VIB_IO) & ~2u) | 2u);
++		uint32_t out = (hap_cfg0 & ~0x3ffu) | (1u << 6) | 0x200u;
++		if (hap_cfg0 & (1u << 11)) {
++			out |= 1u << 12;
++		}
++		vib_wr(hap_east, VIB_CFG, out);
++	} else {
++		vib_wr(hap_east, VIB_IO, vib_rd(hap_east, VIB_IO) & ~2u);
++		vib_wr(hap_east, VIB_CFG, hap_cfg0);
++		vib_wr(hap_east, VIB_IO, hap_io0 & ~2u);
++	}
++}
++
++static void
++hap_thread(void *arg __unused, wait_result_t w __unused)
++{
++	bool on = false;
++	uint64_t on_since = 0, rest_until = 0, stretches = 0;
++	for (;;) {
++		uint64_t now = hap_now_us();
++		bool want = now < hap_until_us && now >= rest_until;
++		if (want && on && now - on_since >= HAP_MAX_MS * 1000ull) {
++			want = false;
++			rest_until = now + HAP_MAX_MS * 1000ull;
++		}
++		if (want != on) {
++			hap_enable(want);
++			on = want;
++			if (on) {
++				on_since = now;
++				if (++stretches <= 20) {
++					printf("SPES HAPTIC: on (#%llu, writes %u loud %u)\n", stretches, hap_writes, hap_loud);
++				}
++			}
++		}
++		delay(4000);
++	}
++}
++
++static int
++hap_open(dev_t dev __unused, int flags __unused, int devtype __unused, struct proc *p __unused)
++{
++	return hap_ready ? 0 : ENXIO;
++}
++
++static int
++hap_close(dev_t dev __unused, int flags __unused, int devtype __unused, struct proc *p __unused)
++{
++	return 0;
++}
++
++static int
++hap_write(dev_t dev __unused, struct uio *uio, int ioflag __unused)
++{
++	int16_t buf[256];
++	int peak = 0, err = 0;
++	while (uio_resid(uio) > 0) {
++		size_t n = MIN((size_t)uio_resid(uio), sizeof(buf));
++		err = uiomove((caddr_t)buf, (int)n, uio);
++		if (err) {
++			break;
++		}
++		for (size_t i = 0; i < n / 2; i++) {
++			int v = buf[i] < 0 ? -buf[i] : buf[i];
++			peak = v > peak ? v : peak;
++		}
++	}
++	os_atomic_inc(&hap_writes, relaxed);
++	if (peak > HAP_THRESH) {
++		os_atomic_inc(&hap_loud, relaxed);
++		hap_until_us = hap_now_us() + HAP_HOLD_MS * 1000ull;
++	}
++	return err;
++}
++
++static struct cdevsw hap_cdevsw = {
++	.d_open = hap_open, .d_close = hap_close, .d_read = eno_rdwrt, .d_write = hap_write,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL,
++	.d_select = eno_select, .d_mmap = eno_mmap, .d_strategy = eno_strat,
++	.d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc, .d_type = 0,
++};
++
++static int spes_vib_lpg_setup(void);
++
++static void
++spes_vib_haptic_start(void)
++{
++	if (spes_vib_lpg_setup() != 0) {
++		printf("SPES HAPTIC: LPG setup failed; no /dev/redwood-haptic\n");
++		return;
++	}
++	hap_east = ml_io_map(VIB_EAST_PA, VIB_CFG + 0x1000u);
++	if (hap_east == 0) {
++		printf("SPES HAPTIC: no TLMM mapping\n");
++		return;
++	}
++	hap_cfg0 = vib_rd(hap_east, VIB_CFG);
++	hap_io0 = vib_rd(hap_east, VIB_IO);
++	int major = cdevsw_add(-1, &hap_cdevsw);
++	if (major < 0) {
++		printf("SPES HAPTIC: cdevsw_add failed\n");
++		return;
++	}
++	if (devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-haptic") == NULL) {
++		printf("SPES HAPTIC: devfs node failed\n");
++		return;
++	}
++	thread_t t;
++	if (kernel_thread_start(hap_thread, NULL, &t) != KERN_SUCCESS) {
++		printf("SPES HAPTIC: no thread\n");
++		return;
++	}
++	thread_deallocate(t);
++	hap_ready = true;
++	printf("SPES HAPTIC: /dev/redwood-haptic ready (GPIO36 cfg %#x io %#x; max %u ms on)\n", hap_cfg0, hap_io0, HAP_MAX_MS);
++}
++
+ void
+ spes_vib_init(void)
+ {
+@@ -222,6 +408,10 @@ spes_vib_init(void)
+ 		spes_vib_lpg_run(on == 4 ? ms : 0);       /* 0192: LPG write path (allow-listed) */
+ 		return;
+ 	}
++	if (on == 5) {
++		spes_vib_haptic_start();        /* 0199 */
++		return;
++	}
+ 	if (on != 1) {
+ 		return;
+ 	}
