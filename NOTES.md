@@ -5365,3 +5365,14 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   for 100 ms, pin restored (cfg 0 io 0), LPG 0xb341-0xb346 restored = before. User felt one short tick.
   Slots b/6 before and after. First vibration under XNU on spesn. Next for haptics: an iOS-facing path
   (HackiOS audio_plugin "Actuator" -> device node) instead of the boot-time test.
+
+## 2026-11-17 13:30 – WLAN: DHCP and internet work
+- Cause of "0 TX frames": /private/var/preferences/SystemConfiguration/preferences.plist had no NetworkServices/
+  Sets/CurrentSet, so configd/ipconfigd never configured en0. Installed a minimal one (Wi-Fi service on en0,
+  IPv4 DHCP, IPv6 automatic, one set as CurrentSet; original kept as preferences.plist.orig on the phone) over the
+  USB file server, read back equal. Takes effect after a reboot.
+- Next boot: wifid auto-joins the known WPA2 network ~90 s after boot (auth/assoc/4-way/keys installed/joined),
+  configd now queries SSID/BSSID after the join, data frames go out. The first 4 HTT tx completions report
+  status 2 (no ack; only the first 4 failures are logged). User: one error message first, then connected;
+  **Safari loads web pages normally.** Kernel unchanged (0193 build, CI 44062990696).
+- Open: what the first error message was; HTT tx failure statistics; COUNTRY_CODE/PHY_MODE/RSSI requests refused.
