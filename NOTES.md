@@ -56,6 +56,18 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   in rd=md0 diagnostics before. 0179: SM5602 voltage/current exactly as Linux; one bq2589x dump.
   0180: `spesvib=2` reads LPG SID1 0xb300-0xb347; sweet_spmi.c uses the SM6225 arbiter on spes (it had
   SM7150's 0x0c440000). 0181: `spesusb=1` logs GPIO 31 via the three-tile search.
+- **Run 1 (touch, observed from sweetlog, 2026-11-17):** kernel CI 44005704440 (0173-0181, SHA256
+  88928ba4...24a6), `shim/out/spes-touch-probe-floor0xa0000000-log.img` (25819f44...6f67), phys 0xa0000000 +
+  2.5 GiB, `spesufslog=1 sweetlog=1 spesusb=1`. Log pulled from OrangeFox (userdata = sda16 here; 39 KB,
+  flush #11). `SWEET UFS: log-only, writes limited to blocks 0x1c453fa..0x1c457fa` (= the 1025 blocks
+  sweet-log-pull.sh reads), `"userdata" on LUN 0: first block 0x2b4c28, 104715 MiB, DMA at 0xa3c10000`
+  -> **UFS DMA below 4 GiB works**. PID 1 heartbeat. Touch: FocalTech 54:52 at 0x38 (0x5d Goodix probe
+  NACKs as expected), 806 events (403 down/up), x 0..1079, y 0..2399, up to 5 fingers at once, one
+  `report err=5` at the start. USB (ABL state after fastboot boot): GDSC on, all 7 CBCRs on, DWC3
+  GSNPSID 0x5533330a (3.30a), DCTL 0x10f00000 (run/stop 0), GEVNTADR 0x9df50000 (ABL's buffer),
+  HSPHY overrides read back as 0xa6/0x85/0x16 per byte (DT sequence 0x61/0x08/0x2d not applied by ABL;
+  femto registers read as the byte replicated in all four lanes). GPIO 31 on tile 0xd00000: cfg
+  0x200 = GPIO function, output, 2 mA, out 0 (matches Linux's usb_switch 0 = data lines to the SoC).
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
