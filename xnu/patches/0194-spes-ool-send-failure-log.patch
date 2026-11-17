@@ -1,0 +1,102 @@
+spes: log out-of-line memory that mach_msg could not hand over (0194, read-only diagnostic).
+
+iOS unified log of the 2026-11-17 WLAN boot (read on the Mac with macos-UnifiedLogs): SpringBoard's
+CoreAnimation commits to backboardd fail with "Failed to send deferred commits ... (ipc/send) invalid
+memory" (0x1000000C = MACH_SEND_INVALID_MEMORY), backboardd then reports serialization errors and
+decode_object ptr = NULL. Apps start (scene ready after ~1 s) but their windows do not show, so the
+user taps 2-3 times. MACH_SEND_INVALID_MEMORY comes from ipc_kmsg_copyin_ool_descriptor (copyin or
+vm_map_copyin of the sender's region failed) or the OOL ports copyin. This logs, for the first 40
+failures per boot: process, which path, address, length, copy option, kr, and the map entries that
+cover the range (protection, submap, needs_copy, wiring, alias, object flags). No behaviour change.
+
+diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
+index b4d1276..7658c18 100644
+--- a/osfmk/ipc/ipc_kmsg.c
++++ b/osfmk/ipc/ipc_kmsg.c
+@@ -4398,6 +4398,62 @@ ipc_kmsg_copyin_port_descriptor(
+ 	return (mach_msg_descriptor_t *)(user_dsc_in + 1);
+ }
+ 
++/*
++ * spes (0194): log out-of-line memory a sender's mach_msg could not hand over
++ * (MACH_SEND_INVALID_MEMORY). SpringBoard's CoreAnimation commits to backboardd fail
++ * with "(ipc/send) invalid memory"; this shows which region and why. Read-only
++ * diagnostic: the first 40 failures per boot, the map entries covering the range.
++ */
++extern void proc_selfname(char *buf, int size);
++static void
++spes_ool_fail_log(vm_map_t map, mach_vm_offset_t addr, mach_vm_size_t len,
++    int copy, int dealloc, kern_return_t kr, int where)
++{
++	static uint32_t spes_ool_fails;
++	char name[32] = "?";
++	uint32_t n = os_atomic_inc_orig(&spes_ool_fails, relaxed);
++	if (n >= 40) {
++		return;
++	}
++	proc_selfname(name, sizeof(name));
++	printf("SPES OOL: %s fail#%d at %d: addr 0x%llx len 0x%llx copy %d dealloc %d kr %d\n",
++	    name, (int)n, where, (unsigned long long)addr, (unsigned long long)len, copy, dealloc, kr);
++	if (map == VM_MAP_NULL || len == 0) {
++		return;
++	}
++	vm_map_lock_read(map);
++	vm_map_entry_t e;
++	vm_map_offset_t end = addr + len, at = addr;
++	bool found = vm_map_lookup_entry(map, addr, &e);
++	if (!found) {
++		printf("SPES OOL:   no entry at 0x%llx (hole)\n", (unsigned long long)addr);
++		e = e->vme_next;
++	}
++	for (int i = 0; i < 6 && e != vm_map_to_entry(map) && e->vme_start < end; i++, e = e->vme_next) {
++		if (e->vme_start > at) {
++			printf("SPES OOL:   hole 0x%llx-0x%llx\n", (unsigned long long)at,
++			    (unsigned long long)e->vme_start);
++		}
++		vm_object_t o = e->is_sub_map ? VM_OBJECT_NULL : VME_OBJECT(e);
++		printf("SPES OOL:   entry 0x%llx-0x%llx prot %d/%d sub %d nc %d wired %d/%d alias %d shared %d obj %p",
++		    (unsigned long long)e->vme_start, (unsigned long long)e->vme_end,
++		    e->protection, e->max_protection, e->is_sub_map, e->needs_copy,
++		    e->wired_count, e->user_wired_count, VME_ALIAS(e), e->is_shared, o);
++		if (o != VM_OBJECT_NULL) {
++			printf(" int %d phys %d strat %d purg %d size 0x%llx pager %p",
++			    o->internal, o->phys_contiguous, o->copy_strategy, o->purgable,
++			    (unsigned long long)o->vo_size, o->pager);
++		}
++		printf("\n");
++		at = e->vme_end;
++	}
++	if (at < end) {
++		printf("SPES OOL:   range ends 0x%llx beyond the last entry 0x%llx\n",
++		    (unsigned long long)end, (unsigned long long)at);
++	}
++	vm_map_unlock_read(map);
++}
++
+ static mach_msg_descriptor_t *
+ ipc_kmsg_copyin_ool_descriptor(
+ 	mach_msg_ool_descriptor_t *dsc,
+@@ -4457,6 +4513,7 @@ ipc_kmsg_copyin_ool_descriptor(
+ 		 * to page if the region is sufficiently large.
+ 		 */
+ 		if (copyin(addr, (char *)*paddr, length)) {
++			spes_ool_fail_log(map, addr, length, copy_options, dealloc, KERN_INVALID_ADDRESS, 1);
+ 			*mr = MACH_SEND_INVALID_MEMORY;
+ 			return NULL;
+ 		}
+@@ -4490,6 +4547,7 @@ ipc_kmsg_copyin_ool_descriptor(
+ 		kern_return_t kr = vm_map_copyin(map, addr,
+ 		    (vm_map_size_t)length, dealloc, copy);
+ 		if (kr != KERN_SUCCESS) {
++			spes_ool_fail_log(map, addr, length, copy_options, dealloc, kr, 2);
+ 			*mr = (kr == KERN_RESOURCE_SHORTAGE) ?
+ 			    MACH_MSG_VM_KERNEL :
+ 			    MACH_SEND_INVALID_MEMORY;
+@@ -4595,6 +4653,7 @@ ipc_kmsg_copyin_ool_ports_descriptor(
+ #endif
+ 
+ 	if (copyinmap(map, addr, names, names_length) != KERN_SUCCESS) {
++		spes_ool_fail_log(map, addr, names_length, -1, deallocate, KERN_INVALID_ADDRESS, 3);
+ 		kfree_type(mach_port_t, count, data);
+ 		*mr = MACH_SEND_INVALID_MEMORY;
+ 		return NULL;
