@@ -1,0 +1,57 @@
+spes: provision the USIM from whichever slot holds it (0203).
+
+all-2: modem online (DMS mode 0 accepted), NAS sees GSM at -63 dBm, searching; UIM: slot 1 card error, slot 2 card
+present with one USIM "detected", primary GW none (0xffff). 0202 only provisioned slot 1. Now the first SIM/USIM that is
+present and ready/detected, in any slot, becomes the primary GW application (Change Provisioning Session with its slot;
+AID sent, never logged); the slot switch is only used when no such application exists. Card status is asked again ~5 s
+after provisioning until the application is READY, then NAS registration is started (0202).
+
+diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
+index d700b26..5b42f97 100644
+--- a/iokit/Kernel/arm/SpesModem.cpp
++++ b/iokit/Kernel/arm/SpesModem.cpp
+@@ -6233,6 +6233,7 @@ uim_rx(const uint8_t *d, uint32_t len)
+ 	}
+ 	unsigned slots = v[8], o = 9, primary_gw = (unsigned)(v[0] | v[1] << 8), ready_slot = 0, first_card = ~0u;
+ 	uint8_t aid[33] = { 0 };
++	unsigned aid_slot = 0;
+ 	static const char *cs[] = { "absent", "present", "error" };
+ 	static const char *as[] = { "unknown", "detected", "pin1 wanted", "puk1 wanted", "perso", "pin1 blocked", "illegal", "ready" };
+ 	LOG("uim: primary GW %#x, %u slot(s)", primary_gw, slots);
+@@ -6249,15 +6250,19 @@ uim_rx(const uint8_t *d, uint32_t len)
+ 			if (card == 1 && state == 7 && ready_slot == 0) {
+ 				ready_slot = sl + 1;
+ 			}
+-			if (sl == 0 && card == 1 && (state == 7 || state == 1) && (type == 1 || type == 2) && alen <= 32 && o + 7 + alen <= l) {
+-				aid[0] = (uint8_t)alen;
++			if (aid_slot == 0 && card == 1 && (state == 7 || state == 1) && (type == 1 || type == 2) && alen <= 32 && o + 7 + alen <= l) {
++				aid[0] = (uint8_t)alen;             /* 0203: any slot (all-2: the SIM is in slot 2, USIM "detected") */
+ 				memcpy(aid + 1, v + o + 7, alen);
++				aid_slot = sl + 1;
+ 			}
+ 			o += 7 + alen + 7;
+ 		}
+ 	}
+ 	u_card_ready = ready_slot != 0;
+-	if (first_card != 1 && ready_slot > 1 && !u_switched) {
++	if (!u_card_ready && u_provisioned) {
++		u_last_ms = g_ms > 25000 ? g_ms - 25000 : 1;  /* 0203: look again in ~5 s after provisioning */
++	}
++	if (first_card != 1 && ready_slot > 1 && !u_switched && aid_slot == 0) {
+ 		uint8_t t[] = { 0x01, 1, 0, 1,  0x02, 4, 0, (uint8_t)ready_slot, 0, 0, 0 };
+ 		u_switched = true;
+ 		LOG("uim: logical slot 1 -> physical slot %u (card ready there)", ready_slot);
+@@ -6268,11 +6273,11 @@ uim_rx(const uint8_t *d, uint32_t len)
+ 		unsigned n = 0;
+ 		t[n++] = 0x01; t[n++] = 2; t[n++] = 0; t[n++] = 0; t[n++] = 1;          /* primary GW, activate */
+ 		t[n++] = 0x10; t[n++] = (uint8_t)(2 + aid[0]); t[n++] = 0;
+-		t[n++] = 1; t[n++] = aid[0];
++		t[n++] = (uint8_t)aid_slot; t[n++] = aid[0];
+ 		memcpy(t + n, aid + 1, aid[0]);
+ 		n += aid[0];
+ 		u_provisioned = true;
+-		LOG("uim: slot 1 USIM made the primary GW application");
++		LOG("uim: slot %u USIM made the primary GW application", aid_slot);
+ 		nq_send_tlv(PORT_UIMC, u_node, u_port, 0x38, t, (uint16_t)n);
+ 	}
+ }
