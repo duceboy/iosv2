@@ -1,0 +1,827 @@
+spes: QMI control of mobile data: IPA QMI handshake and WDS session, draft (0212; modem_ipa_data=1 without readonly).
+
+SpesModem.cpp (draft, docs/SPES-QMI-DATA-DRAFT.md) after HackiOS hakios.mpss.c: our IPA QMI server (0x31:0x101: INDICATION_REGISTER,
+DRIVER_INIT_COMPLETE, filter install acks) and INIT_DRIVER to the modem's IPA service with spes_ipa_modem_info() (0210), INIT_COMPLETE,
+then spes_ipa_modem_start(); data: DPM Open Port (endpoints 1/9), WDA Set Data Format (raw IP, QMAP without checksum), WDS Bind Mux,
+Set IP Family v4, Start Network Interface (APN from boot-arg modem_apn, length only logged) once NAS reports registered+PS attached,
+Get Runtime Settings -> spes_cell_set_session() (0211); packet service status -> session down. SMP2P "ipa" answer 3 while the IPA
+clock is on. Gate: modem_ipa_data=1, modem_ipa_readonly!=1 and spes_ipa_ready(); otherwise no change at all.
+
+diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
+index 140bbad..5763566 100644
+--- a/iokit/Kernel/arm/SpesModem.cpp
++++ b/iokit/Kernel/arm/SpesModem.cpp
+@@ -566,6 +566,43 @@ static struct { uint32_t svc, inst, node, port; } q_srv[64];
+ static unsigned q_srv_count, g_rx_msgs, g_tx_msgs, q_resumes;
+ extern "C" bool spes_ipa_init(void);              /* 0210, bsd/dev/spes_ipa.c */
+ extern "C" bool spes_cell_init(void);             /* 0211, bsd/dev/spes_cell.c */
++/*
++ * QMI data control (modem_ipa_data=1, see "QMI data" further down). The IPA/en1 functions are C (bsd/dev/spes_ipa.c,
++ * spes_cell.c); declared here by hand like spes_ipa_init above, because bsd/dev headers are not on the iokit include
++ * path. The struct MUST stay identical to struct spes_ipa_modem_info in bsd/dev/spes_ipa.h (size checked below).
++ */
++struct spes_ipa_modem_info {
++	uint32_t platform_type;
++	uint32_t hdr_tbl_start, hdr_tbl_end;
++	uint32_t v4_route_start, v4_route_end;
++	uint32_t v6_route_start, v6_route_end;
++	uint32_t v4_filter_start, v6_filter_start;
++	uint32_t modem_mem_start, modem_mem_size;
++	uint32_t ctrl_comm_dest_end_pt;
++	uint32_t hdr_proc_ctx_start, hdr_proc_ctx_end;
++	uint32_t hw_stats_quota_base, hw_stats_quota_size;
++	bool     skip_uc_load;
++};
++static_assert(sizeof(struct spes_ipa_modem_info) == 68, "struct spes_ipa_modem_info differs from bsd/dev/spes_ipa.h");
++extern "C" bool spes_ipa_ready(void);
++extern "C" bool spes_ipa_modem_start(void);
++extern "C" bool spes_ipa_modem_info(struct spes_ipa_modem_info *info);
++extern "C" void spes_ipa_modem_endpoints(uint32_t *to_modem, uint32_t *from_modem);
++extern "C" bool spes_ipa_clock_on(void);
++extern "C" void spes_ipa_set_mux(uint8_t mux);
++extern "C" void spes_cell_set_session(uint32_t ip, uint32_t gw, uint32_t dns1, uint32_t dns2, uint32_t mtu);
++/* our QRTR ports for it (below PORT_SESS 0x4100) */
++#define PORT_IPAH           0x4008              /* our IPA QMI server (service 0x31, instance 1) */
++#define PORT_IPAC           0x4009              /* our client of the modem's IPA service (0x31, instance 2) */
++#define PORT_WDSC           0x400A              /* WDS client (service 0x01) */
++#define PORT_WDAC           0x400B              /* WDA client (service 0x1A) */
++#define PORT_DPMC           0x400C              /* DPM client (service 0x2F) */
++static bool qd_on;                              /* the gate: modem_ipa_data=1, modem_ipa_readonly!=1, spes_ipa_ready() */
++static bool qd_ipa_have, qd_wds_have, qd_wda_have, qd_dpm_have;
++static uint32_t qd_ipa_node, qd_ipa_port, qd_wds_node, qd_wds_port, qd_wda_node, qd_wda_port, qd_dpm_node, qd_dpm_port;
++static bool qd_nas_reg;                         /* NAS Get Serving System: registered and PS attached (modem_nas=1 only) */
++static void qd_ipa_server_up(void);             /* defined in "QMI data" */
++static void qd_modem_gone(void);
+ static unsigned g_ms;                           /* watch time, for the log */
+ static bool g_modem_up;                         /* 0207: PAS-booted, shut down before a reset */
+ static uint32_t n_node, n_port, u_node, u_port;    /* 0200: NAS / UIM servers */
+@@ -814,6 +851,7 @@ svc_name(uint32_t svc)
+ 	case 0x03: return "nas";
+ 	case 0x0B: return "uim";
+ 	case 0x1A: return "wda";
++	case 0x2F: return "dpm";
+ 	default:   return "";
+ 	}
+ }
+@@ -880,6 +918,15 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 				u_node = c->c; u_port = c->d; u_have = true;
+ 			} else if (c->a == 0x02 && !d_have) {       /* 0202 */
+ 				d_node = c->c; d_port = c->d; d_have = true;
++			} else if (qd_on && c->a == 0x31 && c->b == 0x201 && !qd_ipa_have) {   /* the modem's IPA service: v1, instance 2 */
++				qd_ipa_node = c->c; qd_ipa_port = c->d; qd_ipa_have = true;
++				qd_ipa_server_up();
++			} else if (qd_on && c->a == 0x01 && !qd_wds_have) {
++				qd_wds_node = c->c; qd_wds_port = c->d; qd_wds_have = true;
++			} else if (qd_on && c->a == 0x1A && !qd_wda_have) {
++				qd_wda_node = c->c; qd_wda_port = c->d; qd_wda_have = true;
++			} else if (qd_on && c->a == 0x2F && !qd_dpm_have) {
++				qd_dpm_node = c->c; qd_dpm_port = c->d; qd_dpm_have = true;
+ 			}
+ 		}
+ 		break;
+@@ -6085,6 +6132,12 @@ svc_announce(void)
+ 		qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
+ 	}
+ 	LOG("t=%u ms: announced pd-mapper 0x40, tftp 0x1000, rmtfs 0x0e", g_ms);
++	if (qd_on) {
++		/* our IPA QMI server, version 1 instance 1 (Linux ipa_qmi.c: IPA_HOST_SERVICE_SVC_ID 0x31, ins id 1) */
++		struct qrtr_ctrl c = { QRTR_TYPE_NEW_SERVER, 0x31, 0x101, QRTR_NODE_APPS, PORT_IPAH };
++		qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
++		LOG("t=%u ms: ipa-qmi: announced our IPA server 0x31:0x101 port %x", g_ms, PORT_IPAH);
++	}
+ }
+ 
+ 
+@@ -6165,6 +6218,7 @@ nas_rx(const uint8_t *d, uint32_t len)
+ 				strlcat(rats, nas_rat(v[5 + i]), sizeof(rats));
+ 				strlcat(rats, " ", sizeof(rats));
+ 			}
++			qd_nas_reg = v[0] == 1 && v[2] == 1;        /* QMI data: start the session only once registered + PS attached */
+ 			LOG("nas: %s, cs %s, ps %s, network type %u, radio %s", v[0] < 5 ? reg[v[0]] : "?",
+ 			    v[1] == 1 ? "attached" : (v[1] == 2 ? "detached" : "unknown"),
+ 			    v[2] == 1 ? "attached" : (v[2] == 2 ? "detached" : "unknown"), v[3], rats);
+@@ -6370,6 +6424,677 @@ cell_tick(unsigned ms)
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------- QMI data (modem_ipa_data=1) */
++
++/*
++ * The QMI control side of mobile data, on top of the IPA draft (bsd/dev/spes_ipa.c) and en1 (bsd/dev/spes_cell.c).
++ * DRAFT, report docs/SPES-QMI-DATA-DRAFT.md. Gate (qd_gate_init, decided once before the modem boots):
++ * modem_ipa_data=1 AND modem_ipa_readonly!=1 AND spes_ipa_ready(). Without it qd_on stays false and nothing below
++ * runs: no server announced, no NEW_SERVER recorded, SMP2P answer stays 1, qd_tick returns at once.
++ *
++ * Order (Linux drivers/net/ipa/ipa_qmi.c for the handshake, ModemManager's order for the data port, as
++ * HackiOS drivers/modem/hakios.mpss.c "the IPA's QMI handshake" and "the data session" do it; message layouts from there):
++ *   1. our IPA server 0x31:0x101 announced with pd-mapper/tftp/rmtfs (svc_announce)
++ *   2. modem's IPA service 0x31:0x201 appears -> INIT_DRIVER 0x21 with spes_ipa_modem_info() (IPA v4.2 memory map)
++ *   3. modem -> our server: INDICATION_REGISTER 0x20, DRIVER_INIT_COMPLETE 0x35 (uC ready); answered with success
++ *   4. INIT_DRIVER accepted + uC ready -> indication INIT_COMPLETE 0x22 -> spes_ipa_modem_start() (Linux ipa_qmi_ready)
++ *   5. DPM Open Port 0x20 (svc 0x2F): embedded port, iface 1, endpoints from spes_ipa_modem_endpoints() (1 / 9)
++ *   6. WDA Set Data Format 0x20 (svc 0x1A): raw IP, QMAP (5 = v1, no checksum trailer) both ways
++ *   7. WDS Bind Mux Data Port 0xA2 (mux modem_ipa_mux, default 1) -> spes_ipa_set_mux(); Set IP Family 0x4D (IPv4)
++ *   8. WDS Start Network Interface 0x20 (IPv4, APN from modem_apn or the SIM's default profile), once NAS says
++ *      registered + PS attached (modem_nas=1) or, without modem_nas, simply retried every 10 s
++ *   9. WDS Get Runtime Settings 0x2D -> spes_cell_set_session(ip, gw, dns1, dns2, mtu) (host order = TLV read as LE)
++ *  10. WDS Packet Service Status 0x22 (indication, and polled every 30 s): disconnected -> spes_cell_set_session(0,...)
++ * Steps 5-7 go on after an answer or after 20 s without one (HackiOS). All of it runs in the watch thread
++ * (qrtr_rx -> svc_rx -> qd_rx, modem_watch -> qd_tick): no locks needed. The APN is never logged (only its length),
++ * nothing identifying (IMSI/IMEI/ICCID) is asked for.
++ */
++#define QD_IPA_IND_REGISTER     0x20
++#define QD_IPA_INIT_DRIVER      0x21
++#define QD_IPA_INIT_COMPLETE    0x22
++#define QD_IPA_INSTALL_FILTER   0x23
++#define QD_IPA_FILTER_NOTIF     0x24
++#define QD_IPA_CONFIG           0x27
++#define QD_IPA_DRV_INIT_DONE    0x35
++#define QD_WDS_START            0x20
++#define QD_WDS_PKT_STATUS       0x22
++#define QD_WDS_RUNTIME          0x2D
++#define QD_WDS_SET_FAMILY       0x4D
++#define QD_WDS_BIND_MUX         0xA2
++#define QD_WDA_SET_FORMAT       0x20
++#define QD_DPM_OPEN_PORT        0x20
++#define QD_EP_EMBEDDED          4               /* data endpoint type "embedded" (the IPA), as ModemManager/HackiOS */
++#define QD_EP_IFACE             1
++#define QD_DL_MAX_DGRAMS        16
++#define QD_DL_MAX_SIZE          8192            /* HackiOS 0x3800; here the IPA draft's 8 KB modem->AP buffers (CHECK) */
++#define QD_STEP_TIMEOUT_MS      20000
++#define QD_START_RETRY_MS       10000
++#define QD_STATUS_POLL_MS       30000
++#define QD_UC_FALLBACK_MS       10000
++#define QD_IP4(x)               (unsigned)((x) >> 24), (unsigned)(((x) >> 16) & 0xff), (unsigned)(((x) >> 8) & 0xff), (unsigned)((x) & 0xff)
++
++enum { QD_IDLE, QD_DPM, QD_WDA, QD_BIND, QD_FAMILY, QD_START_WAIT, QD_START, QD_SETTINGS, QD_UP };
++static const char *const qd_state_name[] = { "idle", "dpm open port", "wda set data format", "wds bind mux", "wds set ip family",
++	                                     "wait to start", "wds start", "wds runtime settings", "up" };
++static unsigned qd_now, qd_state, qd_state_ms, qd_last_start_ms, qd_last_poll_ms, qd_drv_ok_ms;
++static bool qd_sent;                            /* the current step's request is out */
++static bool qd_ind_wanted, qd_ind_sent, qd_drv_ok, qd_uc_ready, qd_ipa_started, qd_ipa_start_failed, qd_init_sent;
++static bool qd_wait_logged, qd_session;
++static uint32_t qd_ind_node, qd_ind_port, qd_handle;
++static uint8_t qd_mux = 1;
++static char qd_apn[64];
++static size_t qd_apn_len;
++
++static unsigned
++qd_le32(uint8_t *at, uint32_t v)
++{
++	for (unsigned b = 0; b < 4; b++) {
++		at[b] = (uint8_t)(v >> (8 * b));
++	}
++	return 4;
++}
++
++static unsigned
++qd_put_u32(uint8_t *at, uint8_t type, uint32_t v)
++{
++	at[0] = type; at[1] = 4; at[2] = 0;
++	return 3 + qd_le32(at + 3, v);
++}
++
++static unsigned
++qd_put_pair(uint8_t *at, uint8_t type, uint32_t first, uint32_t second)
++{
++	at[0] = type; at[1] = 8; at[2] = 0;
++	qd_le32(at + 3, first);
++	qd_le32(at + 7, second);
++	return 11;
++}
++
++static uint32_t
++qd_tlv_u32(const uint8_t *d, uint32_t len, uint8_t type)
++{
++	uint16_t l = 0;
++	uint32_t v = 0;
++	const uint8_t *p = qm_find(d, len, type, &l);
++	if (p != NULL && l >= 4) {
++		memcpy(&v, p, 4);                       /* LE on the wire = host order on arm64 */
++	}
++	return v;
++}
++
++/* any QMI message: flags 0 request, 2 response (transaction echoed), 4 indication (transaction 0) */
++static void
++qd_qmi_send(uint32_t from, uint32_t node, uint32_t port, uint8_t flags, uint16_t txn, uint16_t msg, const uint8_t *tlv, uint32_t tlen)
++{
++	uint8_t b[320];
++	uint16_t l = (uint16_t)tlen;
++	if (tlen > sizeof(b) - 7) {
++		LOG("qmi: message %#x of %u bytes too long, not sent", msg, tlen);
++		return;
++	}
++	b[0] = flags;
++	memcpy(b + 1, &txn, 2);
++	memcpy(b + 3, &msg, 2);
++	memcpy(b + 5, &l, 2);
++	if (tlen != 0) {
++		memcpy(b + 7, tlv, tlen);
++	}
++	qrtr_send(QRTR_TYPE_DATA, from, node, port, b, 7 + tlen);
++}
++
++static void
++qd_req(uint32_t from, uint32_t node, uint32_t port, uint16_t msg, const uint8_t *tlv, uint32_t tlen)
++{
++	qd_qmi_send(from, node, port, QMI_REQ, n_txn++, msg, tlv, tlen);
++}
++
++static bool
++qd_result(const uint8_t *d, uint32_t len, uint16_t *res, uint16_t *err)
++{
++	uint16_t l = 0;
++	const uint8_t *r = qm_find(d, len, 2, &l);
++	*res = 0xffff;
++	*err = 0xffff;
++	if (r != NULL && l >= 4) {
++		memcpy(res, r, 2);
++		memcpy(err, r + 2, 2);
++	}
++	return *res == 0;
++}
++
++static void
++qd_go(unsigned st)
++{
++	qd_state = st;
++	qd_state_ms = qd_now;
++	qd_sent = false;
++	LOG("t=%u ms: data: step -> %s", qd_now, qd_state_name[st]);
++}
++
++/* ---- IPA QMI handshake (Linux ipa_qmi.c; HackiOS ipa_host_receive / ipa_client_receive / ipa_init_driver) */
++
++static void
++qd_ipa_answer(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg)
++{
++	static const uint8_t ok[7] = { 2, 4, 0, 0, 0, 0, 0 };      /* result TLV: success, no error */
++	qd_qmi_send(PORT_IPAH, node, port, QMI_RESP, txn, msg, ok, sizeof(ok));
++}
++
++/* Linux ipa_qmi_ready(): modem driver accepted INIT_DRIVER and the uC is ready -> indication -> ipa_modem_start() */
++static void
++qd_ipa_check(void)
++{
++	if (!qd_drv_ok) {
++		return;
++	}
++	if (qd_ind_wanted && !qd_ind_sent && (qd_uc_ready || qd_now - qd_drv_ok_ms >= QD_UC_FALLBACK_MS)) {
++		static const uint8_t ok[7] = { 2, 4, 0, 0, 0, 0, 0 };
++		qd_qmi_send(PORT_IPAH, qd_ind_node, qd_ind_port, QMI_IND, 0, QD_IPA_INIT_COMPLETE, ok, sizeof(ok));
++		qd_ind_sent = true;
++		LOG("t=%u ms: ipa-qmi: INIT_COMPLETE indication (0x22) sent to node %u port %x%s", qd_now, qd_ind_node, qd_ind_port,
++		    qd_uc_ready ? "" : " (no DRIVER_INIT_COMPLETE 10 s after INIT_DRIVER: sent anyway, as HackiOS does)");
++	}
++	if (qd_uc_ready && qd_ind_sent && !qd_ipa_started && !qd_ipa_start_failed) {
++		if (spes_ipa_modem_start()) {
++			qd_ipa_started = true;
++			LOG("t=%u ms: ipa-qmi: handshake complete, IPA modem data channels started", qd_now);
++		} else {
++			qd_ipa_start_failed = true;
++			LOG("t=%u ms: ipa-qmi: spes_ipa_modem_start() FAILED: no data session will be set up", qd_now);
++		}
++	}
++}
++
++/* NEW_SERVER of 0x31:0x201 (qrtr_rx): INIT_DRIVER with the IPA v4.2 layout from the IPA draft */
++static void
++qd_ipa_server_up(void)
++{
++	struct spes_ipa_modem_info mi;
++	uint8_t t[160];
++	unsigned n = 0;
++
++	LOG("t=%u ms: ipa-qmi: modem IPA service 0x31:0x201 up (node %u port %x)", g_ms, qd_ipa_node, qd_ipa_port);
++	if (qd_init_sent) {
++		return;
++	}
++	if (!spes_ipa_modem_info(&mi)) {
++		LOG("ipa-qmi: spes_ipa_modem_info() failed: INIT_DRIVER not sent");
++		return;
++	}
++	n += qd_put_u32(t + n, 0x10, mi.platform_type);
++	n += qd_put_pair(t + n, 0x11, mi.hdr_tbl_start, mi.hdr_tbl_end);            /* modem header table, end inclusive */
++	n += qd_put_pair(t + n, 0x12, mi.v4_route_start, mi.v4_route_end);          /* start, last modem index */
++	n += qd_put_pair(t + n, 0x13, mi.v6_route_start, mi.v6_route_end);
++	n += qd_put_u32(t + n, 0x14, mi.v4_filter_start);
++	n += qd_put_u32(t + n, 0x15, mi.v6_filter_start);
++	n += qd_put_pair(t + n, 0x16, mi.modem_mem_start, mi.modem_mem_size);
++	n += qd_put_u32(t + n, 0x17, mi.ctrl_comm_dest_end_pt);
++	if (mi.skip_uc_load) {                                                      /* left out on a first boot (Android, HackiOS) */
++		t[n++] = 0x18; t[n++] = 1; t[n++] = 0; t[n++] = 1;
++	}
++	n += qd_put_pair(t + n, 0x19, mi.hdr_proc_ctx_start, mi.hdr_proc_ctx_end);
++	/* 0x1b-0x1e (hashed route/filter tables): IPA v4.2 has no hashed tables; Linux sends them only for a region of size != 0 */
++	if (mi.hw_stats_quota_size != 0) {
++		n += qd_put_u32(t + n, 0x1f, mi.hw_stats_quota_base);
++		n += qd_put_u32(t + n, 0x20, mi.hw_stats_quota_size);
++	}
++	/* 0x21/0x22 (drop statistics): no such region in the v4.2 map of the IPA draft */
++	qd_init_sent = true;
++	LOG("ipa-qmi: INIT_DRIVER (0x21, %u bytes): platform %u, hdr %#x-%#x, v4 rt %#x/%u, v6 rt %#x/%u, v4 flt %#x, v6 flt %#x, "
++	    "modem mem %#x+%#x, ctrl ep %u, proc ctx %#x-%#x, quota %#x/%#x, skip uc %u", n, mi.platform_type, mi.hdr_tbl_start,
++	    mi.hdr_tbl_end, mi.v4_route_start, mi.v4_route_end, mi.v6_route_start, mi.v6_route_end, mi.v4_filter_start,
++	    mi.v6_filter_start, mi.modem_mem_start, mi.modem_mem_size, mi.ctrl_comm_dest_end_pt, mi.hdr_proc_ctx_start,
++	    mi.hdr_proc_ctx_end, mi.hw_stats_quota_base, mi.hw_stats_quota_size, mi.skip_uc_load ? 1 : 0);
++	qd_req(PORT_IPAC, qd_ipa_node, qd_ipa_port, QD_IPA_INIT_DRIVER, t, n);
++}
++
++/* the modem's requests to our IPA server */
++static void
++qd_ipa_host_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	switch (msg) {
++	case QD_IPA_IND_REGISTER:
++		qd_ipa_answer(node, port, txn, msg);
++		qd_ind_wanted = true;
++		qd_ind_node = node;
++		qd_ind_port = port;
++		LOG("t=%u ms: ipa-qmi: modem registers for the INIT_COMPLETE indication (node %u port %x)", qd_now, node, port);
++		qd_ipa_check();
++		break;
++	case QD_IPA_DRV_INIT_DONE:
++		qd_ipa_answer(node, port, txn, msg);
++		qd_uc_ready = true;
++		LOG("t=%u ms: ipa-qmi: modem says DRIVER_INIT_COMPLETE (uC ready)", qd_now);
++		qd_ipa_check();
++		break;
++	case QD_IPA_INSTALL_FILTER: {
++		/* HackiOS: answer with the rule ids echoed (TLV 0x11); rules in TLV 0x15, count + 173-byte entries, id at byte 168.
++		 * The rules themselves are not programmed into the IPA. */
++		uint16_t sz = 0;
++		const uint8_t *list = qm_find(d, len, 0x15, &sz);
++		unsigned count = list != NULL && sz >= 1 ? list[0] : 0, n = 0;
++		uint8_t t[7 + 3 + 1 + 4 * 64];
++		if (list == NULL || count > 64 || sz != 1 + count * 173) {
++			qd_ipa_answer(node, port, txn, msg);
++			LOG("ipa-qmi: filter rules of an unknown shape (%u, %u bytes): answered with success alone", count, sz);
++			break;
++		}
++		t[n++] = 2; t[n++] = 4; t[n++] = 0; t[n++] = 0; t[n++] = 0; t[n++] = 0; t[n++] = 0;
++		t[n++] = 0x11;
++		t[n++] = (uint8_t)(1 + 4 * count);
++		t[n++] = (uint8_t)((1 + 4 * count) >> 8);
++		t[n++] = (uint8_t)count;
++		for (unsigned r = 0; r < count; r++) {
++			memcpy(t + n, list + 1 + r * 173 + 168, 4);
++			n += 4;
++		}
++		qd_qmi_send(PORT_IPAH, node, port, QMI_RESP, txn, msg, t, n);
++		LOG("ipa-qmi: modem's %u filter rules taken (not installed), ids answered", count);
++		break;
++	}
++	case QD_IPA_CONFIG:
++	case QD_IPA_FILTER_NOTIF:
++	default:
++		qd_ipa_answer(node, port, txn, msg);
++		LOG("ipa-qmi: modem request %#x (%s) answered with success", msg,
++		    msg == QD_IPA_CONFIG ? "config" : msg == QD_IPA_FILTER_NOTIF ? "filters installed" : "unknown");
++		break;
++	}
++}
++
++/* ---- data session senders (HackiOS dpm_server / wda_send_format / wds_advance / wds_send_start) */
++
++static void
++qd_send_dpm(void)
++{
++	uint32_t to_modem = 0, from_modem = 0;
++	uint8_t t[3 + 1 + 16];
++	unsigned n = 0;
++
++	spes_ipa_modem_endpoints(&to_modem, &from_modem);
++	t[n++] = 0x11; t[n++] = 17; t[n++] = 0;         /* hardware data ports: count, then type, iface, consumer, producer */
++	t[n++] = 1;
++	n += qd_le32(t + n, QD_EP_EMBEDDED);
++	n += qd_le32(t + n, QD_EP_IFACE);
++	n += qd_le32(t + n, to_modem);                  /* the modem's consumer = our AP->modem TX endpoint (1) */
++	n += qd_le32(t + n, from_modem);                /* the modem's producer = our modem->AP RX endpoint (9) */
++	qd_sent = true;
++	LOG("t=%u ms: dpm: open port: embedded iface %u, IPA consumer ep %u (AP->modem), producer ep %u (modem->AP)", qd_now,
++	    QD_EP_IFACE, to_modem, from_modem);
++	qd_req(PORT_DPMC, qd_dpm_node, qd_dpm_port, QD_DPM_OPEN_PORT, t, n);
++}
++
++static void
++qd_send_wda(void)
++{
++	uint8_t t[7 * 5 + 11];
++	unsigned n = 0;
++
++	n += qd_put_u32(t + n, 0x11, 2);                /* link layer: raw IP */
++	n += qd_put_u32(t + n, 0x12, 5);                /* UL aggregation: QMAP (v1, no checksum offload) */
++	n += qd_put_u32(t + n, 0x13, 5);                /* DL aggregation: QMAP */
++	n += qd_put_u32(t + n, 0x15, QD_DL_MAX_DGRAMS);
++	n += qd_put_u32(t + n, 0x16, QD_DL_MAX_SIZE);
++	n += qd_put_pair(t + n, 0x17, QD_EP_EMBEDDED, QD_EP_IFACE);
++	qd_sent = true;
++	LOG("t=%u ms: wda: set data format: raw IP, QMAP up/down without checksum, DL max %u datagrams / %u bytes", qd_now,
++	    QD_DL_MAX_DGRAMS, QD_DL_MAX_SIZE);
++	qd_req(PORT_WDAC, qd_wda_node, qd_wda_port, QD_WDA_SET_FORMAT, t, n);
++}
++
++static void
++qd_send_bind(void)
++{
++	uint8_t t[11 + 4];
++	unsigned n = 0;
++
++	n += qd_put_pair(t + n, 0x10, QD_EP_EMBEDDED, QD_EP_IFACE);
++	t[n++] = 0x11; t[n++] = 1; t[n++] = 0; t[n++] = qd_mux;
++	qd_sent = true;
++	LOG("t=%u ms: wds: bind mux data port: embedded iface %u, mux %u", qd_now, QD_EP_IFACE, qd_mux);
++	qd_req(PORT_WDSC, qd_wds_node, qd_wds_port, QD_WDS_BIND_MUX, t, n);
++}
++
++static void
++qd_send_family(void)
++{
++	static const uint8_t t[4] = { 0x01, 1, 0, 4 };  /* IPv4 (en1 carries IPv4 only) */
++	qd_sent = true;
++	LOG("t=%u ms: wds: set IP family IPv4", qd_now);
++	qd_req(PORT_WDSC, qd_wds_node, qd_wds_port, QD_WDS_SET_FAMILY, t, sizeof(t));
++}
++
++static void
++qd_send_start(void)
++{
++	uint8_t t[4 + 3 + sizeof(qd_apn)];
++	unsigned n = 0;
++
++	t[n++] = 0x19; t[n++] = 1; t[n++] = 0; t[n++] = 4;     /* IP family preference: IPv4 */
++	if (qd_apn_len != 0) {
++		t[n++] = 0x14; t[n++] = (uint8_t)qd_apn_len; t[n++] = 0;
++		memcpy(t + n, qd_apn, qd_apn_len);
++		n += (unsigned)qd_apn_len;
++	}
++	qd_sent = true;
++	qd_last_start_ms = qd_now;
++	LOG("t=%u ms: wds: start network interface (IPv4, %s, APN length %u)", qd_now,
++	    qd_apn_len != 0 ? "APN from modem_apn" : "SIM default profile", (unsigned)qd_apn_len);
++	qd_req(PORT_WDSC, qd_wds_node, qd_wds_port, QD_WDS_START, t, n);
++	bzero(t, sizeof(t));
++}
++
++static void
++qd_send_runtime(void)
++{
++	uint8_t t[7];
++	qd_put_u32(t, 0x10, 0xa310);                    /* requested: DNS 0x10, IP 0x100, gateway 0x200, MTU 0x2000, family 0x8000 */
++	qd_sent = true;
++	LOG("t=%u ms: wds: get runtime settings (handle %#x)", qd_now, qd_handle);
++	qd_req(PORT_WDSC, qd_wds_node, qd_wds_port, QD_WDS_RUNTIME, t, sizeof(t));
++}
++
++static void
++qd_session_down(const char *why)
++{
++	if (qd_session) {
++		spes_cell_set_session(0, 0, 0, 0, 0);
++	}
++	LOG("t=%u ms: wds: session down (%s)%s", qd_now, why, qd_session ? ": en1 link down" : "");
++	qd_session = false;
++	qd_handle = 0;
++	qd_last_start_ms = qd_now;
++	if (qd_state >= QD_START) {
++		qd_go(QD_START_WAIT);
++	}
++}
++
++/* modem_watch: the modem crashed (FATAL); the session is gone with it */
++static void
++qd_modem_gone(void)
++{
++	if (!qd_on) {
++		return;
++	}
++	if (qd_session) {
++		spes_cell_set_session(0, 0, 0, 0, 0);
++		qd_session = false;
++	}
++	LOG("wds: modem gone: data session state cleared");
++}
++
++static void
++qd_wds_rx(uint8_t type, uint16_t msg, bool ok, uint16_t res, uint16_t err, const uint8_t *d, uint32_t len)
++{
++	uint16_t l = 0;
++	const uint8_t *v;
++
++	if (type == QMI_RESP && msg == QD_WDS_BIND_MUX) {
++		LOG("t=%u ms: wds: bind mux %u %s (result %u error %u)", qd_now, qd_mux, ok ? "OK" : "REFUSED", res, err);
++		if (ok) {
++			spes_ipa_set_mux(qd_mux);
++		}
++		if (qd_state == QD_BIND) {
++			qd_go(QD_FAMILY);
++		}
++	} else if (type == QMI_RESP && msg == QD_WDS_SET_FAMILY) {
++		LOG("t=%u ms: wds: IP family IPv4 %s (result %u error %u)", qd_now, ok ? "set" : "NOT set", res, err);
++		if (qd_state == QD_FAMILY) {
++			qd_go(QD_START_WAIT);
++		}
++	} else if (type == QMI_RESP && msg == QD_WDS_START) {
++		if (qd_state != QD_START) {
++			LOG("wds: late start answer (result %u error %u) ignored", res, err);
++			return;
++		}
++		v = qm_find(d, len, 0x01, &l);
++		if (ok && v != NULL && l >= 4) {
++			memcpy(&qd_handle, v, 4);
++			LOG("t=%u ms: wds: SESSION STARTED (handle %#x)", qd_now, qd_handle);
++			qd_go(QD_SETTINGS);
++		} else {
++			uint16_t reason = 0xffff, vtype = 0xffff, vreason = 0xffff;
++			if ((v = qm_find(d, len, 0x10, &l)) != NULL && l >= 2) {
++				memcpy(&reason, v, 2);
++			}
++			if ((v = qm_find(d, len, 0x11, &l)) != NULL && l >= 4) {
++				memcpy(&vtype, v, 2);
++				memcpy(&vreason, v + 2, 2);
++			}
++			LOG("t=%u ms: wds: start refused: result %u error %u%s, call end reason %u, verbose %u/%u (retry in %u s)", qd_now,
++			    res, err, err == 70 ? " (invalid operation: PS not attached yet?)" : "", reason, vtype, vreason,
++			    QD_START_RETRY_MS / 1000);
++			qd_last_start_ms = qd_now;
++			qd_go(QD_START_WAIT);
++		}
++	} else if (type == QMI_RESP && msg == QD_WDS_RUNTIME) {
++		uint32_t ip = qd_tlv_u32(d, len, 0x1E), gw = qd_tlv_u32(d, len, 0x20), mask = qd_tlv_u32(d, len, 0x21);
++		uint32_t dns1 = qd_tlv_u32(d, len, 0x15), dns2 = qd_tlv_u32(d, len, 0x16), mtu = qd_tlv_u32(d, len, 0x29);
++		if (qd_state != QD_SETTINGS) {
++			return;
++		}
++		if (!ok || ip == 0) {
++			LOG("t=%u ms: wds: runtime settings without an address (result %u error %u); asked again in 20 s", qd_now, res, err);
++			return;                         /* qd_tick re-asks after the step timeout */
++		}
++		LOG("t=%u ms: wds: SESSION UP: address %u.%u.%u.%u gateway %u.%u.%u.%u mask %u.%u.%u.%u dns %u.%u.%u.%u %u.%u.%u.%u mtu %u",
++		    qd_now, QD_IP4(ip), QD_IP4(gw), QD_IP4(mask), QD_IP4(dns1), QD_IP4(dns2), mtu);
++		spes_cell_set_session(ip, gw, dns1, dns2, mtu);
++		qd_session = true;
++		qd_last_poll_ms = qd_now;
++		qd_go(QD_UP);
++	} else if ((type == QMI_RESP || type == QMI_IND) && msg == QD_WDS_PKT_STATUS) {
++		/* TLV 0x01: connection status (1 disconnected, 2 connected, 3 suspended, 4 authenticating), reconfiguration required */
++		v = qm_find(d, len, 0x01, &l);
++		if (v == NULL || l < 1) {
++			if (type == QMI_RESP && !ok) {
++				LOG("wds: packet service status: result %u error %u", res, err);
++			}
++			return;
++		}
++		unsigned st = v[0], reconf = l >= 2 ? v[1] : 0;
++		if (type == QMI_IND || st != 2) {
++			LOG("t=%u ms: wds: packet service status %u%s (%s)", qd_now, st, reconf ? ", reconfigure" : "",
++			    type == QMI_IND ? "indication" : "poll");
++		}
++		if (st == 1 && (qd_session || qd_state >= QD_SETTINGS)) {
++			qd_session_down("modem reports disconnected");
++		} else if (st == 2 && reconf && qd_state == QD_UP) {
++			qd_go(QD_SETTINGS);
++		}
++	} else {
++		LOG("wds: type %u msg %#x result %u error %u (not handled)", type, msg, res, err);
++	}
++}
++
++static void
++qd_rx(uint32_t node, uint32_t port, uint32_t dst, const uint8_t *d, uint32_t len)
++{
++	uint16_t txn, msg, res, err;
++	bool ok;
++
++	if (len < 7) {
++		return;
++	}
++	memcpy(&txn, d + 1, 2);
++	memcpy(&msg, d + 3, 2);
++	if (dst == PORT_IPAH) {
++		if (d[0] == QMI_REQ) {
++			qd_ipa_host_rx(node, port, txn, msg, d, len);
++		}
++		return;
++	}
++	ok = qd_result(d, len, &res, &err);
++	if (dst == PORT_IPAC) {
++		if (d[0] == QMI_RESP && msg == QD_IPA_INIT_DRIVER) {
++			qd_drv_ok = ok;
++			qd_drv_ok_ms = qd_now;
++			LOG("t=%u ms: ipa-qmi: modem %s INIT_DRIVER (result %u error %u)", qd_now, ok ? "ACCEPTS" : "REFUSES", res, err);
++			qd_ipa_check();
++		} else {
++			LOG("ipa-qmi: client port: type %u msg %#x result %u error %u", d[0], msg, res, err);
++		}
++		return;
++	}
++	if (dst == PORT_DPMC) {
++		if (d[0] == QMI_RESP && msg == QD_DPM_OPEN_PORT) {
++			LOG("t=%u ms: dpm: embedded data port %s (result %u error %u)", qd_now, ok ? "OPEN" : "NOT opened", res, err);
++			if (qd_state == QD_DPM) {
++				qd_go(QD_WDA);
++			}
++		}
++		return;
++	}
++	if (dst == PORT_WDAC) {
++		if (d[0] == QMI_RESP && msg == QD_WDA_SET_FORMAT) {
++			LOG("t=%u ms: wda: data format %s (result %u error %u): link %u (2 raw IP), UL %u DL %u (5 QMAP)", qd_now,
++			    ok ? "SET" : "REFUSED", res, err, qd_tlv_u32(d, len, 0x11), qd_tlv_u32(d, len, 0x12), qd_tlv_u32(d, len, 0x13));
++			if (qd_state == QD_WDA) {
++				qd_go(QD_BIND);
++			}
++		}
++		return;
++	}
++	qd_wds_rx(d[0], msg, ok, res, err, d, len);
++}
++
++/* modem_watch's 1 ms loop */
++static void
++qd_tick(unsigned ms)
++{
++	if (!qd_on) {
++		return;
++	}
++	qd_now = ms ? ms : 1;
++	if (qd_drv_ok && !qd_ipa_started) {
++		qd_ipa_check();                         /* (the 10 s indication fallback) */
++	}
++	unsigned age = qd_now - qd_state_ms;
++	switch (qd_state) {
++	case QD_IDLE:
++		if (qd_ipa_started) {
++			qd_go(QD_DPM);
++		}
++		break;
++	case QD_DPM:
++		if (!qd_sent && qd_dpm_have) {
++			qd_send_dpm();
++		} else if (age >= QD_STEP_TIMEOUT_MS) {
++			LOG("t=%u ms: dpm: %s after 20 s, going on", qd_now, qd_sent ? "no answer" : "no DPM service");
++			qd_go(QD_WDA);
++		}
++		break;
++	case QD_WDA:
++		if (!qd_sent && qd_wda_have) {
++			qd_send_wda();
++		} else if (age >= QD_STEP_TIMEOUT_MS) {
++			LOG("t=%u ms: wda: %s after 20 s, going on", qd_now, qd_sent ? "no answer" : "no WDA service");
++			qd_go(QD_BIND);
++		}
++		break;
++	case QD_BIND:
++		if (!qd_sent && qd_wds_have) {
++			qd_send_bind();
++		} else if (age >= QD_STEP_TIMEOUT_MS) {
++			LOG("t=%u ms: wds: bind: %s after 20 s, going on", qd_now, qd_sent ? "no answer" : "no WDS service");
++			qd_go(QD_FAMILY);
++		}
++		break;
++	case QD_FAMILY:
++		if (!qd_sent && qd_wds_have) {
++			qd_send_family();
++		} else if (age >= QD_STEP_TIMEOUT_MS) {
++			LOG("t=%u ms: wds: set IP family: %s after 20 s, going on", qd_now, qd_sent ? "no answer" : "no WDS service");
++			qd_go(QD_START_WAIT);
++		}
++		break;
++	case QD_START_WAIT:
++		if (!qd_wds_have) {
++			break;
++		}
++		if (n_on && !qd_nas_reg) {
++			if (!qd_wait_logged) {
++				qd_wait_logged = true;
++				LOG("t=%u ms: wds: waiting for NAS registered + PS attached before starting the session", qd_now);
++			}
++			break;
++		}
++		if (qd_last_start_ms == 0 || qd_now - qd_last_start_ms >= QD_START_RETRY_MS) {
++			qd_go(QD_START);
++			qd_send_start();
++		}
++		break;
++	case QD_START:
++		if (age >= QD_STEP_TIMEOUT_MS) {
++			LOG("t=%u ms: wds: no answer to start after 20 s", qd_now);
++			qd_last_start_ms = qd_now;
++			qd_go(QD_START_WAIT);
++		}
++		break;
++	case QD_SETTINGS:
++		if (!qd_sent) {
++			qd_send_runtime();
++		} else if (age >= QD_STEP_TIMEOUT_MS) {
++			qd_sent = false;
++			qd_state_ms = qd_now;
++		}
++		break;
++	case QD_UP:
++		if (qd_now - qd_last_poll_ms >= QD_STATUS_POLL_MS) {
++			qd_last_poll_ms = qd_now;
++			qd_req(PORT_WDSC, qd_wds_node, qd_wds_port, QD_WDS_PKT_STATUS, NULL, 0);
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++/* spes_modem_thread, after spes_ipa_init()/spes_cell_init() and before modem_boot() */
++static void
++qd_gate_init(void)
++{
++	uint32_t data = 0, ro = 0, mux = 1;
++
++	(void)PE_parse_boot_argn("modem_ipa_data", &data, sizeof(data));
++	if (data != 1) {
++		return;                                 /* existing boots: no new behaviour, not even a log line */
++	}
++	(void)PE_parse_boot_argn("modem_ipa_readonly", &ro, sizeof(ro));
++	if (ro == 1) {
++		LOG("ipa-qmi: modem_ipa_readonly=1: QMI data control stays off");
++		return;
++	}
++	if (!spes_ipa_ready()) {
++		LOG("ipa-qmi: IPA not ready: QMI data control stays off");
++		return;
++	}
++	(void)PE_parse_boot_argn("modem_ipa_mux", &mux, sizeof(mux));   /* same boot-arg as the IPA draft's TX mux */
++	if (mux < 1 || mux > 254) {
++		mux = 1;
++	}
++	qd_mux = (uint8_t)mux;
++	bzero(qd_apn, sizeof(qd_apn));
++	qd_apn_len = 0;
++	if (PE_parse_boot_arg_str("modem_apn", qd_apn, sizeof(qd_apn)) && qd_apn[0] != 0) {
++		size_t al = strnlen(qd_apn, sizeof(qd_apn) - 1);
++		bool good = true;
++		for (size_t i = 0; i < al; i++) {
++			char ch = qd_apn[i];
++			good = good && ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '-');
++		}
++		if (good) {
++			qd_apn_len = al;
++		} else {
++			LOG("wds: modem_apn has characters outside [A-Za-z0-9.-]: ignored, SIM default profile used");
++			bzero(qd_apn, sizeof(qd_apn));
++		}
++	}
++	qd_on = true;
++	LOG("ipa-qmi: QMI data control on (mux %u, %s, APN length %u)", qd_mux,
++	    qd_apn_len != 0 ? "APN from modem_apn" : "SIM default profile", (unsigned)qd_apn_len);
++}
++
+ static bool
+ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *data, uint32_t len)
+ {
+@@ -6395,6 +7120,11 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+ 		dms_rx(data, len);
+ 		return true;
+ 	}
++	if (qd_on && (dst_port == PORT_IPAH || dst_port == PORT_IPAC || dst_port == PORT_WDSC || dst_port == PORT_WDAC ||
++	    dst_port == PORT_DPMC)) {
++		qd_rx(src_node, src_port, dst_port, data, len);
++		return true;
++	}
+ 	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
+ 		return tftp_session(dst_port, data, len);
+ 	}
+@@ -6488,6 +7218,7 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 					memcpy(buf, why, MIN(sz, (uint32_t)sizeof(buf) - 1));
+ 				}
+ 				LOG("modem crash reason: %s", why != NULL ? buf : "(none)");
++				qd_modem_gone();                /* QMI data: en1 session down (nothing without the gate) */
+ 				if (glink) {
+ 					glink_summary();
+ 				}
+@@ -6497,13 +7228,16 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 		if (ipa_in != NULL && ipa_out != NULL && *ipa_in != ipa_last) {
+ 			uint32_t v = *ipa_in;
+ 			if ((v & 1) && !(ipa_last != ~0u && (ipa_last & 1))) {
+-				*ipa_out = 1;                   /* answer valid, AP IPA power off */
++				/* answer valid, AP IPA power off; QMI data gate: bit 1 = our IPA clock vote is held (Linux ipa_smp2p.c) */
++				uint32_t ans = qd_on ? (spes_ipa_clock_on() ? 3u : 1u) : 1u;
++				*ipa_out = ans;
+ 				smp2p_kick();
+-				LOG("t=%u ms: answered IPA power query (%08x)", ms, v);
++				LOG("t=%u ms: answered IPA power query (%08x) with %u", ms, v, ans);
+ 			}
+ 			ipa_last = v;
+ 		}
+ 		nas_tick(ms);                           /* 0200, modem_nas=1 */
++		qd_tick(ms);                            /* QMI data, modem_ipa_data=1 (gate) */
+ 		IOSleep(1);
+ 	}
+ 	LOG("watch done: slave-kernel %08x, %s", sk_last, ready ? "READY" : "NOT ready");
+@@ -6814,6 +7548,7 @@ spes_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 		 * the read-only probe). Nothing happens without the boot-arg. */
+ 		(void)spes_ipa_init();
+ 		(void)spes_cell_init();                 /* 0211: en1 (modem_cell=1/2); nothing without the boot-arg */
++		qd_gate_init();                         /* QMI data control: gate decided once, before the modem boots */
+ 	}
+ 	if (modem_boot()) {
+ 		modem_watch(smem_partition(0, 1), watch);
