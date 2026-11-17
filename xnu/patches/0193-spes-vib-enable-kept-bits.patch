@@ -1,0 +1,63 @@
+spes vibration: check only the ENABLE_CONTROL bits this LPG channel keeps (0193).
+
+vib-2 (spesvib=3, 2026-11-17): every LPG write read back as written except ENABLE_CONTROL: 0x84 read
+back 0x80. On this channel (type 0x13, SUBTYPE_PWM 0x0b, no LUT) bit 2 (PWM source select) is not
+kept; the output bit 7 is. Linux pwm-qti-lpg.c writes the same masked value and never reads it back.
+The driver stopped as designed, switched the output off and restored 0xb341-0xb346 (log: equal to
+before). Now the read-back compares bits 7 and 1 only (SPES_LPG_ENABLE_KEPT 0x82); the off-write is
+not compared at all (the restore pass checks every register afterwards).
+
+diff --git a/bsd/dev/spes_lpg.h b/bsd/dev/spes_lpg.h
+index 48fa461..01224dc 100644
+--- a/bsd/dev/spes_lpg.h
++++ b/bsd/dev/spes_lpg.h
+@@ -36,6 +36,7 @@
+ #define SPES_LPG_ENABLE_MASK    0x86u
+ #define SPES_LPG_ENABLE_ON      0x84u       /* output on, source = PWM value, no ramp */
+ #define SPES_LPG_ENABLE_OFF     0x04u       /* output off, source = PWM value (Linux disable) */
++#define SPES_LPG_ENABLE_KEPT    0x82u       /* bits this channel keeps (0193: bit 2 reads 0 on SUBTYPE_PWM) */
+ 
+ #define SPES_VIB_MAX_MS         100u        /* longest buzz this driver allows */
+ 
+diff --git a/bsd/dev/spes_vib.c b/bsd/dev/spes_vib.c
+index 52d89a7..0fd0267 100644
+--- a/bsd/dev/spes_vib.c
++++ b/bsd/dev/spes_vib.c
+@@ -161,13 +161,35 @@ spes_vib_lpg_run(uint32_t buzz_ms)
+ 	err = err ? err : lpg_put(SPES_LPG_VALUE_LSB, (uint8_t)(SPES_LPG_VALUE & 0xff), true);
+ 	err = err ? err : lpg_put(SPES_LPG_SYNC, 0x01, false);       /* self-clearing strobe */
+ 	err = err ? err : lpg_masked(SPES_LPG_TYPE_CONFIG, SPES_LPG_GLITCH_BIT, SPES_LPG_GLITCH_BIT);
+-	err = err ? err : lpg_masked(SPES_LPG_ENABLE, SPES_LPG_ENABLE_MASK, SPES_LPG_ENABLE_ON);
++	/*
++	 * 0193: this channel (SUBTYPE_PWM, no LUT) does not keep ENABLE_CONTROL bit 2 (PWM source
++	 * select): 0x84 reads back 0x80 (vib-2, 2026-11-17). Linux writes the same masked value and
++	 * never reads it back. Check only the bits that exist here: output (7) and ramp (1).
++	 */
++	if (!err) {
++		uint8_t old = 0, back = 0xff;
++		uint8_t want = spes_lpg_masked(0, SPES_LPG_ENABLE_MASK, SPES_LPG_ENABLE_ON);
++		err = sweet_spmi_read(SPES_LPG_SID, SPES_LPG_ENABLE, &old) != 0 ? -1 : 0;
++		want = spes_lpg_masked(old, SPES_LPG_ENABLE_MASK, SPES_LPG_ENABLE_ON);
++		err = err ? err : lpg_put(SPES_LPG_ENABLE, want, false);
++		err = err ? err : (sweet_spmi_read(SPES_LPG_SID, SPES_LPG_ENABLE, &back) != 0 ? -1 : 0);
++		if (!err && (back & SPES_LPG_ENABLE_KEPT) != (want & SPES_LPG_ENABLE_KEPT)) {
++			printf("SPES VIB: write %#x = %#04x, read back %#04x (bits %#x differ)\n", SPES_LPG_ENABLE,
++			    want, back, SPES_LPG_ENABLE_KEPT);
++			err = -1;
++		}
++	}
+ 	lpg_log(err ? "after a FAILED write" : "PWM on (9 bit, 19.2 MHz, value 435)");
+ 	if (!err && buzz_ms != 0) {
+ 		vib_gpio_pulse(spes_vib_clamp_ms(buzz_ms));
+ 	}
+ 	/* off, then every register back to what it was */
+-	(void)lpg_masked(SPES_LPG_ENABLE, SPES_LPG_ENABLE_MASK, SPES_LPG_ENABLE_OFF);
++	{
++		uint8_t old = 0;
++		if (sweet_spmi_read(SPES_LPG_SID, SPES_LPG_ENABLE, &old) == 0) {
++			(void)lpg_put(SPES_LPG_ENABLE, spes_lpg_masked(old, SPES_LPG_ENABLE_MASK, SPES_LPG_ENABLE_OFF), false);
++		}
++	}
+ 	(void)lpg_put(SPES_LPG_TYPE_CONFIG, orig[3], true);
+ 	(void)lpg_put(SPES_LPG_PREDIV_CLK, orig[2], true);
+ 	(void)lpg_put(SPES_LPG_SIZE_CLK, orig[1], true);
