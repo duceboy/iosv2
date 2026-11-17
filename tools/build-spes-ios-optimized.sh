@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 [[ -f "$kernel" && -f "$fdt" ]] || { echo 'Kernel or live FDT missing' >&2; exit 1; }
 
 mkdir -p shim/out
-python3 tools/mkadt.py "shim/out/$name.adt" --device spes --memory-dtb "$fdt"
+python3 tools/mkadt.py "shim/out/$name.adt" --device spes --memory-dtb "$fdt" ${SPES_MEMORY_FLOOR:+--memory-floor "$SPES_MEMORY_FLOOR"}
 
 python3 tools/mkpayload.py "$kernel" "shim/out/$name.adt" "shim/out/$name.payload" \
     --cmdline 'debug=0xc serial=3 cpus=4 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 ufsroot=userdata unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin wdt=-1 ufsrw=1 rootrw=1 sweetlog=1 ufslogsecs=10 sweettouch=1 sweettouchdelay=5 sweettouchdiag=3 sweetkeys=0 sweethw=0 sweetfb_stayon=1 sweetfb_noconsole=1 sweetfb_hz=60'

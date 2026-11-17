@@ -265,6 +265,9 @@ if __name__ == '__main__':
     ap.add_argument('out')
     ap.add_argument('--device', choices=['topaz', 'spes'], default='topaz')
     ap.add_argument('--memory-dtb', help='live /sys/firmware/fdt (stock images have no RAM map)')
+    ap.add_argument('--memory-floor', type=lambda v: int(v, 0), default=None,
+                    help='spes only, off by default: also use RAM below 4 GiB, from this address '
+                         '(e.g. 0xa0000000 for a 4 GB spesn; see tools/spes_memory.py)')
     ap.add_argument('--dump', action='store_true')
     ap.add_argument('--qemu', action='store_true')
     ap.add_argument('--highmem', action='store_true')
@@ -273,7 +276,13 @@ if __name__ == '__main__':
         memory = None
         if args.memory_dtb:
             from spes_memory import select_memory
-            memory = select_memory(open(args.memory_dtb, 'rb').read())
+            if args.memory_floor is None:
+                memory = select_memory(open(args.memory_dtb, 'rb').read())
+            else:
+                memory = select_memory(open(args.memory_dtb, 'rb').read(), floor=args.memory_floor)
+                print(f'spes RAM with floor {args.memory_floor:#x}: {memory[0]:#x}+{memory[1]:#x}', file=sys.stderr)
+        if args.memory_floor is not None and (args.device != 'spes' or not args.memory_dtb):
+            raise ValueError('--memory-floor needs --device spes and --memory-dtb')
         root = build(qemu=args.qemu, highmem=args.highmem, device=args.device, memory=memory)
     except ValueError as e:
         ap.error(str(e))

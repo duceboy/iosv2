@@ -29,12 +29,14 @@ case "$profile" in
     wifi) extra=' spestouchprobe=1 modem=1 wifi=1 modem_watch=30 sweettouchdelay=5'; touch=1; name=spes-wifi-probe ;;
     *) echo "Unknown diagnostic profile: $profile" >&2; exit 2 ;;
 esac
+# SPES_MEMORY_FLOOR=0xa0000000 (0174, 4 GB spesn): RAM below 4 GiB too; own image name.
+name="$name${SPES_MEMORY_FLOOR:+-floor$SPES_MEMORY_FLOOR}"
 kernel=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1")
 live_fdt=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$2")
 cd "$(dirname "$0")/.."
 [ -f "$kernel" ] && [ -f "$live_fdt" ] || { echo 'Kernel or live FDT missing' >&2; exit 1; }
 mkdir -p shim/out
-python3 tools/mkadt.py shim/out/spes.adt --device spes --memory-dtb "$live_fdt"
+python3 tools/mkadt.py shim/out/spes.adt --device spes --memory-dtb "$live_fdt" ${SPES_MEMORY_FLOOR:+--memory-floor "$SPES_MEMORY_FLOOR"}
 clang -target arm64-apple-ios16.0 -mcpu=cortex-a53 -c tools/sweet-init.S -o shim/out/spes-init.o
 python3 tools/mkinit.py shim/out/spes-init.o shim/out/spes-init
 python3 tools/mkpayload.py "$kernel" shim/out/spes.adt "shim/out/$name.payload" \

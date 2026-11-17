@@ -47,6 +47,29 @@ class SpesTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             select_memory(fdt([(0x100000000, 0x80000000)])[:-1])
 
+    # Synthetic 4 GB khaje-style map (not from a real phone): a low bank, then two touching banks
+    # listed out of order, as a Qualcomm ABL does.
+    SPESN = [(0x40000000, 0x3c000000), (0xc0000000, 0x80000000), (0x80000000, 0x40000000)]
+
+    def test_spesn_default_unchanged_above_4g(self):
+        self.assertEqual(select_memory(fdt(self.SPESN)), (0x100000000, 0x40000000))
+
+    def test_spesn_floor_merges_touching_banks(self):
+        self.assertEqual(select_memory(fdt(self.SPESN), floor=0xa0000000), (0xa0000000, 0xa0000000))
+
+    def test_floor_bounds(self):
+        for bad in (0x90000000, 0x9e000000, 0xa0001000, 0x120000000):
+            with self.assertRaises(ValueError):
+                select_memory(fdt(self.SPESN), floor=bad)
+
+    def test_floor_respects_reservations(self):
+        got = select_memory(fdt(self.SPESN, [(0xe0000000, 0x1000000)]), floor=0xa0000000)
+        self.assertEqual(got, (0xe2000000, 0x5e000000))
+
+    def test_floor_explicit_4g_is_default(self):
+        six = [(0x80000000, 0x80000000), (0x100000000, 0xfcc00000)]
+        self.assertEqual(select_memory(fdt(six), floor=0x100000000), select_memory(fdt(six)))
+
     def test_spes_requires_verified_memory(self):
         with self.assertRaises(ValueError): mkadt.build(device='spes')
         with self.assertRaises(ValueError): mkadt.build(device='spes', highmem=True, memory=(0x140000000, 0x80000000))

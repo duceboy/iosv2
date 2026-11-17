@@ -1,4 +1,5 @@
-"""Read a live khaje FDT and select contiguous RAM above 4 GiB for XNU.
+"""Read a live khaje FDT and select contiguous RAM above 4 GiB for XNU
+(or above an explicit lower floor, select_memory(floor=...), for 4 GB phones).
 
 Never infer physical RAM addresses from the advertised RAM capacity. Qualcomm
 ABL fills /memory; the placeholder in stock vendor_boot is deliberately rejected.
@@ -60,8 +61,30 @@ def parse(blob):
     raise ValueError('unterminated FDT reservations')
 
 
-def select_memory(blob):
+FOUR_GIB = 0x100000000
+# Lowest --memory-floor: above everything below that iosv2 uses by fixed physical address. None of
+# these regions is in the live FDT, so the floor has to keep XNU's RAM clear of them:
+#   0x80000000-0x86000000  ABL load area of the shim Image (+ payload)  NOTES.md, 0116
+#   0x90000000-0x9c000000  scanout pool, 12 x 16 MB (DSI buffer 0121)   SweetSurface.h (0116)
+#   0x9c000000-0x9d000000  SpesModem pool when 0xE0000000 is kernel RAM SpesModem.cpp (0174)
+# The default SpesModem pool 0xE0000000 is NOT excluded: 0174 moves it to 0x9c000000 by itself
+# when it lies in kernel RAM. Dynamic reserved-memory pools (size + alloc-ranges, no reg) are
+# Linux allocations (CMA, qseecom, secure display, ...); nothing allocates them under XNU.
+MIN_FLOOR = 0xa0000000
+IOSV2_FIXED = ((0x80000000, 0x06000000), (0x90000000, 0x0c000000), (0x9c000000, 0x01000000))
+
+
+def select_memory(blob, floor=FOUR_GIB):
+    """Largest aligned contiguous RAM range at or above floor (default 4 GiB, the tested layout).
+
+    floor < 4 GiB (mkadt.py --memory-floor, for 4 GB phones such as spesn) also admits RAM
+    below 4 GiB; it must be 32 MB aligned and at least MIN_FLOOR.
+    """
+    if floor != FOUR_GIB and (floor & 0x1ffffff or not MIN_FLOOR <= floor <= FOUR_GIB):
+        raise ValueError(f'memory floor {floor:#x}: 32 MB aligned, {MIN_FLOOR:#x}..{FOUR_GIB:#x}')
     nodes, reserved = parse(blob)
+    if floor < FOUR_GIB:
+        reserved = reserved + list(IOSV2_FIXED)
     root = nodes.get('', {})
     if b'qcom,khaje\0' not in root.get('compatible', b''):
         raise ValueError('expected a live khaje/spes device tree')
@@ -92,9 +115,18 @@ def select_memory(blob):
                 allocation = ranges(props.get('alloc-ranges', b''), rac, rsc)
                 if not allocation or any(b + s > 0x100000000 for b, s in allocation):
                     raise ValueError('unresolved dynamic reservation above 4 GiB')
+    if floor < FOUR_GIB:
+        # The ABL lists touching banks separately (spesn 4 GB: 0x80000000+1G, 0xc0000000+2G).
+        merged = []
+        for base, size in sorted(banks):
+            if merged and merged[-1][0] + merged[-1][1] == base:
+                merged[-1] = (merged[-1][0], merged[-1][1] + size)
+            else:
+                merged.append((base, size))
+        banks = merged
     candidates = []
     for base, size in banks:
-        spans = [(max(base, 0x100000000), min(base + size, 0x400000000))]
+        spans = [(max(base, floor), min(base + size, 0x400000000))]
         for rb, rs in reserved:
             spans = [(a, b) for lo, hi in spans for a, b in
                      ((lo, min(hi, rb)), (max(lo, rb + rs), hi)) if a < b]

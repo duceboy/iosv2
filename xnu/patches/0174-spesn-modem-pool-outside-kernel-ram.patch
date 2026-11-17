@@ -1,0 +1,94 @@
+spesn 4 GB (0174): SpesModem's pool leaves kernel RAM.
+
+tools/mkadt.py --memory-floor (off by default) can give XNU RAM below 4 GiB, e.g. 0xa0000000-
+0x140000000 on a 4 GB spesn. MODEM_POOL_BASE 0xE0000000 then lies inside kernel RAM and the
+modem/WLAN/ADSP buffers would overwrite kernel pages. The pool now moves to 0x9C000000 (behind the
+scanout pool, below 4 GiB and 0xF0000000) when the default overlaps gPhysBase..gPhysBase+gPhysSize;
+boot-arg spesmodempool=PA overrides; a pool inside kernel RAM, below 0x9C000000 or above
+0xF0000000 is refused (modem/audio then report "mappings failed"). The default layout (XNU above
+4 GiB) keeps 0xE0000000; the only difference there is one "SpesModem: pool ..." log line.
+
+diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
+index 201d3a9..756e5ad 100644
+--- a/iokit/Kernel/arm/SpesModem.cpp
++++ b/iokit/Kernel/arm/SpesModem.cpp
+@@ -46,6 +46,16 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ /* middle DDR bank, RAM the kernel does not manage; below 0xF0000000 for TZ/the modem */
+ #define MODEM_POOL_BASE     0xE0000000ull
+ #define MODEM_POOL_SIZE     0x01000000ull       /* 16 MB: metadata, SCM args, rmtfs, CE rings, WMI memory */
++/*
++ * 0174: where the pool goes when MODEM_POOL_BASE is RAM XNU manages. With mkadt.py --memory-floor
++ * (spesn 4 GB: XNU at 0xa0000000-0x140000000) 0xE0000000 is kernel RAM; the pool then sits right
++ * behind the scanout pool (SweetSurface.h: 0x90000000 + 12 x 16 MB = 0x9C000000), still below 4 GiB
++ * and below 0xF0000000. Unchanged default layout (XNU above 4 GiB): MODEM_POOL_BASE as before.
++ * Boot-arg spesmodempool=PA overrides both; any choice inside kernel RAM is refused.
++ */
++#define MODEM_POOL_LOW      0x9C000000ull
++#define MODEM_POOL_FLOOR    0x9C000000ull       /* below: ABL load area (to ~0x86000000), scanout pool */
++#define MODEM_POOL_CEIL     0xF0000000ull
+ 
+ #define SMEM_PA             0x46000000ull
+ #define SMEM_SIZE           0x00200000u
+@@ -83,7 +93,8 @@ struct smp2p_entry { char name[16]; uint32_t value; } __attribute__((packed));
+ static uint8_t *smem;                           /* write-combined */
+ static volatile uint8_t *apcs, *tcsr_mutex;     /* device */
+ static uint8_t *pool;
+-static IOLock *soc_lock;                        /* SMEM allocation and the pool, shared with SpesAudio.cpp */
++static uint64_t pool_base = MODEM_POOL_BASE;    /* physical; modem_pool_choose() */
++static IOLock *soc_lock;                       /* SMEM allocation and the pool, shared with SpesAudio.cpp */
+ static uint64_t pool_used;
+ 
+ static inline void mb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
+@@ -118,7 +129,7 @@ pool_alloc(uint64_t size, uint64_t *pa)
+ 		}
+ 		return NULL;
+ 	}
+-	*pa = MODEM_POOL_BASE + pool_used;
++	*pa = pool_base + pool_used;
+ 	void *va = pool + pool_used;
+ 	pool_used += size;
+ 	if (soc_lock != NULL) {
+@@ -128,6 +139,34 @@ pool_alloc(uint64_t size, uint64_t *pa)
+ 	return va;
+ }
+ 
++/* The pool's physical base: outside XNU's RAM (gPhysBase/gPhysSize), see MODEM_POOL_LOW. */
++static bool
++modem_pool_choose(void)
++{
++	extern unsigned long gPhysBase, gPhysSize;
++	const uint64_t ram_lo = gPhysBase, ram_hi = (uint64_t)gPhysBase + gPhysSize;
++	uint64_t base = MODEM_POOL_BASE, arg = 0;
++	const char *why = "default";
++
++	if (base < ram_hi && base + MODEM_POOL_SIZE > ram_lo) {
++		base = MODEM_POOL_LOW;
++		why = "kernel RAM covers the default";
++	}
++	if (PE_parse_boot_argn("spesmodempool", &arg, sizeof(arg))) {
++		base = arg;
++		why = "spesmodempool";
++	}
++	if ((base & 0xfffffull) != 0 || base < MODEM_POOL_FLOOR || base + MODEM_POOL_SIZE > MODEM_POOL_CEIL ||
++	    (base < ram_hi && base + MODEM_POOL_SIZE > ram_lo)) {
++		LOG("pool %#llx (%s) refused: kernel RAM %#llx-%#llx, allowed %#llx-%#llx, 1 MB aligned",
++		    base, why, ram_lo, ram_hi, MODEM_POOL_FLOOR, MODEM_POOL_CEIL);
++		return false;
++	}
++	pool_base = base;
++	LOG("pool %#llx+%#llx (%s), kernel RAM %#llx-%#llx", base, MODEM_POOL_SIZE, why, ram_lo, ram_hi);
++	return true;
++}
++
+ /* ---------------------------------------------------------------- TrustZone */
+ 
+ static uint64_t
+@@ -6335,7 +6374,7 @@ spes_soc_map(void)
+ 		return false;
+ 	}
+ 	smem_map = map_phys(SMEM_PA, SMEM_SIZE, true);
+-	pool_map = map_phys(MODEM_POOL_BASE, MODEM_POOL_SIZE, true);
++	pool_map = modem_pool_choose() ? map_phys(pool_base, MODEM_POOL_SIZE, true) : NULL;
+ 	apcs = (volatile uint8_t *)ml_io_map(APCS_PA, 0x1000);
+ 	tcsr_mutex = (volatile uint8_t *)ml_io_map(TCSR_MUTEX_PA, 0x4000);
+ 	if (smem_map == NULL || pool_map == NULL || apcs == NULL || tcsr_mutex == NULL || soc_lock == NULL) {

@@ -17,7 +17,7 @@ extra=${SWEET_EXTRA_ARGS:-}
 wlan_mac=$(python3 tools/spes_wlan_mac.py "$fdt" 2>/dev/null || true)
 [[ -n "$wlan_mac" ]] && extra="${extra:+$extra }wlan_mac=$wlan_mac"
 mkdir -p shim/out
-python3 tools/mkadt.py shim/out/spes-ios-graphics.adt --device spes --memory-dtb "$fdt"
+python3 tools/mkadt.py shim/out/spes-ios-graphics.adt --device spes --memory-dtb "$fdt" ${SPES_MEMORY_FLOOR:+--memory-floor "$SPES_MEMORY_FLOOR"}
 # The development kernel uses OSX platform policy; allow iOS executables.
 # ignition_level=1 uses the cache merged into our single HFS root.
 python3 tools/mkpayload.py "$kernel" shim/out/spes-ios-graphics.adt shim/out/spes-ios-graphics-fixed.payload \
