@@ -1,44 +1,46 @@
-# What iOS 16 expects from an iPhone X and what spesn provides (gap list)
+# iOS-Lücken (erzeugt)
 
-Method (2026-11-17): instead of chasing single log lines, compare what iOS asks the hardware for with what
-the port answers. Sources:
-1. iOS unified log of a running boot: `/var/db/diagnostics` + `/var/db/uuidtext` pulled over SSH, laid out
-   as a `.logarchive` and read on the Mac with mandiant/macos-UnifiedLogs (`unifiedlog_iterator`). macOS
-   `log show` refuses the archive (missing metadata). Archives stay local (research/oslog, gitignored).
-2. Kernel IOKit trace (`IOK <proc>: matching ... -> none`) for SpringBoard/backboardd, also in the unified log.
-3. Reference: iPhone X device tree (research/ipsw-x/d22ap.adt) and the iOS 16.7.16 kernelcache: which
-   IOKit classes/properties exist on the real device.
+Erzeugt am 2026-11-17 von `tools/inventar/gen_luecken.py` aus der lokalen Inventar-Datenbank (iOS 16.7.16 für iPhone X: Kernel, Gerätebaum, dyld-Cache, Programme). Die Datenbank selbst bleibt lokal, weil sie aus Apple-Dateien abgeleitet ist; hier stehen nur Zahlen und eigene Beschreibungen.
 
-## Display pipeline (blocks smooth UI and app launches) — first priority
-- SpringBoard -> backboardd CoreAnimation commits fail: `Failed to send deferred commits ... (ipc/send)
-  invalid memory` (12x), `Failed to commit transaction` (2x); backboardd: `serialization error` (57x),
-  `decode_object - ptr = NULL, required_type = 49` (>60x). Apps reach "scene ready" in ~1 s, but their
-  layers are missing, so the user sees the icon zoom and taps again. Kernel side: MACH_SEND_INVALID_MEMORY
-  from the OOL copyin path -> 0194 logs which region and why.
-- SpringBoard: `Rejecting value: <null> For key: contents` (106x).
+## Gesamtzahlen
 
-## IOKit services iOS looks for and does not find (boot of 2026-11-17 13:3x)
-| Class / match | Asked by | Real iPhone X | Effect here |
-|---|---|---|---|
-| AGXAccelerator | backboardd, SpringBoard | Apple GPU driver | CA uses the redwood-gl path |
-| AppleM2ScalerCSCDriver | backboardd, SpringBoard | hardware scaler / colour conversion | scaling + 420v conversion on the CPU (slow; mediaserverd 420v) |
-| AppleJPEGDriver | SpringBoard | hardware JPEG | software JPEG |
-| AppleVXD375/390/393 | SpringBoard | video decoder | software video |
-| AppleH9CamIn / AppleH10CamIn | SpringBoard | camera ISP | no camera |
-| IONameMatch als | SpringBoard | ambient light sensor | no auto brightness |
-| IOPropertyMatch name=gyro | SpringBoard | gyro (SPU) | no rotation sensor |
-| IOPropertyMatch backlight-control | backboardd, SpringBoard | backlight node | brightness control |
-| AppleSPUTimesync | SpringBoard | sensor processor | — |
-| AppleCredentialManager, ApplePearlSEPDriver, /arm-io/pearl-sep | SpringBoard, backboardd | SEP / Face ID | no Face ID (not a goal) |
-| IONameMatch sdio / bluetooth | SpringBoard | BT/WLAN nodes | BT open |
-| IODeviceTree:/options | SpringBoard | NVRAM | — |
+| Größe | Wert |
+|---|---|
+| Kernel-Erweiterungen | 223 |
+| IOKit-Personalities | 830 |
+| Treiberklassen | 2357 |
+| Befehlstabellen / Befehle | 250 / 1996 |
+| Befehle mit zugeordneter Treiberklasse | 1110 |
+| Befehle mit Funktionsname aus dem Userland (Größen geprüft) | 293 |
+| Gerätebaum-Knoten (davon mit Treiber) | 259 (160) |
+| Hardware-Aufrufstellen im Userland (Cache + Programme) | 21111 |
+| launchd-Jobs | 492 |
 
-## Userland errors worth a driver (excerpt)
-- wifid/configd: `AppleNBindToInterfaceWithService: IOServiceOpen failed` (5x each); captive: `failed to get the Wi-Fi devices`.
-- deleted: `IOServiceGetMatchingService failed`; softwareupdateservicesd: `NANDSize: ... disk0 failed`.
-- findmydeviced: `IORegistryEntryFromPath returned MACH_PORT_NULL`.
-- healthd: no data subscription context (no cellular).
+## Je Funktion
 
-## Order
-1. OOL send failure (0194 diagnostic -> fix). 2. Re-measure launches/frame rate from the unified log
-(app_launch_measurement signposts, CA commit stalls). 3. Scaler/CSC fallback cost. 4. Sensors/backlight.
+| Funktion | Apple-Treiberklassen | davon mit Befehlen | Befehle | im Port | Stand im Port | Qualcomm-Baustein | Linux-Treiber | Vorlagen |
+|---|---|---|---|---|---|---|---|---|
+| Akku | 9 | 1 | 3 | 0 | teilweise (lesend, spesbattery=1) | SM5602 Fuel-Gauge @0x71 | drivers/power/supply/syv/sm5602_fuelgauge.c | ios-topaz 0091, iosv2 SweetBattery |
+| Anzeige | 42 | 1 | 59 | 4 | läuft (CPU-Kopie/Skalierung in Software, Helligkeit fest) | MDSS/DPU sde@5e00000, DSI0 k7_38_0c_0a, backlight über DSI-DCS | techpack/display (sde-kms, dsi-display, sde_rotator) | iosv2 SweetFramebuffer/Backlight |
+| Blitz | 4 | 0 | 0 | 0 | fehlt | PM6125 Flash-LED / aw2016 @0x64 (Status-LED) | drivers/leds/leds-qti-flash | keine |
+| Bluetooth | 10 | 0 | 0 | 0 | fehlt (bluetoothd startet ständig neu) | WCN3988 BT über UART QUP0 SE3, bt-sw-ctrl GPIO87 | drivers/bluetooth/btqca, msm_bt_power | HackiOS drivers/bt (Protokoll), Linux btqca |
+| Grafik | 139 | 4 | 213 | 2 | teilweise (GL ES über Mesa/EAGL, kein Metal) | Adreno 610 kgsl-3d0@5900000 | drivers/gpu/msm (kgsl) | iosv2 0156–0168 NegroniMetal, ios-flame Turnip/m2v, HackiOS hakios-metal |
+| Haptik | 16 | 3 | 8 | 0 | teilweise (Kernel-Stufe spesvib=4, keine iOS-Anbindung) | PM6125 LPG SID1 0xb300 + GPIO36 (lct-pwm-vibrator) | drivers/pwm/pwm-qti-lpg.c, drivers/leds/leds-qpnp-vibrator-pwm.c (lct-pwm-vibrator) | HackiOS drivers/haptic + audio_plugin Actuator |
+| Kamera | 41 | 5 | 118 | 1 | fehlt | CAMSS: CPAS, CSID, CSIPHY, CCI0; S5KJN1 50 MP, ISP (IFE) | techpack/camera-bengal (cam_cpas, cam_isp, cam_sensor_module, cam_ope) | HackiOS hakios.camera.c |
+| Laden | 56 | 1 | 36 | 0 | ABL-Einstellung (448 mA), keine eigene Steuerung (Freigabe nötig) | bq2589x/SYV690 @0x6a, sc8551 @0x66, rt1711h Typ-C @0x4e | drivers/power/supply/syv (bq2589x), cp_manager (sc8551) | ios-topaz 0148 |
+| Mikrofon | 46 | 3 | 14 | 0 | fehlt | WCD937x TX + VA-Makro | techpack/audio | HackiOS drivers/mic |
+| Mobilfunk | 61 | 3 | 105 | 0 | teilweise (Modem bootet, keine QMI-Brücke zu CommCenter) | MPSS (modem_b), QMI über SMD/GLINK, rmtfs | drivers/soc/qcom (qmi, glink, rmtfs), net/qrtr | HackiOS drivers/modem, docs/cellular.md, iosv2 SpesModem |
+| Ortung | 6 | 2 | 13 | 0 | fehlt | GNSS im MPSS (LOC QMI) | Modem-Firmware + QMI LOC | keine (Simulations-Schnittstelle von locationd prüfen) |
+| Schlaf | 35 | 0 | 0 | 0 | fehlt (kein Schlaf, Display bleibt an) | RPMh/PSCI cpu-idle, AOSS | drivers/soc/qcom, cpuidle | iosv2 SweetCPU |
+| Sensoren | 99 | 10 | 48 | 0 | fehlt | SSC/ADSP Sensoren (BMI160/ICM, AK09918, ALS/Prox stk3x1x) – sensors über ADSP-SSC | kein Linux-Treiber: Sensoren laufen im ADSP-SSC (Live-DTB ohne I2C-Sensor), Zugriff über QMI/sensors.ssc; Konfiguration research/spesn-vendor | keine |
+| Speicher | 53 | 2 | 26 | 2 | läuft (UFS, HFSX-Root) | UFS @4804000 | drivers/scsi/ufs | iosv2 sweet_ufs |
+| Tasten | 8 | 0 | 0 | 0 | teilweise (SweetHIDButtons) | PM6125 PON (Power, Leiser), GPIO Lauter | drivers/input/misc/qpnp-power-on | iosv2 |
+| Thermik | 62 | 3 | 30 | 0 | fehlt (nur Akku-Temperatur geloggt) | TSENS @4410000, PM6125 ADC (xo/pa therm) | drivers/thermal/qcom (tsens24xx), spmi-temp-alarm, iio/adc | keine |
+| Ton | 91 | 3 | 15 | 0 | fehlt (Verstärker-Init vorhanden) | ADSP (APR/GPR), WCD937x über SoundWire, Bolero rx/tx/va, aw87559 Verstärker @0x58/0x5b | techpack/audio (asoc, codecs/wcd937x, codecs/aw87xxx) | HackiOS audio_plugin.c, iosv2 spes_amp.c |
+| Touch | 42 | 3 | 11 | 0 | läuft (gelegentlich verlorene Abheben-Ereignisse?) | FocalTech ft3518 @I2C1 0x38, IRQ GPIO80, Reset GPIO86 | drivers/input/touchscreen/focaltech_touch | iosv2 sweet_touch.c |
+| USB | 237 | 6 | 130 | 1 | teilweise (Gerätemodus CDC-ECM für Diagnose, kein Apple-USB-Stack) | DWC3 @4e00000, HS-PHY 1613000 | drivers/usb/dwc3 | iosv2 0183, sweet 0072–0077 |
+| Uhrzeit | 10 | 0 | 0 | 0 | teilweise (Zeit über Netz/NTP?) | PM6125 RTC (SPMI) | drivers/rtc/rtc-pm8xxx | keine |
+| Video | 9 | 3 | 19 | 0 | fehlt (Software-Decoder, H264SW-Absturz bei 420v) | Venus vidc@5a00000 | techpack/video (msm_vidc) | keine |
+| WLAN | 189 | 2 | 9 | 1 | läuft (Auto-Join, DHCP, Safari) | WCN3988 über WCNSS/ath10k-snoc, wlan@c800000 | drivers/net/wireless/cnss2 + ath, icnss | iosv2 RedwoodWLAN |
+
+Hinweise: „Apple-Treiberklassen“ ist eine Namens-Zuordnung (Muster je Funktion), „Befehle“ stammen aus den Befehlstabellen im Kernel (Code). „im Port“ = gleichnamige Klasse im iosv2-Kernel. Details (Klassen, Befehle mit Namen, Gerätebaum-Knoten, aufrufende Daemons) im lokalen Bericht `research/inventar/FUNKTIONEN.md`.

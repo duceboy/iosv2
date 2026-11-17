@@ -5429,3 +5429,14 @@ fehlen darin (bräuchten Disassemblierung).
 Boot ool-3 (CI 44130310949, Kernel fbe9702d…): `SPES OOL: SpringBoard phys-copy fallback #0 len 0xab4794 kr 0 step 3` – die
 Kopie gelingt, kein OOL-Fehlschlag mehr. Nutzer: Fotos als erste App ~10 s weiß beim Laden, danach gehen **alle anderen Apps
 direkt auf**. Offen: schwarzer Balken oben beim App-Start (nur Notch-Bereich oder halbes Bild), Fotos-Erststart langsam.
+
+### 2026-11-17 ~21:00 – Vollinventar Teil A/B (AUFTRAG-INVENTAR-UND-METAL.md)
+
+Werkzeug `tools/inventar/` (eigener Code; Datenbank research/inventar/x11.db und Bericht research/inventar/FUNKTIONEN.md bleiben
+lokal). Kernel: 223 Kexts, 2357 Klassen, 830 Personalities, 250 Befehlstabellen/1996 Befehle (1110 einer Klasse zugeordnet),
+~500k Aufrufe mit Konstanten. Gerätebaum d22ap: 259 Knoten, 160 mit Treiber. Userland: 13 163 Aufrufstellen im dyld-Cache,
+11 468 in 2765 Programmen, 30k Entitlements, 492 launchd-Jobs. **293 Befehle haben über Größenvergleich einen Funktionsnamen**
+(z. B. Framebuffer: SwapBegin/SwapEnd/GetDisplaySize/SetBrightnessCorrection). Je Funktion (22) Qualcomm-Baustein, Linux-Treiber
+(Pfade im Xiaomi-Kernel geprüft), Stand im Port, Vorlagen → docs/IOS-LUECKEN.md (erzeugt, nur Zahlen/eigene Texte).
+Lehren: Kexts teils -O0 gebaut (Metaclass-Konstruktor über x0-Wrapper), Funktionsgrenzen nur über BL-Ziele/Vtables sicher;
+unifiedlog_iterator schreibt bei großem Archiv >36 GB JSON → künftig gefiltert. Teil D (anderes IPSW) noch offen.
