@@ -5328,3 +5328,10 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   The `vnode_open()` KPI ignores O_TRUNC (open1() truncates itself). 0188: `vnode_setsize(vp, 0)` after open,
   plus fsync/F_FULLFSYNC before "OK" and a double sync before reset.
 - Repair: 7-MiB block delta (launchd.plist without `-E`), before hashes checked, readback = after.
+
+## 2026-11-17 09:38 – MILESTONE: SSH into iOS over USB
+
+- Kernel with 0188 (CI 44046238505) + repaired launchd.plist: dropbear starts from launchd, generates an
+  ed25519 host key, "Pubkey auth succeeded for 'root'" from 192.168.7.1. Shell = dash, toybox applets in
+  /var/local/bin. Return to fastboot over USB 9 s after the command (double sync).
+- dropbear's default PATH lacks /var/local/bin; the Mac wrapper prefixes it (rebuild with DEFAULT_PATH later).
