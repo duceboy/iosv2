@@ -1,0 +1,133 @@
+spes PON restart reason (0185): read and log only; the one-register write allow-list, unused yet.
+
+Before any PMIC write for "reboot to fastboot" (ios-flame writes PON SOFT_RB_SPARE; Xiaomi's ABL ignored
+the IMEM cookie alone, run 2026-11-17: Mi-logo boot loop), this run only reads. sweet_spmi_read's
+allow-list gains the four PM6125 PON registers SID 0 0x801 (revision), 0x804 (type), 0x805 (subtype)
+and 0x88F (SOFT_RB_SPARE); with sweetusb=2 the USB start logs them and the value the write would use.
+bsd/dev/spes_spmi_allow.h holds the future write's checks, free of kernel headers so
+tests/test_spes_spmi_allow.py compiles it from this patch: spes_spmi_write_allowed() is true only for
+SID 0, 0x88F, length 1 (the user's allow-list); spes_pon_bootloader_value() keeps bit 0 and sets
+bits 7:1 to 2 (Linux qpnp_pon_set_restart_reason, PON gen2) and refuses any subtype other than 4/5.
+Sources: live FDT qcom,pm6125@0 qcom,power-on@800 (store-hard-reset-reason); Xiaomi qpnp-power-on.c
+(SOFT_RB_SPARE = base + 0x8F, GENMASK(7,1), reason << 1), qpnp-power-on.h (BOOTLOADER = 0x02).
+
+diff --git a/bsd/dev/spes_spmi_allow.h b/bsd/dev/spes_spmi_allow.h
+new file mode 100644
+index 0000000..dc08042
+--- /dev/null
++++ b/bsd/dev/spes_spmi_allow.h
+@@ -0,0 +1,38 @@
++/*
++ * PMIC (SPMI) write allow-list for spes, kept free of kernel headers so tests/test_spes_spmi_allow.py
++ * compiles this very file on the host (0185).
++ *
++ * The user allowed exactly ONE register: PM6125 (SID 0) PON SOFT_RB_SPARE, 0x88F, one byte, for the
++ * "reboot to fastboot" reason. Live FDT: qcom,pm6125@0 (reg <0 0>) qcom,power-on@800 (reg 0x800 0x100,
++ * qcom,store-hard-reset-reason). Linux (Xiaomi qpnp-power-on.c): SOFT_RB_SPARE = base + 0x8F;
++ * PON_RESTART_REASON_BOOTLOADER = 0x02; PON gen2 (PERPH_SUBTYPE 0x805 = 4 or 5) writes GENMASK(7,1)
++ * with reason << 1. Everything else is refused.
++ */
++#ifndef SPES_SPMI_ALLOW_H
++#define SPES_SPMI_ALLOW_H
++
++#define SPES_PON_SID            0u
++#define SPES_PON_SOFT_RB_SPARE  0x88Fu
++#define SPES_PON_SUBTYPE        0x805u
++
++/* true only for SID 0, address 0x88F, exactly one byte. */
++static inline bool
++spes_spmi_write_allowed(uint32_t sid, uint32_t addr, uint32_t len)
++{
++	return sid == SPES_PON_SID && addr == SPES_PON_SOFT_RB_SPARE && len == 1;
++}
++
++/*
++ * The SOFT_RB_SPARE value for "bootloader" from the register's current value, as Linux's masked
++ * write: keep bit 0, bits 7:1 = 2. Only for PON gen2 (subtype 4 or 5); -1 = do not write.
++ */
++static inline int
++spes_pon_bootloader_value(uint8_t old, uint8_t subtype)
++{
++	if (subtype != 0x04 && subtype != 0x05) {
++		return -1;
++	}
++	return (int)((old & 0x01u) | (0x02u << 1));
++}
++
++#endif /* SPES_SPMI_ALLOW_H */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index f0a4677..7a2db02 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -12,6 +12,7 @@
+ #include <IOKit/IOLocks.h>
+ #include <pexpert/device_tree.h>
+ #include "sweet_spmi.h"
++#include "spes_spmi_allow.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+@@ -102,7 +103,9 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	bool battery = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
+ 	    peripheral == 0x13 || peripheral == 0x48);
+ 	bool lpg = sid == 1 && peripheral == 0xb3 && (addr & 0xffu) <= 0x47u;   /* 0180: PM6125 LPG, spesvib=2 */
+-	if (!sp_ready || !out || addr > 0xffffu || (!battery && !lpg)) {
++	/* 0185: PM6125 PON revision/type/subtype and SOFT_RB_SPARE, read only */
++	bool pon = sid == 0 && (addr == 0x801 || addr == 0x804 || addr == 0x805 || addr == 0x88F);
++	if (!sp_ready || !out || addr > 0xffffu || (!battery && !lpg && !pon)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -136,3 +139,30 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	return -1;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0185: log the PM6125 PON registers the "reboot to fastboot" reason would use, READ ONLY: revision
++ * (0x801), type (0x804), subtype (0x805; 4/5 = gen2) and SOFT_RB_SPARE (0x88F), plus the value the
++ * allow-listed write (spes_spmi_allow.h) would put there. Nothing is written in this patch.
++ */
++void spes_pon_log(void);
++void
++spes_pon_log(void)
++{
++	uint8_t rev = 0, type = 0, sub = 0, spare = 0;
++	if (sweet_spmi_init() != 0) {
++		printf("SPES PON: SPMI not available\n");
++		return;
++	}
++	bool ok = sweet_spmi_read(0, 0x801, &rev) == 0 && sweet_spmi_read(0, 0x804, &type) == 0 &&
++	    sweet_spmi_read(0, 0x805, &sub) == 0 && sweet_spmi_read(0, SPES_PON_SOFT_RB_SPARE, &spare) == 0;
++	if (!ok) {
++		printf("SPES PON: read failed\n");
++		return;
++	}
++	int want = spes_pon_bootloader_value(spare, sub);
++	printf("SPES PON: rev %#x type %#x subtype %#x (%s) SOFT_RB_SPARE 0x88f = %#x; bootloader value would be %s%#x\n",
++	    rev, type, sub, (sub == 4 || sub == 5) ? "gen2" : "not gen2", spare, want < 0 ? "none, " : "", want < 0 ? 0 : want);
++}
++#endif
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 469e27a..627e2fb 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -38,6 +38,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ extern bool spes_smmu_identity(uint32_t sid, uint32_t mask, const char *name);     /* SpesModem.cpp */
++extern void spes_pon_log(void);                                                     /* sweet_spmi.c */
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+@@ -128,6 +129,9 @@ sweet_usb_probe(void)
+ 	if (usb_soc.spes && enabled < 2) {
+ 		return;         /* 0183: on spes only an explicit sweetusb=2 (spesusb=1 is the read-only probe) */
+ 	}
++	if (usb_soc.spes) {
++		spes_pon_log();     /* 0185: PON restart-reason registers, read only */
++	}
+ 	vm_offset_t gcc = ml_io_map(usb_soc.gcc_pa, usb_soc.gcc_size);
+ 	if (gcc == 0) {
+ 		printf("SWEET USB: GCC map failed\n");
