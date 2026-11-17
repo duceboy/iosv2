@@ -54,6 +54,13 @@ On the iosv2 author's 6 GB spes the default gave `0x1_00000000` + 3 GiB (NOTES.m
 | 20 | dynamic reserved-memory pools (CMA, qseecom, secure display, adsp, dump) | below 4 GiB = not XNU's | now inside XNU's range; **assumed Linux-only allocations** (nothing allocates them under XNU) |
 | 21 | Qualcomm XPU/TZ protection of `0xa0000000-0xffffffff` | - | **unknown**. iosv2 used `0x90000000` (scanout, CPU + MDP) and `0xE0000000` (modem pool, CPU + TZ + modem) on spes without faults; no XNU RAM below 4 GiB was ever run on SM6225 |
 
+## Results
+
+- 2026-11-17 boot 1, default layout (`0x1_00000000` + 1 GiB): storage probe result=0, PID 1 running.
+- 2026-11-17 boot 2, `--memory-floor 0xa0000000`: shim `PHYS base=A0000000 size=A0000000`, PID 1
+  heartbeat (`SWEET init: still alive`). UFS probe line not captured. On this phone the ABL put the shim
+  Image at ~0x40080000 (`EMBED 0x400AD000`), below every RAM range considered here.
+
 ## Evidence check: "topaz starts at 0xb0000000" was wrong
 
 - topaz phone: upper bank `0x1_40000000` + 4 GiB (`docs/TOPAZ-UPSTREAM.md:17`, `mkadt.py --highmem`).

@@ -19,8 +19,15 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   read-only, DMA at 0x103430000` (author's phone: 0x2B8C00), md0 root, `*** SWEET userspace: init
   running as PID 1 ***`, AMFI/sandbox stand-ins load. Battery: static fallback (spesbattery off).
   The first screen (shim PHYS line) was not captured; the DMA address confirms RAM above 4 GiB.
-- Built, not booted yet: `shim/out/spes-storage-probe-floor0xa0000000.img` (SHA256 892f531f…843e,
-  phys 0xa0000000 + 2.5 GiB). Each `fastboot boot` is confirmed by the user individually.
+- **Boot 2 (observed, photo of the shim screen + final screen):** `shim/out/spes-storage-probe-floor0xa0000000.img`
+  (SHA256 892f531f…843e). Shim: ABL starts on Silver (MIDR 0x51AF8014, no 16K granule) -> hands off to
+  Gold 0x100; GIC/timer/SGI1 checks as on spes; **`EMBED 0x400AD000`** (on this phone the ABL loads the
+  shim Image at ~0x40080000, not ~0x80080000 as the author noted); **`PHYS base=A0000000 size=A0000000`**,
+  SEGS end 0xA25F0000, BOOTARG pa 0xA25F4000, JUMP 0xA14C9488. Screen then ends in repeated
+  `SWEET init: still alive` = PID 1 heartbeat. **So XNU with RAM 0xa0000000-0x140000000 (2.5 GiB,
+  partly below 4 GiB) boots to userspace on SM6225** (no XPU reset). Not seen: the UFS probe result and
+  its DMA address for this layout (screen not captured); not shown: that all 2.5 GiB are usable
+  (only the pages the kernel touched). Each `fastboot boot` is confirmed by the user individually.
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
