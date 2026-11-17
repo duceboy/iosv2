@@ -192,6 +192,12 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   chnls 0x1e00000 + 0x10000*apid) used by "fastboot": `SPES PON: SOFT_RB_SPARE 0 -> 0x4 (bootloader), read back
   OK`, IMEM cookie, PSCI reset -> **fastboot 8 s later**. Slots after every fastboot stay b / retry 6 / not
   unbootable (`bericht/fastboot-slots.log`). Live log still loses the boot backlog (sock_send succeeds before ARP).
+- **USB file server (0187, ios-flame 0091) works in the running iOS (2026-11-17 08:24):** automated loop
+  (`~/ios-spes/tools-local/run-usbtest.sh`, no buttons): graphics iOS image + `sweetusb=2` -> USB link 46 s
+  after boot, after 60 s MKDIR/PUT 256 KiB/GET/compare (ROUNDTRIP OK)/RM, `fastboot` back, slots b/6/no.
+  In the diagnostic ramdisk MKDIR /private/var/tmp gives ENOENT (no such tree there). Live log carries the whole
+  iOS run (236 KB). Seen: `SWEET SURF: backboardd create id 0 1105x1160 fmt 0x0 ... -> 0xe00002c2` (bad
+  argument) repeatedly - candidate for the app-open graphics glitches.
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
