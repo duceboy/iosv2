@@ -138,7 +138,8 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   right after `SWEET SURF: mediaserverd create ... 332x198 fmt 420v planes 2` (far in an r-x mapping -> the planar
   IOSurface mapping; to investigate), restarted. Display: first frames shown directly from scanout pool slots
   (0x90014450/0x91014450), then "frame copied by the processor" (slow path). Touch: 31470 frames, 6037 errors,
-  58 taps. Battery 15 samples temp_in 34 C.
+  58 taps. Battery 15 samples temp_in 34 C. **User: the status bar battery showed 100 %** -> 0173/0179 (SM5602 via
+  spes_i2c1, spesbattery=1) confirmed on hardware end to end (gauge -> SweetBattery -> IOPMPowerSource -> SpringBoard).
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
