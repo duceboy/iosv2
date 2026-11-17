@@ -5522,3 +5522,15 @@ soll aus launchd.plist (beim nächsten erreichbaren Boot). CI 44187398152.
   IOSurface-Client-Layout aus der Disassemblierung (IOSurfaceClientGet*OfPlane, 20H392): Ebene i im Lock-Ergebnis bei
   0x68+i*0x80, bytesPerRow bei +0x10 (wir hatten +0x08 → 0). **0209** setzt +0x10. CI 44188142821 (mit 0207/0208).
 - Kein Neustart ohne Nutzer: der laufende all-5-Kernel hat den DSP-Shutdown vor dem Reset (0207) noch nicht.
+
+### 2026-11-17 23:45 – 0210 IPA-Entwurf eingebunden (Lese-Stufe), Firmware aufs Telefon; syncdefaultsd/wifip2pd aus launchd
+
+- **0210** bsd/dev/spes_ipa.c (Entwurf eines Sub-Agenten nach HackiOS hakios.ipa.c + Linux v6.12 IPA 4.2; Bericht
+  docs/SPES-IPA-DRAFT.md): Aufruf in SpesModem vor modem_boot(); ohne `modem_ipa_data=1` passiert nichts; erster Lauf mit
+  `modem_ipa_readonly=1` (nur Takt-Vote + Lese-Probe FLAVOR_0/SHARED_MEM_SIZE). Offene Prüfpunkte: IPA-Takt (RPM „ipa“
+  100 MHz), Registerbasis 0x5840000 (abgeleitet), PAS-15-Laden, SMMU 0x140.
+- IPA-Firmware ipa_fws.mdt/.b00–.b04 nach /usr/share/firmware/spes/ipa/ auf dem Telefon (zurückgelesen; nie ins Repo).
+- launchd.plist: zusätzlich wifip2pd (131 Neustarts/Boot) und syncdefaultsd (15 Abstürze/Boot) entfernt; Einträge in
+  research/userland-ssh/launchd/removed-jobs-20261117.plist (Rückweg: wieder einfügen).
+- CI 44188875852 = 0207–0210. Nächster Boot (wenn das Telefon ohne Hände nach Fastboot kann): `spesautofb=25`
+  `modem_ipa_data=1 modem_ipa_readonly=1` + bisherige Args.
