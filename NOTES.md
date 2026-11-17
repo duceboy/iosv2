@@ -24,7 +24,13 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   Gold 0x100; GIC/timer/SGI1 checks as on spes; **`EMBED 0x400AD000`** (on this phone the ABL loads the
   shim Image at ~0x40080000, not ~0x80080000 as the author noted); **`PHYS base=A0000000 size=A0000000`**,
   SEGS end 0xA25F0000, BOOTARG pa 0xA25F4000, JUMP 0xA14C9488. Screen then ends in repeated
-  `SWEET init: still alive` = PID 1 heartbeat. **So XNU with RAM 0xa0000000-0x140000000 (2.5 GiB,
+  `SWEET init: still alive` = PID 1 heartbeat. Confirmed by a video of a repeat run (user, 2026-11-17):
+  full shim screen as above, kernel `using 3228 buffer headers` (boot 1: 1261, scales with RAM),
+  CPU/display/framebuffer as boot 1, zone_init output, then a lasting heartbeat. **Not directly
+  documented: `SPES UFS PROBE: result=0`, `SWEET UFS: ... DMA at 0x...` and `init running as PID 1`**
+  (not filmed); PID 1 runs, so they ran, but a UFS DMA address below 4 GiB is NOT shown -> read it from
+  the first sweetlog run. **User decision: 0xa0000000 is the layout for all further spesn images**
+  (`SPES_MEMORY_FLOOR=0xa0000000`; the mkadt default stays unchanged). **So XNU with RAM 0xa0000000-0x140000000 (2.5 GiB,
   partly below 4 GiB) boots to userspace on SM6225** (no XPU reset). Not seen: the UFS probe result and
   its DMA address for this layout (screen not captured); not shown: that all 2.5 GiB are usable
   (only the pages the kernel touched). Each `fastboot boot` is confirmed by the user individually.
