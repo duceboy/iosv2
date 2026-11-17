@@ -1,0 +1,149 @@
+spes PON restart reason (0186): the one allow-listed PMIC write, used by "fastboot"; live-log fix.
+
+Run 2026-11-17 (0185, read only): PM6125 PON rev 0x1 type 0x1 subtype 0x4 (gen2 primary),
+SOFT_RB_SPARE 0x88F = 0x00 after ABL; bootloader value 0x04. sweet_spmi_write() writes one byte through
+the APID's read/write channel (arbiter v5, Linux spmi-pmic-arb.c: chnls 0x1e00000 + 0x10000 * apid,
+WDATA0 +0x10, command +0x00 EXT_WRITEL, status +0x08), only if spes_spmi_write_allowed() (SID 0, 0x88F,
+length 1; host-tested in 0185) and the ownership table gives the APID to the apps EE 0.
+spes_pon_set_bootloader() reads subtype and SOFT_RB_SPARE, writes spes_pon_bootloader_value() ((old &
+1) | 0x04, gen2 only) and reads it back. The USB "fastboot" command now sets it first and resets only
+if the read-back matches (then IMEM cookie + PSCI SYSTEM_RESET as before), else it replies "fastboot
+refused". Live log: a failed send no longer drops the chunk (the backlog before the Mac's en3 was up
+was lost).
+
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 7a2db02..86385d0 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -141,6 +141,95 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0186: the ONE allowed PMIC write (spes_spmi_allow.h: SID 0, 0x88F, 1 byte; user, 2026-11-17).
++ * Linux spmi-pmic-arb.c, arbiter v5: the read/write channel of an APID is chnls + 0x10000 * apid
++ * (live FDT qcom,spmi@1c40000 reg-name "chnls" = 0x1e00000); WDATA0 at +0x10, the command at +0x00
++ * ((opcode << 27) | (addr[7:0] << 4) | (bytes - 1), EXT_WRITEL = 0), status at +0x08 (bit 0 done,
++ * bits 1-3 failure/denied/dropped). Only when the ownership table (cnfg + 0x700 + 4 * apid, bits
++ * 2:0) gives the APID to the apps EE 0, as Linux checks write_ee.
++ */
++#define SP_KHAJE_CHNLS_PA 0x01e00000u
++
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
++int
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value)
++{
++	DTEntry platform;
++	if (!spes_spmi_write_allowed(sid, addr, 1)) {
++		printf("SWEET SPMI: write sid=%u addr=%#x refused (not allow-listed)\n", sid, addr);
++		return -1;
++	}
++	if (!sp_ready || SecureDTLookupEntry(NULL, "/spes-platform", &platform) != kSuccess) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	unsigned peripheral = addr >> 8;
++	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
++	if (apid == SP_NO_APID || sp_poisoned[apid]) {
++		IOLockUnlock(sp_lock);
++		printf("SWEET SPMI: write sid=%u addr=%#x: no usable APID\n", sid, addr);
++		return -1;
++	}
++	uint32_t owner = sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u;
++	if (owner != 0) {
++		IOLockUnlock(sp_lock);
++		printf("SWEET SPMI: write sid=%u addr=%#x: APID %u owned by EE %u, refused\n", sid, addr, apid, owner);
++		return -1;
++	}
++	vm_offset_t ch = ml_io_map(SP_KHAJE_CHNLS_PA + 0x10000u * apid, 0x1000);
++	if (ch == 0) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x10u) = value;                       /* WDATA0 */
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x00u) = (0u << 27) | ((addr & 0xffu) << 4) | 0u;   /* EXT_WRITEL, 1 byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(ch, 0x08u);
++		if (status & 1u) {
++			IOLockUnlock(sp_lock);
++			if (status & 0x0eu) {
++				printf("SWEET SPMI: write sid=%u addr=%#x status %#x (failed)\n", sid, addr, status);
++				return -1;
++			}
++			return 0;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	printf("SWEET SPMI: write timeout sid=%u addr=%#x APID=%u disabled\n", sid, addr, apid);
++	IOLockUnlock(sp_lock);
++	return -1;
++}
++
++/* 0186: PON SOFT_RB_SPARE = "bootloader" for the next reset, read back. 0 = set. */
++int spes_pon_set_bootloader(void);
++int
++spes_pon_set_bootloader(void)
++{
++	uint8_t sub = 0, spare = 0, back = 0xff;
++	if (sweet_spmi_init() != 0 || sweet_spmi_read(0, 0x805, &sub) != 0 ||
++	    sweet_spmi_read(0, SPES_PON_SOFT_RB_SPARE, &spare) != 0) {
++		printf("SPES PON: read failed, not set\n");
++		return -1;
++	}
++	int want = spes_pon_bootloader_value(spare, sub);
++	if (want < 0) {
++		printf("SPES PON: subtype %#x is not gen2, not set\n", sub);
++		return -1;
++	}
++	if (sweet_spmi_write(0, SPES_PON_SOFT_RB_SPARE, (uint8_t)want) != 0 ||
++	    sweet_spmi_read(0, SPES_PON_SOFT_RB_SPARE, &back) != 0 || back != (uint8_t)want) {
++		printf("SPES PON: SOFT_RB_SPARE %#x -> want %#x, read back %#x: NOT set\n", spare, want, back);
++		return -1;
++	}
++	printf("SPES PON: SOFT_RB_SPARE %#x -> %#x (bootloader), read back OK\n", spare, back);
++	return 0;
++}
++
+ /*
+  * 0185: log the PM6125 PON registers the "reboot to fastboot" reason would use, READ ONLY: revision
+  * (0x801), type (0x804), subtype (0x805; 4/5 = gen2) and SOFT_RB_SPARE (0x88F), plus the value the
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 627e2fb..8b0e2a6 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -39,6 +39,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ extern bool spes_smmu_identity(uint32_t sid, uint32_t mask, const char *name);     /* SpesModem.cpp */
+ extern void spes_pon_log(void);                                                     /* sweet_spmi.c */
++extern int spes_pon_set_bootloader(void);                                           /* sweet_spmi.c, 0186 */
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+@@ -859,6 +860,7 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			};
+ 			size_t sent = 0;
+ 			if (sock_send(so, &msg, 0, &sent) != 0) {
++				pos -= n;       /* 0186: keep it for the next try (the Mac's en3 may not be up yet) */
+ 				break;          /* no route/ARP yet: retry later */
+ 			}
+ 		}
+@@ -941,8 +943,13 @@ ud_cmd_thread(__unused void *arg, __unused wait_result_t wr)
+ 			reset = true;
+ 			reply = "rebooting\n";
+ 		} else if (strcmp(buf, "fastboot") == 0) {
+-			reset = bootloader = true;
+-			reply = "rebooting to fastboot\n";
++			/* 0186: the PMIC reason first (Xiaomi's ABL ignores the IMEM cookie alone); no reset without it */
++			if (usb_soc.spes && spes_pon_set_bootloader() != 0) {
++				reply = "fastboot refused: PON restart reason not set\n";
++			} else {
++				reset = bootloader = true;
++				reply = "rebooting to fastboot\n";
++			}
+ 		} else {
+ 			reply = "unknown command\n";
+ 		}
