@@ -1,0 +1,136 @@
+spes USB command server (0184): ping/sync/reboot/fastboot over UDP 5141 on ue0, no register pokes.
+
+After ios-flame 0089, but only four commands and only from 192.168.7.0/24 (the USB link); each datagram
+gets one reply line. reboot: sync_internal(), PSCI SYSTEM_RESET (0x84000009 over smc, the conduit
+SweetCPU's CPU_ON uses). fastboot: the same, but first the Linux restart reason "bootloader"
+(0x77665500) into IMEM restart_reason (live FDT qcom,msm-imem@c125000 restart_reason@65c = 0x0c12565c,
+SoC SRAM; the PMIC PON spare register that Linux also writes is NOT written). Whether Xiaomi's ABL
+honours the IMEM cookie alone is the test. On by default on spes (sweetusbcmd=0 off).
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index c271af0..469e27a 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -861,6 +861,111 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ }
+ 
++/*
++ * 0184: command server on UDP 5141 (ue0), after ios-flame 0089 but without its register pokes.
++ * Only datagrams from 192.168.7.0/24 (the USB link) are taken; each gets one reply line.
++ *   ping      -> pong
++ *   sync      -> filesystems flushed
++ *   reboot    -> sync, PSCI SYSTEM_RESET
++ *   fastboot  -> sync, restart reason "bootloader" (0x77665500) in IMEM restart_reason (live FDT
++ *                qcom,msm-imem@c125000 restart_reason@65c = 0x0c12565c, SoC SRAM, not the PMIC), reset
++ * Whether Xiaomi's ABL reads the IMEM cookie (Linux also writes the PMIC PON spare register, which
++ * is not done here) is what the first "fastboot" shows (docs/SPESN-USB-PLAN.md).
++ */
++extern int sync_internal(void);
++#define SPES_IMEM_PAGE          0x0c125000u
++#define SPES_IMEM_RESTART       0x65cu
++#define RESTART_BOOTLOADER      0x77665500u
++#define PSCI_SYSTEM_RESET       0x84000009ull
++
++static void __attribute__((noreturn))
++ud_psci_reset(void)
++{
++	register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_RESET;
++	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	for (;;) {
++		__asm__ volatile ("wfi");
++	}
++}
++
++static void
++ud_cmd_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	socket_t so = NULL;
++	struct sockaddr_in me;
++	char buf[128];
++
++	bzero(&me, sizeof(me));
++	me.sin_len = sizeof(me);
++	me.sin_family = AF_INET;
++	me.sin_port = htons(5141);
++	me.sin_addr.s_addr = htonl(INADDR_ANY);
++	if (sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0 ||
++	    sock_bind(so, (struct sockaddr *)&me) != 0) {
++		printf("SWEET USB: command server: no socket\n");
++		if (so != NULL) {
++			sock_close(so);
++		}
++		return;
++	}
++	printf("SWEET USB: command server on udp 5141 (ping, sync, reboot, fastboot)\n");
++	for (;;) {
++		struct sockaddr_in from;
++		struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) - 1 };
++		struct msghdr msg = { .msg_name = &from, .msg_namelen = sizeof(from), .msg_iov = &iov, .msg_iovlen = 1 };
++		size_t n = 0;
++		bzero(&from, sizeof(from));
++		if (sock_receive(so, &msg, 0, &n) != 0 || n == 0) {
++			ud_sleep_ms(100);
++			continue;
++		}
++		if ((ntohl(from.sin_addr.s_addr) & 0xffffff00u) != 0xc0a80700u) {
++			continue;                       /* only the USB link */
++		}
++		while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' || buf[n - 1] == ' ')) {
++			n--;
++		}
++		buf[n] = 0;
++		const char *reply;
++		bool reset = false, bootloader = false;
++		if (strcmp(buf, "ping") == 0) {
++			reply = "pong\n";
++		} else if (strcmp(buf, "sync") == 0) {
++			(void)sync_internal();
++			reply = "synced\n";
++		} else if (strcmp(buf, "reboot") == 0) {
++			reset = true;
++			reply = "rebooting\n";
++		} else if (strcmp(buf, "fastboot") == 0) {
++			reset = bootloader = true;
++			reply = "rebooting to fastboot\n";
++		} else {
++			reply = "unknown command\n";
++		}
++		printf("SWEET USB: command \"%s\" from 192.168.7.%u\n", buf, ntohl(from.sin_addr.s_addr) & 0xffu);
++		struct iovec riov = { .iov_base = (void *)(uintptr_t)reply, .iov_len = strlen(reply) };
++		struct msghdr rmsg = { .msg_name = &from, .msg_namelen = sizeof(from), .msg_iov = &riov, .msg_iovlen = 1 };
++		size_t sent = 0;
++		(void)sock_send(so, &rmsg, 0, &sent);
++		if (!reset) {
++			continue;
++		}
++		(void)sync_internal();
++		ud_sleep_ms(500);                   /* reply and last log lines out over USB */
++		if (bootloader) {
++			vm_offset_t imem = ml_io_map(SPES_IMEM_PAGE, 0x1000);
++			if (imem != 0 && usb_soc.spes) {
++				*(volatile uint32_t *)(imem + SPES_IMEM_RESTART) = RESTART_BOOTLOADER;
++				__asm__ volatile ("dsb sy" ::: "memory");
++				printf("SWEET USB: IMEM restart_reason %#x\n", *(volatile uint32_t *)(imem + SPES_IMEM_RESTART));
++			}
++		}
++		printf("SWEET USB: PSCI SYSTEM_RESET\n");
++		ud_sleep_ms(300);
++		ud_psci_reset();
++	}
++}
++
+ static void
+ sweet_usb_gadget_start(vm_offset_t dwc)
+ {
+@@ -950,5 +1055,10 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	int cmd = usb_soc.spes ? 1 : 0;     /* 0184: on by default on spes (USB link only) */
++	PE_parse_boot_argn("sweetusbcmd", &cmd, sizeof(cmd));
++	if (cmd && ud.ifp != NULL && kernel_thread_start(ud_cmd_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
