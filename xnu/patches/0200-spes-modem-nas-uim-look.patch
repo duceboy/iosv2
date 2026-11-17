@@ -1,0 +1,203 @@
+spes: read-only NAS/UIM look at the cellular side (0200, modem_nas=1).
+
+First step towards mobile data. Once the modem announces NAS (QMI 3) and UIM (QMI 0x0B) over QRTR, every
+30 s NAS Get Serving System (0x24) and Get Signal Strength (0x20), and once UIM Get Card Status (0x2F), from
+our own client ports 0x4005/0x4006 in SpesModem's poll loop. Logged: registration and attach states, radio
+technology, signal (dBm, LTE SNR), card and application states. Nothing is set; nothing identifying (IMSI,
+ICCID, IMEI, AIDs) is requested or logged.
+
+diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
+index 80a7e74..a728672 100644
+--- a/iokit/Kernel/arm/SpesModem.cpp
++++ b/iokit/Kernel/arm/SpesModem.cpp
+@@ -868,6 +868,11 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 			wlfw_arrive(c->c, c->d);
+ 		} else if (c->a != 0) {
+ 			LOG("t=%u ms: service %x:%x port %x %s", g_ms, c->a, c->b, c->d, svc_name(c->a));
++			if (c->a == 0x03 && n_node == 0) {          /* 0200 */
++				n_node = c->c; n_port = c->d;
++			} else if (c->a == 0x0B && u_node == 0) {
++				u_node = c->c; u_port = c->d;
++			}
+ 		}
+ 		break;
+ 	case QRTR_TYPE_DATA:
+@@ -6074,6 +6079,143 @@ svc_announce(void)
+ 	LOG("t=%u ms: announced pd-mapper 0x40, tftp 0x1000, rmtfs 0x0e", g_ms);
+ }
+ 
++
++/* ---------------------------------------------------------------- NAS / UIM look (0200, modem_nas=1) */
++
++/*
++ * Read-only look at the cellular side, the first step towards mobile data: every 30 s once the services
++ * are announced, NAS Get Serving System (0x24) and Get Signal Strength (0x20), and once UIM Get Card Status
++ * (0x2F). Logged: registration state, attach states, radio, signal in dBm, card and application states.
++ * Nothing is set, nothing identifying (no IMSI/ICCID/IMEI/AID) is asked for or logged.
++ */
++#define PORT_NASC           0x4005
++#define PORT_UIMC           0x4006
++static uint32_t n_node, n_port, u_node, u_port, n_last_ms;
++static uint16_t n_txn = 0x100;
++static bool n_on, u_asked;
++
++static void
++nq_send(uint32_t port_from, uint32_t node, uint32_t port, uint16_t msg)
++{
++	uint8_t b[7];
++	b[0] = QMI_REQ;
++	uint16_t t = n_txn++, l = 0;
++	memcpy(b + 1, &t, 2);
++	memcpy(b + 3, &msg, 2);
++	memcpy(b + 5, &l, 2);
++	qrtr_send(QRTR_TYPE_DATA, port_from, node, port, b, sizeof(b));
++}
++
++static const char *
++nas_rat(uint8_t r)
++{
++	switch (r) {
++	case 0: return "none"; case 1: return "cdma1x"; case 2: return "hdr"; case 4: return "gsm";
++	case 5: return "umts"; case 8: return "lte"; case 9: return "tdscdma"; case 12: return "nr5g";
++	default: return "?";
++	}
++}
++
++static void
++nas_tick(unsigned ms)
++{
++	if (!n_on) {
++		return;
++	}
++	if (u_node != 0 && !u_asked) {
++		u_asked = true;
++		nq_send(PORT_UIMC, u_node, u_port, 0x2F);
++	}
++	if (n_node != 0 && (n_last_ms == 0 || ms - n_last_ms >= 30000)) {
++		n_last_ms = ms ? ms : 1;
++		nq_send(PORT_NASC, n_node, n_port, 0x24);
++		nq_send(PORT_NASC, n_node, n_port, 0x20);
++	}
++}
++
++static void
++nas_rx(const uint8_t *d, uint32_t len)
++{
++	uint16_t msg = 0, l = 0, res = 0xffff, err = 0xffff;
++	if (len < 7) {
++		return;
++	}
++	memcpy(&msg, d + 3, 2);
++	const uint8_t *r = qm_find(d, len, 2, &l);
++	if (r != NULL && l >= 4) {
++		memcpy(&res, r, 2);
++		memcpy(&err, r + 2, 2);
++	}
++	if (res != 0) {
++		LOG("nas: msg %#x result %u error %u", msg, res, err);
++		return;
++	}
++	if (msg == 0x24) {
++		const uint8_t *v = qm_find(d, len, 1, &l);
++		if (v != NULL && l >= 5) {
++			static const char *reg[] = { "not registered", "registered", "searching", "denied", "unknown" };
++			char rats[48] = "";
++			for (unsigned i = 0; i < v[4] && 5 + i < l && i < 6; i++) {
++				strlcat(rats, nas_rat(v[5 + i]), sizeof(rats));
++				strlcat(rats, " ", sizeof(rats));
++			}
++			LOG("nas: %s, cs %s, ps %s, network type %u, radio %s", v[0] < 5 ? reg[v[0]] : "?",
++			    v[1] == 1 ? "attached" : (v[1] == 2 ? "detached" : "unknown"),
++			    v[2] == 1 ? "attached" : (v[2] == 2 ? "detached" : "unknown"), v[3], rats);
++		}
++	} else if (msg == 0x20) {
++		const uint8_t *v = qm_find(d, len, 1, &l);
++		if (v != NULL && l >= 2) {
++			LOG("nas: signal %d dBm (%s)", (int)(int8_t)v[0], nas_rat(v[1]));
++		}
++		const uint8_t *lte = qm_find(d, len, 0x16, &l);     /* LTE SNR, x0.1 dB */
++		if (lte != NULL && l >= 2) {
++			int16_t snr;
++			memcpy(&snr, lte, 2);
++			LOG("nas: lte snr %d.%d dB", snr / 10, (snr < 0 ? -snr : snr) % 10);
++		}
++	}
++}
++
++static void
++uim_rx(const uint8_t *d, uint32_t len)
++{
++	uint16_t msg = 0, l = 0, res = 0xffff, err = 0xffff;
++	if (len < 7) {
++		return;
++	}
++	memcpy(&msg, d + 3, 2);
++	const uint8_t *r = qm_find(d, len, 2, &l);
++	if (r != NULL && l >= 4) {
++		memcpy(&res, r, 2);
++		memcpy(&err, r + 2, 2);
++	}
++	if (msg != 0x2F || res != 0) {
++		LOG("uim: msg %#x result %u error %u", msg, res, err);
++		return;
++	}
++	const uint8_t *v = qm_find(d, len, 0x10, &l);
++	if (v == NULL || l < 9) {
++		LOG("uim: card status without the status TLV");
++		return;
++	}
++	unsigned slots = v[8], o = 9;
++	static const char *cs[] = { "absent", "present", "error" };
++	static const char *as[] = { "unknown", "detected", "pin1/upin required", "puk1 required", "perso", "pin1 blocked", "illegal", "ready" };
++	for (unsigned sl = 0; sl < slots && o + 6 <= l; sl++) {
++		unsigned card = v[o], napp = v[o + 5];
++		LOG("uim: slot %u card %s, %u application(s)", sl + 1, card < 3 ? cs[card] : "?", napp);
++		o += 6;
++		for (unsigned a = 0; a < napp && o + 2 <= l; a++) {
++			unsigned type = v[o], state = v[o + 1];
++			unsigned aidlen = (o + 4 < l) ? v[o + 4] : 0;     /* skip the AID itself */
++			LOG("uim:   app type %u state %s", type, state < 8 ? as[state] : "?");
++			o += 5 + aidlen;            /* type, state, perso state, perso feature, aid len, aid */
++			o += 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1;   /* upin flag, pin1 state, pin1/puk1 retries, pin2 state, pin2/puk2 retries */
++		}
++	}
++}
++
+ static bool
+ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *data, uint32_t len)
+ {
+@@ -6087,6 +6229,14 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+ 		wlfw_rx(data, len);
+ 		return true;
+ 	}
++	if (dst_port == PORT_NASC) {
++		nas_rx(data, len);
++		return true;
++	}
++	if (dst_port == PORT_UIMC) {
++		uim_rx(data, len);
++		return true;
++	}
+ 	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
+ 		return tftp_session(dst_port, data, len);
+ 	}
+@@ -6195,6 +6345,7 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 			}
+ 			ipa_last = v;
+ 		}
++		nas_tick(ms);                           /* 0200, modem_nas=1 */
+ 		IOSleep(1);
+ 	}
+ 	LOG("watch done: slave-kernel %08x, %s", sk_last, ready ? "READY" : "NOT ready");
+@@ -6382,6 +6533,11 @@ spes_soc_map(void)
+ 	state = -1;
+ 	soc_lock = IOLockAlloc();
+ 	(void)PE_parse_boot_argn("modem_part", fw_part, sizeof(fw_part));
++	{
++		int nas = 0;
++		(void)PE_parse_boot_argn("modem_nas", &nas, sizeof(nas));
++		n_on = nas == 1;                        /* 0200 */
++	}
+ 	/* sweet_ufs comes up with the root device; neither DSP is needed before that */
+ 	uint8_t probe[16];
+ 	int err = EAGAIN;
