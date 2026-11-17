@@ -1,0 +1,177 @@
+spes: countdown back to fastboot (spesautofb=N minutes) and DSP shutdown before a reset (0207).
+
+User's idea: a test boot should never run forever. spesautofb=N starts a thread that logs the countdown and after N
+minutes does what the USB "fastboot" command does (PON reason with read-back, bounded syncs, IMEM, PSCI reset); the reset
+path is now one function ud_reset() shared by both. all-5: the reset happened with the modem and ADSP up but fastboot never
+appeared; Linux stops its remoteprocs on reboot, so ud_reset() now asks TrustZone for PAS shutdown of the modem (if it was
+booted) and the ADSP first (spes_dsps_shutdown in SpesModem.cpp).
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 41fbaab..46583ac 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -921,6 +921,70 @@ ud_sync_thread(void *arg __unused, wait_result_t w __unused)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* 0207: the reset path of the "fastboot"/"reboot" commands, shared with the countdown (spesautofb=) */
++static void
++ud_reset(bool bootloader)
++{
++	/*
++	 * 0188: twice, with time for HFS's journal and the UFS cache in between. 0205: on a helper
++	 * thread, waited for at most 8 s: with the ADSP and the modem up (all-1, all-3) the command
++	 * thread never came back from sync_internal() and the phone never reset.
++	 */
++	ud_sync_done = 0;
++	{
++		thread_t st;
++		if (kernel_thread_start(ud_sync_thread, NULL, &st) == KERN_SUCCESS) {
++			thread_deallocate(st);
++			for (int w = 0; w < 80 && !ud_sync_done; w++) {
++				ud_sleep_ms(100);
++			}
++		}
++	}
++	printf("SWEET USB: sync %s\n", ud_sync_done ? "done" : "still running after 8 s: resetting anyway");
++	ud_sleep_ms(500);                   /* reply and last log lines out over USB */
++	if (bootloader) {
++		vm_offset_t imem = ml_io_map(SPES_IMEM_PAGE, 0x1000);
++		if (imem != 0 && usb_soc.spes) {
++			*(volatile uint32_t *)(imem + SPES_IMEM_RESTART) = RESTART_BOOTLOADER;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			printf("SWEET USB: IMEM restart_reason %#x\n", *(volatile uint32_t *)(imem + SPES_IMEM_RESTART));
++		}
++	}
++	/* 0207: shut the modem and the ADSP down first (Linux stops its remoteprocs on reboot); all-5 reset with both up
++	 * but never reached fastboot */
++	{
++		extern void spes_dsps_shutdown(void);
++		spes_dsps_shutdown();
++	}
++	printf("SWEET USB: PSCI SYSTEM_RESET\n");
++	ud_sleep_ms(300);
++	ud_psci_reset();
++}
++
++/*
++ * 0207, spesautofb=N: after N minutes of running, go to fastboot by itself (PON reason, bounded syncs, reset), so a
++ * test boot never runs forever and the next one needs no hands (user's idea, 2026-11-17). 0 = off.
++ */
++static void
++ud_autofb_thread(void *arg __unused, wait_result_t w __unused)
++{
++	uint32_t minutes = (uint32_t)(uintptr_t)arg;
++	for (uint32_t m = 0; m < minutes; m++) {
++		if (minutes - m <= 3 || (minutes - m) % 10 == 0) {
++			printf("SWEET USB: countdown: fastboot in %u min\n", minutes - m);
++		}
++		ud_sleep_ms(60000);
++	}
++	printf("SWEET USB: countdown over: going to fastboot\n");
++	if (usb_soc.spes && spes_pon_set_bootloader() != 0) {
++		printf("SWEET USB: countdown: PON reason not set, no reset\n");
++		(void)thread_terminate(current_thread());
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	ud_reset(true);
++}
++
++
+ static void
+ ud_cmd_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -988,34 +1052,7 @@ ud_cmd_thread(__unused void *arg, __unused wait_result_t wr)
+ 		if (!reset) {
+ 			continue;
+ 		}
+-		/*
+-		 * 0188: twice, with time for HFS's journal and the UFS cache in between. 0205: on a helper
+-		 * thread, waited for at most 8 s: with the ADSP and the modem up (all-1, all-3) the command
+-		 * thread never came back from sync_internal() and the phone never reset.
+-		 */
+-		ud_sync_done = 0;
+-		{
+-			thread_t st;
+-			if (kernel_thread_start(ud_sync_thread, NULL, &st) == KERN_SUCCESS) {
+-				thread_deallocate(st);
+-				for (int w = 0; w < 80 && !ud_sync_done; w++) {
+-					ud_sleep_ms(100);
+-				}
+-			}
+-		}
+-		printf("SWEET USB: sync %s\n", ud_sync_done ? "done" : "still running after 8 s: resetting anyway");
+-		ud_sleep_ms(500);                   /* reply and last log lines out over USB */
+-		if (bootloader) {
+-			vm_offset_t imem = ml_io_map(SPES_IMEM_PAGE, 0x1000);
+-			if (imem != 0 && usb_soc.spes) {
+-				*(volatile uint32_t *)(imem + SPES_IMEM_RESTART) = RESTART_BOOTLOADER;
+-				__asm__ volatile ("dsb sy" ::: "memory");
+-				printf("SWEET USB: IMEM restart_reason %#x\n", *(volatile uint32_t *)(imem + SPES_IMEM_RESTART));
+-			}
+-		}
+-		printf("SWEET USB: PSCI SYSTEM_RESET\n");
+-		ud_sleep_ms(300);
+-		ud_psci_reset();
++		ud_reset(bootloader);
+ 	}
+ }
+ 
+@@ -1119,5 +1156,12 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (cmd && ud.ifp != NULL && kernel_thread_start(ud_cmd_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	uint32_t autofb = 0;                /* 0207 */
++	PE_parse_boot_argn("spesautofb", &autofb, sizeof(autofb));
++	if (autofb != 0 && usb_soc.spes &&
++	    kernel_thread_start(ud_autofb_thread, (void *)(uintptr_t)autofb, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("SWEET USB: countdown armed: fastboot after %u min\n", autofb);
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SpesModem.cpp b/iokit/Kernel/arm/SpesModem.cpp
+index da799eb..dddf3c7 100644
+--- a/iokit/Kernel/arm/SpesModem.cpp
++++ b/iokit/Kernel/arm/SpesModem.cpp
+@@ -565,6 +565,7 @@ static bool q_hello_sent, q_hello_rx, q_announced;
+ static struct { uint32_t svc, inst, node, port; } q_srv[64];
+ static unsigned q_srv_count, g_rx_msgs, g_tx_msgs, q_resumes;
+ static unsigned g_ms;                           /* watch time, for the log */
++static bool g_modem_up;                         /* 0207: PAS-booted, shut down before a reset */
+ static uint32_t n_node, n_port, u_node, u_port;    /* 0200: NAS / UIM servers */
+ static bool n_on, n_have, u_have, d_have;       /* 0200/0202: modem_nas=1; servers seen (node 0 is the modem) */
+ static uint32_t d_node, d_port;                 /* 0202: DMS server */
+@@ -6721,6 +6722,7 @@ spes_soc_map(void)
+ 	pool = (uint8_t *)pool_map->getVirtualAddress();
+ 	LOG("SMEM version %u", *(volatile uint32_t *)(smem + 64 + 7 * 4) >> 16);
+ 	state = 1;
++	g_modem_up = true;                          /* 0207 */
+ 	IOLockUnlock(once);
+ 	return true;
+ }
+@@ -6850,8 +6852,24 @@ bool topaz_wlan_joined(void) { return spes_wlan_joined(); }
+ bool topaz_wlan_transmit(const uint8_t *f, size_t l) { return spes_wlan_transmit(f, l); }
+ }
+ 
++/* 0207: PAS shutdown of the modem and the ADSP before a reset (sweet_usb.c ud_reset). Only what was booted. */
++extern "C" void spes_dsps_shutdown(void);
++extern "C" void
++spes_dsps_shutdown(void)
++{
++	uint64_t res = 0, st;
++	if (g_modem_up) {
++		st = scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, PAS_ID_MODEM, 0, 0, &res);
++		printf("SpesModem: modem PAS shutdown before reset: ret=%llx res=%llx\n", st, res);
++	}
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, 1 /* ADSP PAS id */, 0, 0, &res);
++	printf("SpesModem: ADSP PAS shutdown before reset: ret=%llx res=%llx\n", st, res);
++}
++
+ #else
+ extern "C" void spes_modem_init(void) {}
+ extern "C" void topaz_modem_init(void) {}
++extern "C" void spes_dsps_shutdown(void) {}
++
+ 
+ #endif

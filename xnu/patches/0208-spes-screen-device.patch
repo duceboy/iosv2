@@ -1,0 +1,133 @@
+spes: /dev/spes-screen, a picture of the display for the Mac (0208).
+
+User's idea, so the screen can be checked without asking. On open the device notes the address and pitch MDP VIG0 is
+fetching from (SSPP SRC0_ADDR/SRC_YSTRIDE0, as SweetFramebuffer.cpp reads them); read() gives a 16-byte header (SPSC, width,
+height, bytes a row) and the 1080x2400 BGRA rows. Read only; root only (0600). Made when the USB gadget starts on spes.
+Mac side: tools-local/spes-screen.py (ssh cat -> PNG).
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 61e60bc..2012dd1 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+ bsd/dev/spes_sta.c		standard
+ bsd/dev/spes_vib.c		standard
++bsd/dev/spes_screen.c		standard
+ bsd/dev/spes_cpufreq.c		standard
+ bsd/dev/spes_amp.c		standard
+ bsd/dev/spes_usb.c		standard
+diff --git a/bsd/dev/spes_screen.c b/bsd/dev/spes_screen.c
+new file mode 100644
+index 0000000..7af3fb0
+--- /dev/null
++++ b/bsd/dev/spes_screen.c
+@@ -0,0 +1,93 @@
++/*
++ * 0208: /dev/spes-screen, a picture of what the display shows, for looking at the phone from the Mac over the USB file
++ * server (user's idea, 2026-11-17). Read only: on open it notes the address and row pitch MDP VIG0 is fetching from right
++ * now (SSPP SRC0_ADDR 0x14 / SRC_YSTRIDE0 0x24, SweetFramebuffer.cpp), and read() returns a 16-byte header
++ * ("SPSC", width, height, bytes per row, little endian) followed by the panel's rows (1080 x 2400, 4 bytes a pixel as
++ * scanned, BGRA). Nothing is written to the display hardware.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/errno.h>
++#include <miscfs/devfs/devfs.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++void spes_screen_init(void);
++
++#define SCR_VIG0        0x05e05000u
++#define SCR_W           1080u
++#define SCR_H           2400u
++
++static vm_offset_t scr_vig0;
++static uint32_t scr_src, scr_stride;
++
++static int
++scr_open(dev_t dev __unused, int flags __unused, int devtype __unused, struct proc *p __unused)
++{
++	if (scr_vig0 == 0) {
++		return ENXIO;
++	}
++	scr_src = *(volatile uint32_t *)(scr_vig0 + 0x14);
++	scr_stride = *(volatile uint32_t *)(scr_vig0 + 0x24) & 0xffffu;
++	if (scr_src == 0 || scr_stride < SCR_W * 4u) {
++		return ENXIO;
++	}
++	return 0;
++}
++
++static int
++scr_close(dev_t dev __unused, int flags __unused, int devtype __unused, struct proc *p __unused)
++{
++	return 0;
++}
++
++static int
++scr_read(dev_t dev __unused, struct uio *uio, int ioflag __unused)
++{
++	uint32_t hdr[4] = { 0x43535053u /* "SPSC" */, SCR_W, SCR_H, SCR_W * 4u };
++	off_t total = (off_t)sizeof(hdr) + (off_t)SCR_W * 4 * SCR_H;
++	int err = 0;
++	while (uio_resid(uio) > 0 && uio_offset(uio) < total && err == 0) {
++		off_t off = uio_offset(uio);
++		if (off < (off_t)sizeof(hdr)) {
++			err = uiomove((caddr_t)hdr + off, (int)MIN((off_t)sizeof(hdr) - off, (off_t)uio_resid(uio)), uio);
++			continue;
++		}
++		off_t pix = off - (off_t)sizeof(hdr);
++		uint32_t row = (uint32_t)(pix / (SCR_W * 4)), col = (uint32_t)(pix % (SCR_W * 4));
++		vm_offset_t m = ml_io_map(scr_src + (vm_offset_t)row * scr_stride, scr_stride);
++		if (m == 0) {
++			return EIO;
++		}
++		uint8_t buf[SCR_W * 4];
++		memcpy(buf, (const void *)m, sizeof(buf));
++		err = uiomove((caddr_t)buf + col, (int)MIN((off_t)(SCR_W * 4 - col), (off_t)uio_resid(uio)), uio);
++		ml_io_unmap(m, scr_stride);
++	}
++	return err;
++}
++
++static struct cdevsw scr_cdevsw = {
++	.d_open = scr_open, .d_close = scr_close, .d_read = scr_read, .d_write = eno_rdwrt,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL,
++	.d_select = eno_select, .d_mmap = eno_mmap, .d_strategy = eno_strat,
++	.d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc, .d_type = 0,
++};
++
++void
++spes_screen_init(void)
++{
++	scr_vig0 = ml_io_map(SCR_VIG0, 0x1000);
++	int major = cdevsw_add(-1, &scr_cdevsw);
++	if (scr_vig0 == 0 || major < 0 ||
++	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "spes-screen") == NULL) {
++		printf("SPES SCREEN: not available\n");
++		return;
++	}
++	printf("SPES SCREEN: /dev/spes-screen ready\n");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 46583ac..ac23622 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1156,6 +1156,10 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (cmd && ud.ifp != NULL && kernel_thread_start(ud_cmd_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (usb_soc.spes) {                 /* 0208: picture of the display for the Mac */
++		extern void spes_screen_init(void);
++		spes_screen_init();
++	}
+ 	uint32_t autofb = 0;                /* 0207 */
+ 	PE_parse_boot_argn("spesautofb", &autofb, sizeof(autofb));
+ 	if (autofb != 0 && usb_soc.spes &&
