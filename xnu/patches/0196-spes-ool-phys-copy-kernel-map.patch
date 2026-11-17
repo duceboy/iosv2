@@ -1,0 +1,68 @@
+spes: OOL physical-copy fallback buffer from kernel_map (0196).
+
+First 0195 boot: the fallback ran for SpringBoard's 0xab4794-byte commit but still failed with kr 2:
+mach_vm_allocate_kernel in ipc_kernel_copy_map cannot fit ~11 MiB, that map is only 8 MiB
+(IPC_KERNEL_COPY_MAP_SIZE). Allocate the bounce buffer in kernel_map instead and copy it in with
+src_destroy, the same pattern IOUserClient.cpp uses for IOCatalogue data. The log line now also says
+which step was reached (1 alloc failed, 2 copyin failed, 3 vm_map_copyin of the buffer).
+
+diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
+index 34fe3e9..580b3cd 100644
+--- a/osfmk/ipc/ipc_kmsg.c
++++ b/osfmk/ipc/ipc_kmsg.c
+@@ -4456,7 +4456,7 @@ spes_ool_fail_log(vm_map_t map, mach_vm_offset_t addr, mach_vm_size_t len,
+ 
+ #define SPES_OOL_PHYS_MAX (64ULL << 20)
+ static void
+-spes_ool_phys_log(mach_vm_offset_t addr, mach_vm_size_t len, kern_return_t kr)
++spes_ool_phys_log(mach_vm_offset_t addr, mach_vm_size_t len, kern_return_t kr, int step)
+ {
+ 	static uint32_t spes_ool_phys;
+ 	char name[32] = "?";
+@@ -4465,8 +4465,8 @@ spes_ool_phys_log(mach_vm_offset_t addr, mach_vm_size_t len, kern_return_t kr)
+ 		return;
+ 	}
+ 	proc_selfname(name, sizeof(name));
+-	printf("SPES OOL: %s phys-copy fallback #%u addr 0x%llx len 0x%llx kr %d\n",
+-	    name, n, (unsigned long long)addr, (unsigned long long)len, kr);
++	printf("SPES OOL: %s phys-copy fallback #%u addr 0x%llx len 0x%llx kr %d step %d\n",
++	    name, n, (unsigned long long)addr, (unsigned long long)len, kr, step);
+ }
+ 
+ static mach_msg_descriptor_t *
+@@ -4572,25 +4572,30 @@ ipc_kmsg_copyin_ool_descriptor(
+ 			 * goes through the user mapping), then a virtual copy of the kernel buffer.
+ 			 */
+ 			mach_vm_offset_t kbuf = 0;
+-			if (mach_vm_allocate_kernel(ipc_kernel_copy_map, &kbuf, round_page(length),
++			int step = 1;
++			/* kernel_map, not ipc_kernel_copy_map: that map is only 8 MiB, the surfaces are ~11 MiB
++			 * (same pattern as IOCatalogue serialization in IOUserClient.cpp) */
++			if (mach_vm_allocate_kernel(kernel_map, &kbuf, round_page(length),
+ 			    VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_IPC) == KERN_SUCCESS) {
++				step = 2;
+ 				if (copyin(addr, (char *)kbuf, length) == 0) {
++					step = 3;
+ 					if (!page_aligned(length)) {
+ 						(void) memset((void *)(kbuf + length), 0,
+ 						    round_page(length) - length);
+ 					}
+-					kr = vm_map_copyin(ipc_kernel_copy_map, (vm_map_address_t)kbuf,
++					kr = vm_map_copyin(kernel_map, (vm_map_address_t)kbuf,
+ 					    (vm_map_size_t)length, TRUE, copy);
+ 					if (kr != KERN_SUCCESS) {
+-						(void) mach_vm_deallocate(ipc_kernel_copy_map, kbuf, round_page(length));
++						(void) mach_vm_deallocate(kernel_map, kbuf, round_page(length));
+ 					} else if (dealloc) {
+ 						(void) mach_vm_deallocate(map, addr, length);
+ 					}
+ 				} else {
+-					(void) mach_vm_deallocate(ipc_kernel_copy_map, kbuf, round_page(length));
++					(void) mach_vm_deallocate(kernel_map, kbuf, round_page(length));
+ 				}
+ 			}
+-			spes_ool_phys_log(addr, length, kr);
++			spes_ool_phys_log(addr, length, kr, step);
+ 		}
+ 		if (kr != KERN_SUCCESS) {
+ 			spes_ool_fail_log(map, addr, length, copy_options, dealloc, kr, 2);
