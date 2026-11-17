@@ -1,0 +1,42 @@
+spes: take back 0209 (plane bytes per row at +0x10) and stop creating /dev/spes-screen (0215).
+
+all-7 and all-8 (all-5's boot-args, kernel with 0207-0212): display black from the start, power key without effect; all-5 with
+kernel up to 0206 was fine. 0210-0212 do nothing without their boot-args, so the suspects are 0209 (changes what every client of a
+planar IOSurface reads, backboardd included) and 0208. 0209 is reverted here (back to +0x08 only) and the screen device is no longer
+made (it also froze the kernel when read, all-7; the user asked to drop it). The video fix needs another look.
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index ac23622..c3586e2 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1156,10 +1156,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (cmd && ud.ifp != NULL && kernel_thread_start(ud_cmd_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+-	if (usb_soc.spes) {                 /* 0208: picture of the display for the Mac */
+-		extern void spes_screen_init(void);
+-		spes_screen_init();
+-	}
++	/* 0215: /dev/spes-screen (0208) removed: froze the kernel in all-7 (user: drop it) */
+ 	uint32_t autofb = 0;                /* 0207 */
+ 	PE_parse_boot_argn("spesautofb", &autofb, sizeof(autofb));
+ 	if (autofb != 0 && usb_soc.spes &&
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 619686c..c58a3ec 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -847,13 +847,7 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+-		/*
+-		 * 0209: bytes per row at +0x10 (IOSurface 20H392 IOSurfaceClientGetBytesPerRowOfPlane reads client+0xe0+i*0x80,
+-		 * the result lands at client+0x68: plane 0x68+0x10). +0x08 was read as 0: H.264 decoding into 420v crashed
+-		 * mediaserverd (SIGBUS writing through a bad plane address). Kept at +0x08 too, harmless.
+-		 */
+-		put32(p, 0x08, pl->bytesPerRow);
+-		put32(p, 0x10, pl->bytesPerRow);
++		put32(p, 0x08, pl->bytesPerRow);    /* 0215: 0209 (+0x10) taken back: all-7/all-8 black display */
+ 		put32(p, 0x0c, pl->offset);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
