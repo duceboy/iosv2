@@ -1,0 +1,95 @@
+spes: IOSurface plane bytes-per-row at the offset IOSurface.framework reads (0209).
+
+vtprobe (AVAssetReader, 420v output) reproduced the video crash: mediaserverd SIGBUS in H264SW.videocodec writing through
+a plane address inside the shared cache. IOSurface 20H392 (disassembly of IOSurfaceClientGet*OfPlane): plane i at client
++0xd0+i*0x80, i.e. lock result 0x68+i*0x80: width +0, height +4, offset +0xc, bytes per row +0x10, size +0x14, bytes per
+element +0x18, element w/h +0x1a/+0x1b, component count +0x1c, address format +0x1d, compression type +0x54. Ours had bytes
+per row at +0x8 only, so planes read 0. Now at +0x10 (and still +0x8).
+
+diff --git a/bsd/dev/spes_ipa.h b/bsd/dev/spes_ipa.h
+new file mode 100644
+index 0000000..2c5b899
+--- /dev/null
++++ b/bsd/dev/spes_ipa.h
+@@ -0,0 +1,63 @@
++/*
++ * spes_ipa.h - IPA 4.2 data path between the application processor and the modem (SM6225 "khaje").
++ * DRAFT (not built, not run). Implementation: bsd/dev/spes_ipa.c, report: SPES-IPA-DRAFT.md.
++ *
++ * Everything sits behind boot-arg modem_ipa_data=1. The calls below are meant for two later users:
++ *   - SpesModem.cpp (modem thread, QMI): spes_ipa_init() before the modem goes online,
++ *     spes_ipa_modem_info() for the IPA QMI INIT_DRIVER request, spes_ipa_modem_endpoints() for
++ *     DPM Open Port, spes_ipa_clock_on() for the SMP2P "ipa" answer, spes_ipa_modem_start() once the
++ *     IPA QMI handshake is done (Linux ipa_qmi_ready() -> ipa_modem_start()).
++ *   - a network interface file (en1, like HackiOS hakios.cell.c): spes_ipa_tx() and spes_ipa_rx_hook.
++ */
++#ifndef _SPES_IPA_H_
++#define _SPES_IPA_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++ * Offsets (already including the IPA local-memory base read from SHARED_MEM_SIZE) the modem needs in
++ * the IPA QMI INIT_DRIVER request (Linux ipa_qmi.c init_modem_driver_req(), IPA v4.2 memory map from
++ * ipa_data-v4.2.c). Valid after spes_ipa_init() returned true.
++ */
++struct spes_ipa_modem_info {
++	uint32_t platform_type;                 /* CHECK: IPA_QMI_PLATFORM_TYPE_MSM_ANDROID (ipa_qmi_msg.h, not in the local copy) */
++	uint32_t hdr_tbl_start, hdr_tbl_end;    /* modem header region, end inclusive */
++	uint32_t v4_route_start, v4_route_end;  /* end = modem_route_count - 1 (an index, not an address; Linux does this) */
++	uint32_t v6_route_start, v6_route_end;
++	uint32_t v4_filter_start, v6_filter_start;
++	uint32_t modem_mem_start, modem_mem_size;
++	uint32_t ctrl_comm_dest_end_pt;         /* AP_MODEM_RX endpoint (9) */
++	uint32_t hdr_proc_ctx_start, hdr_proc_ctx_end;
++	uint32_t hw_stats_quota_base, hw_stats_quota_size;
++	bool     skip_uc_load;                  /* false on the first modem boot */
++};
++
++/* Set up the IPA (clock vote, SMMU, firmware, GSI channels, endpoints, tables). May sleep; call from a thread. */
++bool spes_ipa_init(void);
++bool spes_ipa_ready(void);
++/* Start the two modem data channels (AP->modem TX ep 1/ch 0, modem->AP RX ep 9/ch 3). After the IPA QMI handshake. */
++bool spes_ipa_modem_start(void);
++/* One IP packet to the modem, QMAP-framed with the current mux id. 0, or ENODEV/EMSGSIZE/ENOBUFS. Copies. */
++int  spes_ipa_tx(const void *ip, size_t len);
++/* QMAP mux id for transmit (from WDS Bind Mux Data Port; default 1). */
++void spes_ipa_set_mux(uint8_t mux);
++/* Called from the IPA poll thread for each IP packet from the modem (data points into a DMA buffer: copy it). */
++extern void (*spes_ipa_rx_hook)(const void *ip, size_t len, uint8_t mux);
++
++bool spes_ipa_modem_info(struct spes_ipa_modem_info *info);
++void spes_ipa_modem_endpoints(uint32_t *to_modem, uint32_t *from_modem);
++/* true while this driver holds the IPA clock vote (SMP2P "ipa" answer: 3 = valid + on, 1 = valid + off). */
++bool spes_ipa_clock_on(void);
++void spes_ipa_status(char *out, size_t size);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _SPES_IPA_H_ */
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 69aed6d..619686c 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -847,7 +847,13 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
++		/*
++		 * 0209: bytes per row at +0x10 (IOSurface 20H392 IOSurfaceClientGetBytesPerRowOfPlane reads client+0xe0+i*0x80,
++		 * the result lands at client+0x68: plane 0x68+0x10). +0x08 was read as 0: H.264 decoding into 420v crashed
++		 * mediaserverd (SIGBUS writing through a bad plane address). Kept at +0x08 too, harmless.
++		 */
+ 		put32(p, 0x08, pl->bytesPerRow);
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
