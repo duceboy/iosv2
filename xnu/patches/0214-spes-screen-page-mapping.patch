@@ -1,0 +1,36 @@
+spes: /dev/spes-screen maps whole pages around each row (0214).
+
+all-7: reading /dev/spes-screen stopped the kernel (log ends with the read, no reply, no ping). 0208 mapped scr_stride bytes from
+an unaligned row address; io_map covers round_page(size) from the page start, so rows crossing a 16 KB page boundary were read
+past the mapping. Now the mapping starts at the page and covers the whole row; it is unmapped before uiomove.
+
+diff --git a/bsd/dev/spes_screen.c b/bsd/dev/spes_screen.c
+index 7af3fb0..f5b4b2a 100644
+--- a/bsd/dev/spes_screen.c
++++ b/bsd/dev/spes_screen.c
+@@ -59,14 +59,22 @@ scr_read(dev_t dev __unused, struct uio *uio, int ioflag __unused)
+ 		}
+ 		off_t pix = off - (off_t)sizeof(hdr);
+ 		uint32_t row = (uint32_t)(pix / (SCR_W * 4)), col = (uint32_t)(pix % (SCR_W * 4));
+-		vm_offset_t m = ml_io_map(scr_src + (vm_offset_t)row * scr_stride, scr_stride);
++		/*
++		 * 0214: map whole pages around the row. 0208 mapped scr_stride bytes from an unaligned address
++		 * (0x91014450 + row * 4608): io_map covers round_page(size) from the page start, so rows crossing a
++		 * 16 KB page boundary were read past the mapping and the kernel stopped (all-7, 00:15).
++		 */
++		vm_offset_t pa = scr_src + (vm_offset_t)row * scr_stride;
++		vm_offset_t pa0 = pa & ~(vm_offset_t)PAGE_MASK;
++		vm_size_t len = round_page(pa - pa0 + SCR_W * 4u);
++		vm_offset_t m = ml_io_map(pa0, len);
+ 		if (m == 0) {
+ 			return EIO;
+ 		}
+ 		uint8_t buf[SCR_W * 4];
+-		memcpy(buf, (const void *)m, sizeof(buf));
++		memcpy(buf, (const void *)(m + (pa - pa0)), sizeof(buf));
++		ml_io_unmap(m, len);
+ 		err = uiomove((caddr_t)buf + col, (int)MIN((off_t)(SCR_W * 4 - col), (off_t)uio_resid(uio)), uio);
+-		ml_io_unmap(m, scr_stride);
+ 	}
+ 	return err;
+ }
