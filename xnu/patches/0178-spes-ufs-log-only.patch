@@ -1,0 +1,95 @@
+spes UFS log-only mode (0178): persistent console log with rd=md0, writes only in the log area.
+
+With rd=md0 the UFS was only started by the read-only storage probe (spesufsprobe=1), so the
+diagnostic profiles (touch, gpu-display, ...) could never use sweetlog. Boot-arg spesufslog=1 (rd=md0,
+spes platform) now starts the UFS in a log-only mode: SCSI limited to TEST UNIT READY, READ(10),
+WRITE(10) and SYNCHRONIZE CACHE, and ufs_write_blocks refuses every LBA below the log area (the last
+1 + 4 MiB / 4 KiB blocks of the partition, exactly what sweet_log_thread writes). ufsrw stays 0;
+/dev/ufsroot0 writes from userspace are refused the same way. Off by default.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 060a12e..15a073c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -50,6 +50,13 @@ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
+ static bool spes_readonly_probe;
++/*
++ * 0178 (boot-arg spesufslog=1 with rd=md0): UFS up for the persistent console log only. The one
++ * range that may be written is the log area at the end of the partition (spes_log_lo..end);
++ * every other write, from the kernel or through /dev/ufsroot0, is refused. ufsrw stays 0.
++ */
++static bool spes_log_only;
++static uint64_t spes_log_lo;
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void spes_vib_init(void);       /* bsd/dev/spes_vib.c (spesvib=1) */
+@@ -157,6 +164,13 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	if (spes_readonly_probe && (write || (cdb[0] != 0x00 && cdb[0] != 0x28))) {
+ 		return EROFS;
+ 	}
++	/* Log-only (0178): additionally WRITE(10) and SYNCHRONIZE CACHE; the LBA check is in ufs_write_blocks. */
++	if (spes_log_only && cdb[0] != 0x00 && cdb[0] != 0x28 && cdb[0] != 0x2a && cdb[0] != 0x35) {
++		return EROFS;
++	}
++	if (spes_log_only && write != (cdb[0] == 0x2a)) {
++		return EROFS;
++	}
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+ 	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
+@@ -293,6 +307,11 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
+ 		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+ 		return EPERM;
+ 	}
++	if (spes_log_only && (spes_log_lo == 0 || lba < spes_log_lo)) {
++		printf("SWEET UFS: log-only, refusing write of %u blocks at 0x%llx (log from 0x%llx)\n",
++		    count, lba, spes_log_lo);
++		return EPERM;
++	}
+ 	uint8_t cdb[10] = {
+ 		0x2a, 0,
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+@@ -760,6 +779,13 @@ sweet_ufs_init(void)
+ 	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
+ 	/* Only now, with the partition bounds known, can writes be allowed. */
+ 	su.writable = !spes_readonly_probe && (rw != 0);
++	if (spes_log_only && su.nblocks > 2 * (1 + (4u << 20) / UFS_BLOCK)) {
++		/* the same area sweet_log_thread writes: the last SWEET_LOG_BLOCKS blocks */
++		spes_log_lo = su.first_block + su.nblocks - (1 + (4u << 20) / UFS_BLOCK);
++		su.writable = true;
++		printf("SWEET UFS: log-only, writes limited to blocks 0x%llx..0x%llx\n",
++		    spes_log_lo, su.first_block + su.nblocks - 1);
++	}
+ 	su.ready = true;
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+@@ -952,12 +978,26 @@ spes_ufs_probe(void)
+ 	DTEntry platform;
+ 	int enabled = 0;
+ 	char root[32] = { 0 };
++	int logonly = 0;
+ 	(void)PE_parse_boot_argn("spesufsprobe", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("spesufslog", &logonly, sizeof(logonly));
+ 	(void)PE_parse_boot_argn("rd", root, sizeof(root));
+-	if (enabled != 1 ||
++	if ((enabled != 1 && logonly != 1) ||
+ 	    SecureDTLookupEntry(NULL, "/spes-platform", &platform) != kSuccess) {
+ 		return;
+ 	}
++	if (enabled != 1) {
++		/* 0178: spesufslog=1 alone: UFS for the console log, nothing else written */
++		if (strcmp(root, "md0") != 0 || su.ready) {
++			printf("SPES UFS LOG: refused; requires unused UFS and rd=md0\n");
++			return;
++		}
++		spes_log_only = true;
++		printf("SPES UFS LOG: starting, writes limited to the log area\n");
++		int err = sweet_ufs_init();
++		printf("SPES UFS LOG: result=%d; continuing RAM init\n", err);
++		return;
++	}
+ 	if (strcmp(root, "md0") != 0 || su.ready) {
+ 		printf("SPES UFS PROBE: refused; requires unused UFS and rd=md0\n");
+ 		return;

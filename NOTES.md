@@ -34,6 +34,19 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   partly below 4 GiB) boots to userspace on SM6225** (no XPU reset). Not seen: the UFS probe result and
   its DMA address for this layout (screen not captured); not shown: that all 2.5 GiB are usable
   (only the pages the kernel touched). Each `fastboot boot` is confirmed by the user individually.
+- **Read-only Linux reference values (OrangeFox recovery kernel, 2026-11-17):** SM5602 raw words
+  0x05/0x07/0x08 = 0x6419/0x49ed/0x8011 vs power_supply 100 %/4442 mV/-8 mA: 0173's SOC, voltage
+  (4436 mV vs driver 4437, gauge sysfs 4435; voltage_now 4442 comes from the sc8551) and current
+  incl. sign (bit 15 -> negative = discharging, -8 mA) match; 0173 rounds current to even mA.
+  bq2589x/SYV690 0x00-0x14 raw = driver view (0x0C read twice, 0x00 both; WATCHDOG off, VREG 4448 mV,
+  ICHG limit 5056 mA, IINLIM 500 mA, REG0B SDP/charge done, PN 001). LPG registers not readable (no
+  debugfs, no /dev/mem); vibrator log: period 50000 ns, duty 42500 ns, en GPIO 36. GPIO 31: driver's
+  last usb_switch=0 (D+/D- to the SoC), level not measured. Touch: FocalTech 0x5452, fw 0x17, reset
+  GPIO 86, int GPIO 80; Synaptics/Novatek disabled in DT. modem_b = modem_a (MD5), MPSS.HA.1.1.c1-00027.
+- **0177** (spesn modem tables from modem_b: 20/28 CRCs, 273/610 extents differ) and **0178**
+  (`spesufslog=1`: UFS log-only with rd=md0; before, sweetlog could not work in touch/gpu-display at
+  all because only the read-only storage probe starts the UFS) added. `build-spes-diagnostic.sh`:
+  `SPES_SWEETLOG=1` (-> `spesufslog=1 sweetlog=1`, ufsrw stays 0), `SPES_EXTRA_BOOTARGS`.
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables

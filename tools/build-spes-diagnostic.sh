@@ -31,6 +31,18 @@ case "$profile" in
 esac
 # SPES_MEMORY_FLOOR=0xa0000000 (0174, 4 GB spesn): RAM below 4 GiB too; own image name.
 name="$name${SPES_MEMORY_FLOOR:+-floor$SPES_MEMORY_FLOOR}"
+# SPES_SWEETLOG=1 (kernel with 0178): persistent console log (0047) in the last 4 MiB + 4 KiB of
+# userdata via spesufslog=1 (UFS log-only: no other block can be written; ufsrw stays 0). This
+# overwrites whatever Android keeps there. storage (spesufsprobe=1) is read-only and cannot log.
+# Read back with tools/sweet-log-pull.sh from OrangeFox.
+ufs='ufsrw=0 rootrw=0 sweetlog=0'
+if [ "${SPES_SWEETLOG:-0}" = 1 ]; then
+    [ "$profile" != storage ] || { echo 'storage is read-only (spesufsprobe=1): no sweetlog' >&2; exit 2; }
+    ufs='ufsrw=0 rootrw=0 spesufslog=1 sweetlog=1'
+    name="$name-log"
+fi
+# SPES_EXTRA_BOOTARGS: appended verbatim (e.g. modem_part=modem_b).
+extra="$extra${SPES_EXTRA_BOOTARGS:+ $SPES_EXTRA_BOOTARGS}"
 kernel=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1")
 live_fdt=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$2")
 cd "$(dirname "$0")/.."
@@ -41,7 +53,7 @@ clang -target arm64-apple-ios16.0 -mcpu=cortex-a53 -c tools/sweet-init.S -o shim
 python3 tools/mkinit.py shim/out/spes-init.o shim/out/spes-init
 python3 tools/mkpayload.py "$kernel" shim/out/spes.adt "shim/out/$name.payload" \
     --ramdisk shim/out/spes-init \
-    --cmdline "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 ufsrw=0 rootrw=0 sweetlog=0 sweettouch=$touch sweetkeys=0 sweethw=0 sweetfb_stayon=1$extra"
+    --cmdline "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 $ufs sweettouch=$touch sweetkeys=0 sweethw=0 sweetfb_stayon=1$extra"
 BOOT_HEADER_VERSION=3 shim/build.sh "out/$name.payload"
 cp shim/out/shim-boot.img "shim/out/$name.img"
 shasum -a 256 "shim/out/$name.img" > "shim/out/$name.img.sha256"
