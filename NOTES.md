@@ -5335,3 +5335,12 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   ed25519 host key, "Pubkey auth succeeded for 'root'" from 192.168.7.1. Shell = dash, toybox applets in
   /var/local/bin. Return to fastboot over USB 9 s after the command (double sync).
 - dropbear's default PATH lacks /var/local/bin; the Mac wrapper prefixes it (rebuild with DEFAULT_PATH later).
+
+## 2026-11-17 10:34 – 0189–0191: backboardd's refused IOSurfaces
+
+- 0189/0190 (diagnostic): refused creates logged key by key. backboardd wraps its own pixels
+  (IOSurfaceAddress) with an unpadded last row: 1105x1160 BGRA, bpr 4448, AllocSize 4448*1159+4420 =
+  5159652; 256x1 bpe 2, bpr 672, AllocSize 512. Kernel required bpr*rows -> ~1000 refusals a boot.
+- 0191: single-plane client memory needs offset + bpr*(rows-1) + last row's pixels. Run surf-3 (CI
+  44054679871): 0 refused creates (before ~1000), both shapes created once (backboardd stops retrying).
+  Crashes in 90 s: driverkitd 1, syncdefaultsd 9 (both known). Visual check of the glitches still open.
