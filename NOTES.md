@@ -177,6 +177,13 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
   frames sent, 45-50 received; dropped 0/0` -> en0 receives, nothing is ever transmitted (no DHCP DISCOVER).**
   Likely wifid/configd never consider the association complete (apple80211 state/event after join), so
   IPConfiguration does not start; to investigate (SSID/MACs deliberately not recorded here).
+- **MILESTONE 2026-11-17 06:41: USB DEVICE MODE + IP OVER USB ON spesn (0183).** Kernel CI 44024624880 (0173-0183,
+  ea5ba84b...e2af), diagnostic `shim/out/spes-diagnostic-floor0xa0000000-log.img` (baseline, log-only, `sweetusb=2`).
+  The Mac enumerated "Sweet iOS (USB Ethernet)" (vendor ios-sweet, VID 0x1209 PID 1) after the user allowed the
+  accessory in macOS (Apple silicon asks once; until then IOUSBHostDevice stays !registered); AppleUserECM (CDC-ECM)
+  made en3. User set `sudo networksetup -setmanual "Sweet iOS (USB Ethernet)" 192.168.7.1 255.255.255.0`.
+  `ping 192.168.7.2`: 3/3, ~4 ms. UDP live log to 192.168.7.1:5140 arrives (host: ~/ios-spes/tools-local/
+  spes-live.py). No SoC reset: the SMMU stream for 0x120 works. PHY untouched.
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
