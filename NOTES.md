@@ -97,6 +97,14 @@ Different handset and user from everything below (duceboy fork, branch `spesn-4g
 - iOS root built by the user on the Mac: `research/spes-ios-root.img` (16 GiB HFSX, fsck_hfs OK, SHA256
   46c8d16f039144907ac058caf27c5dd88c569b93248640005439c2a742e628d9). D22AP ADT source
   `research/ipsw-x/d22ap.adt` extracted (IM4P -> LZFSE). Not written to the phone yet.
+- **iOS root written to userdata (user's go, 2026-11-17 04:49-04:55):** `fastboot -S 512M flash userdata
+  research/spes-ios-root.simg` (sparse 11.6 GB, SHA256 e3539d58...2515; round trip = raw image 46c8d16f...28d9),
+  23/23 chunks OKAY, 326 s, log `research/flash-userdata-ios.log`. ABL stopped answering afterwards (as noted
+  for spes) -> power + volume down. Evolution X's data is gone; way back: OrangeFox Format Data.
+- Kernel CI 44010579866 (0173-0182, 10 patches applied) SHA256 b9066c3d...a81c (`xnu/out-spesn-4gb-c`).
+  iOS image `shim/out/spes-ios.img` (e6275fd4...cd20): `SPES_MEMORY_FLOOR=0xa0000000 SPES_EXTRA_BOOTARGS=
+  spesbattery=1 tools/build-spes-ios.sh`, rd=ufsroot0 ufsrw=1 rootrw=1 sweetlog=1, ADT with the D22AP /product
+  node. Not booted yet.
 - Next (user's order): floor storage boot; read-only Android reference values (bq2589x registers,
   PM6125 LPG SID1 0xb300, GPIO 31, touch controller) and modem_b backup via OrangeFox before
   `sweetlog=1`; touch and gpu-display with both layouts; then USB probe, modem tables
