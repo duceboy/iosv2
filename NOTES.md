@@ -5501,3 +5501,14 @@ Serving System Fehler 74 → SIM steckt nicht oder der Slot muss erst eingeschal
 - **userland/mgprobe** (eigener Code): fragt MobileGestalt auf dem Telefon ab. Nach dem Löschen des MG-Caches:
   DeviceSupportsClosedLoopHaptics = true, camera-flash = true, HasBaseband = false, cellular-data = false,
   ambient-light-sensor = false, proximity/gyro/accel/magnetometer = true.
+
+### 2026-11-17 23:10 – MEILENSTEIN: SIM entsperrt, im LTE-Netz angemeldet (all-5)
+
+all-5 (CI 44183295345, 0206 PIN als Text): „PIN verify result 0“, USIM in Slot 2 **ready**, „initiate network register
+(automatic)“, danach **„registered, cs attached, ps attached, radio lte“, -63 dBm**. Damit ist die Grundlage für mobile Daten
+da (fehlt: WDS/DPM/WDA + IPA-4.2-Datenweg, Entwurf läuft). Oberfläche lief mit dem neu erzeugten MobileGestalt-Cache
+(backboardd schreibt) → das Schwarzbild in all-3 lag nicht am Cache (Ursache offen; all-3 hatte gar keine Konsolen-Ausgabe).
+Fastboot-Rückweg: 0205 synct (Log „sync done“), Telefon setzte zurück, Fastboot kam aber nicht → **0207**: PAS-Shutdown von
+Modem und ADSP vor dem Reset + Countdown `spesautofb=N` (Idee des Nutzers: iOS nie endlos laufen lassen). **0208**
+/dev/spes-screen + tools-local/spes-screen.py (Bildschirmabbild per SSH, Idee des Nutzers). wifip2pd (131 Neustarts je Boot)
+soll aus launchd.plist (beim nächsten erreichbaren Boot). CI 44187398152.
