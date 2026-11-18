@@ -5741,7 +5741,7 @@ durch den Nutzer.
   CI 44324828337. Nächster Lauf all-21 = Args von all-20.
 - USB-Umstecktest (0223) weiter offen. 90 Hz danach in eigenem Lauf, mit Logring-Sicherung.
 
-### 18.11.2026 18:10 – all-21 (0224) ausgewertet, all-22 läuft, 0225/0226 gebaut
+### 18.11.2026 17:40 – all-21 (0224) ausgewertet, all-22 läuft, 0225/0226 gebaut
 
 - **all-21** (Kernel 0224, `sweetpanel=1 sweetfb_rate=60`, 15:55–17:30): Nutzer: Helligkeit einstellen ging, wirkte „etwas
   ruckeliger“; nach knapp 2 h in Safari (youtube.de) Hänger, Oberfläche einmal neu gestartet, danach Bild eingefroren.
