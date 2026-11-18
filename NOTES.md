@@ -5770,3 +5770,20 @@ durch den Nutzer.
   `-[NSFileManager _safari_getMobileSafariContainerDirectoryURL:isContainerized:]` → `fileURLWithPath:` mit nil; der
   Safari-Datencontainer existiert. Die Containerabfrage des Dienstes liefert also nichts (Ursache offen).
 - Beim nächsten Einfrieren: Kabel dran lassen bzw. anstecken, dann `spes-cmd.py "sample"` und Log sichern, erst danach Fastboot.
+
+### 18.11.2026 17:55 – 0227 (Safari.History), 0228 (Scaler-Selektor 4), Build für all-23
+
+- **Safari.History-SIGABRT geklärt (Agent, Disassemblierung SafariCore):** der Block ruft
+  `sandbox_container_path_for_pid(getpid(), buf, 0x400)`; bei 0 baut er den Pfad aus `buf`, bei Fehler fragt er
+  LSApplicationRecord nach dem Datencontainer von com.apple.mobilesafari. Unsere Attrappe (0147, sweet_amfi.c
+  `sweet_sandbox_container_path`) gab 0 zurück, ohne den Puffer zu füllen, wenn der Prozess kein CFFIXED_USER_HOME hat →
+  uninitialisierter Puffer → nil → Ausnahme. **0227:** ohne Variable ENOENT (wie vor 0147). Offen: ob der
+  LaunchServices-Zweig den Container dann findet.
+- **Scaler-Selektor 4 geklärt (Agent, IOSurfaceAccelerator.framework):** `IOSurfaceAcceleratorSetCustomFilter`, 32 Bytes:
+  zweimal (u32 Verhältnis 0x8000 = 1,0; u32, u32 Tabellenmaße), u64 Adresse der Koeffizienten; keine Ausgabe. Aufrufer:
+  Portrait, CMImaging, CMCapture, QuartzCore copy_iosurface, SetFilterCoefficients. „23ד war die Log-Grenze (24), die wahre
+  Zahl ist unbekannt. **0228:** ab Stufe 2 prüfen, loggen, Erfolg melden, Koeffizienten nicht lesen (unser Scaler filtert nicht).
+- Build CI 44350942184 enthält 0225 (Stichprobe per USB), 0226 (Register lesen), 0227, 0228 – vier unabhängige Änderungen in
+  einem Lauf (zwei davon nur lesend/Diagnose), weil der Nutzer weg ist und das Telefon in Fastboot wartet. all-23 = Args wie all-22.
+- GPU-Takt: laut Autor (NOTES ~Zeile 349, all47) brachten 1115 MHz keine besseren Bildzeiten → kein Hebel.
+- Weitere Agenten laufen: Zeichenzeit backboardd (Performance), Ursache des Einfrierens (Code-Audit auf unbegrenztes Warten).
