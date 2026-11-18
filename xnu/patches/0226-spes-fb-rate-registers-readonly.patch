@@ -1,0 +1,46 @@
+sweet fb: log the display timing registers as the bootloader left them (0226, read only).
+
+Step A before the 90 Hz change is tried again. all-18 (sweetpanel=1, default sweetfb_rate=90): noisy green picture getting
+brighter, "DSI cmd 0x3 not done ... status 0x200b"; all-20 (sweetfb_rate=60): clean picture, every command done. Linux
+(xiaomi spes techpack/display: dsi_ctrl.c dsi_ctrl_async_timing_update, dsi_ctrl_hw_cmn.c, sde_encoder_phys_vid.c
+programmable_fetch_config, sde_hw_intf.c) also moves INTF PROG_FETCH_START (0x170, INTF_CONFIG bit 31), brackets the DSI
+total with TIMING_DB (0x1e8), schedules video-mode commands at DMA_SCHEDULE_CTRL (0x100) and sends the panel "60 01";
+setupRate() does none of these. Their bootloader values were never read: two lines with INTF_1 and DSI0 registers, printed
+before setupRate() decides anything. Writes nothing. Not run on hardware yet.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f549061..8a69bcd 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -798,6 +798,31 @@ AppleCLCD::setupRate(void)
+ 	uint32_t vtotal = period / line, active = (vend - vstart) / line + 1;
+ 	uint32_t dsiTotal = fDsi != NULL ? *(volatile uint32_t *)(fDsi + SWEET_DSI_VIDEO_TOTAL) : 0;
+ 	uint32_t mhz = measureRate(vtotal);
++	{
++		/*
++		 * 0226, read only: what the bootloader left in the registers a change of the frame's
++		 * length has to keep consistent, before anything here writes one (all-18: 90 Hz gave a
++		 * noisy picture and a DSI command that was never sent; its log was lost). Linux,
++		 * dfps_immediate_porch_mode_vfp: INTF VSYNC_PERIOD and PROG_FETCH_START (+ INTF_CONFIG
++		 * bit 31), DSI VIDEO_MODE_TOTAL under TIMING_DB (0x1e8), commands at DMA_SCHEDULE_CTRL
++		 * (0x100) (sde_hw_intf.c, sde_encoder_phys_vid.c, dsi_ctrl_hw_cmn.c, dsi_ctrl_hw_2_2.c).
++		 */
++		static const uint16_t io[] = { 0x004, 0x008, 0x00c, 0x010, 0x014, 0x018, 0x01c, 0x020, 0x024, 0x170, 0x26c };
++		char line1[200];
++		size_t at = 0;
++		for (unsigned i = 0; i < sizeof(io) / sizeof(io[0]) && at + 20 < sizeof(line1); i++) {
++			at += (size_t)snprintf(line1 + at, sizeof(line1) - at, " %x=%x", io[i], intf[io[i] / 4]);
++		}
++		IOLog("SWEET FB: rate: INTF_1 as found:%s\n", line1);
++		if (fDsi != NULL) {
++			static const uint16_t dio[] = { 0x004, 0x008, 0x010, 0x024, 0x028, 0x02c, 0x030, 0x034, 0x038, 0x03c, 0x084, 0x0c4, 0x100, 0x110, 0x1e8 };
++			at = 0;
++			for (unsigned i = 0; i < sizeof(dio) / sizeof(dio[0]) && at + 20 < sizeof(line1); i++) {
++				at += (size_t)snprintf(line1 + at, sizeof(line1) - at, " %x=%x", dio[i], *(volatile uint32_t *)(fDsi + dio[i]));
++			}
++			IOLog("SWEET FB: rate: DSI0 as found:%s\n", line1);
++		}
++	}
+ 	IOLog("SWEET FB: rate: panel sent %u.%03u frames/s: %u lines (%u shown), %u clocks a line; DSI total %#x\n",
+ 	    mhz / 1000, mhz % 1000, vtotal, active, line, dsiTotal);
+ 	/* rounded: all31 measured 59.999 Hz over 3648 lines and truncated to 2431, one under the DT's 2432 */
