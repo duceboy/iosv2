@@ -5850,3 +5850,18 @@ durch den Nutzer.
   Image nicht, ich kann das Bild also nicht selbst prüfen.
 - Nächste Läufe: **all-24** = Kernel 0229 + wiederhergestellte Args + Panel 60 Hz (Kette `tools-local/spes-next.sh` wartet auf
   Fastboot, sichert zuerst den Logring von all-23). Danach all-25: neue Bibliothek aktiv, `glbox=1`, Sichtprüfung.
+
+### 18.11.2026 18:56 – Grund für die fehlenden Boot-Args: 600-Byte-Grenze; all-24 passend gemacht; 0229 baut
+
+- Korrektur zum Eintrag davor: Die Gruppe fehlte nicht nur aus Versehen. XNU behält 608 Byte Boot-Args (BOOT_LINE_LENGTH),
+  `tools/build-spes-ios-graphics.sh` bricht ab 600 ab. Mit Datenweg-, Panel- und Ton-Schaltern zusammen waren es 633 Byte.
+  ios-run.sh verschluckte die Fehlermeldung (`>/dev/null … || exit 13`).
+- Jetzt: `glsync=1` aus der festen Zeile genommen (ist der Standard der EAGL-Brücke: nur `glsync=0` schaltet um), `spestherm=1`
+  und `spesmetal=1` weggelassen (Metal-Liste enthält ohnehin nur die Probes). all-24 = 600 Byte:
+  `… spesscaler=2 spesvib=5 spesddr_khz=2133000 adsp=1 spesamp=2 spescodec=4 modem_ipa_data=1 modem_cell=1 modem_nas=1
+  modem_online=1 modem_pin=… sweetpanel=1 sweetfb_rate=60`. Kein Platz mehr für weitere Schalter (z. B. `glbox=1`).
+- Folgerung: ein Kernel-Patch muss Platz schaffen (Vorschlag: spes-Standardwerte im Kernel statt Boot-Arg, z. B. sweetfb_rate
+  60, sweettouchdelay, oder ein zweiter Argument-Text aus dem ADT). Bis dahin für Testschalter einen anderen weglassen.
+- CI 44361206908 (0229) erfolgreich; Kernel 0ccf73ef…, Image all-24 f0b33c64… gebaut, Args per strings geprüft.
+- Entwürfe in Arbeit (Agenten, nur Scratch): 90-Hz-Umschaltung nach Linux-Vorbild hinter `sweetfb_rate2=1`; Cache-Push außerhalb
+  von gGPULock hinter `gpu_pushout=1`.
