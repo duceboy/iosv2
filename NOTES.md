@@ -5727,3 +5727,16 @@ durch den Nutzer.
   der Lauf endete kurz danach, ob das Senden wieder lief, ist nicht belegt. Test wiederholen.
 - Lehre: vor dem Start eines Ersatzauftrags den alten Auftrag zuerst stoppen; nach einem Fehlbild erst den Logring sichern.
 - Nächster Lauf all-20: `sweetpanel=1 sweetfb_rate=60` (Panel-Befehle ohne Ratenumschaltung) trennt die beiden Ursachen.
+
+### 18.11.2026 15:30 – all-20: Panel-Befehle ohne Ratenumschaltung; 0224
+
+- all-20 = all-19 + `sweetpanel=1 sweetfb_rate=60`, Start 15:13:55. Bild sauber, kein Rauschen; `panel level 0x418: done`,
+  Sperr-Abblendung (0x3c1 … 0x1a2), `panel display off, sleep in: done`, `sleep out, display on: done`. Der DSI-Befehlsweg
+  funktioniert also bei 60 Hz. Rückschluss (nicht direkt belegt): in all-18 hat die 90-Hz-Umschaltung gestört.
+- Neuer Fehler (Nutzer): nach dem Aufwecken kurz hell, dann dunkel bis schwarz; mehrfach Power half manchmal.
+  Log: letzter Stand `display on` + `brightness 128 FadePeriod 12124`, kein späteres `brightness 0` → iOS hält das Display
+  für an, das Panel steht aber dunkel. Ursache: setPanelOn(true) rampt nach 120 ms Wartezeit von 1 auf fPanelLevel, liest
+  das Ziel einmal, während backboardds Aufweck-Überblendung (185 ms) es gerade verschiebt; die Rampe endet zuletzt.
+- 0224: mit Backlight-Dienst sendet die Einschaltsequenz dessen aktuellen Wert (unter der DSI-Sperre gelesen) statt der Rampe.
+  CI 44324828337. Nächster Lauf all-21 = Args von all-20.
+- USB-Umstecktest (0223) weiter offen. 90 Hz danach in eigenem Lauf, mit Logring-Sicherung.
