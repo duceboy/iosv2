@@ -1,0 +1,392 @@
+--- eagl-spes.c.orig	2026-11-18 18:47:32
++++ eagl-spes.c	2026-11-18 18:47:53
+@@ -56,7 +56,7 @@
+  * fetch_offered), glgroup=0 leaves vibrant layers inside groups as they were (see group_draw_begin()), glprecision=0 leaves the shaders' "lowp" and "mediump" as they are (see all_highp), glenv=NAME=VALUE puts that into the environment for the library to find
+  * (its own switches: FD_MESA_DEBUG=sysmem, say), vblur=0 blurs nothing whose radius varies and
+  * vblur=2 paints such blurs by their masks instead (see vblur_on), glframes=1 writes a line for
+- * every frame (see frame_end()).
++ * every frame (see frame_end()), glbox=1 copies of a frame only what was drawn into (see box_targets).
+  */
+ #include <CoreFoundation/CoreFoundation.h>
+ #include <IOKit/IOKitLib.h>
+@@ -235,6 +235,8 @@
+ 	unsigned looked;                /* ... the frame in which that memory was last looked at, */
+ 	uint64_t sum;                   /* ... and what it added up to */
+ 	bool sub_ok;                    /* ... refilled with glTexSubImage2D (until that fails) */
++	bool box_all;                   /* (boot-arg glbox) all of it is to be copied into its surface, */
++	GLint box[4];                   /* ... or this of it: left, bottom, right, top (right <= left: nothing) */
+ 	GLenum to, internal, format, type;
+ 	uint32_t plane, seed;
+ 	GLsizei width, height;
+@@ -313,6 +315,9 @@
+ 	const char *sources[256];       /* the text of the shaders being made, by name (modulo this) */
+ 	bool fragment[256];             /* ... and which of the two kinds each is */
+ 	unsigned plain_said;
++	/* (boot-arg glbox) since the last line about it: copies into surfaces, those of a part, and why not */
++	unsigned box_copies, box_parts, box_unfollowed, box_strangers;
++	uint64_t box_pixels, box_whole; /* ... the pixels copied, and the pixels of those pictures */
+ };
+ 
+ static unsigned trace_first, trace_last;        /* the frames whose calls are written down */
+@@ -357,6 +362,17 @@
+  */
+ static int wait_for_frames = 1;
+ static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's end does not push what Mesa holds back (frame_end()) */
++/*
++ * Boot-arg glbox=1 (with blit_targets): the copy at a frame's end is of what was drawn into since
++ * the last one, not of the whole picture. CoreAnimation draws what has changed inside a scissor
++ * box and leaves the rest; every surface has a texture of its own that keeps its picture, so the
++ * surface and the texture differ only where the texture was drawn into since its last copy. What
++ * is kept for each texture is one box around all of that (box_add()); a draw or a clear with no
++ * scissor, a call that is not followed (box_unfollowed()), another texture copied into the same
++ * surface (box_strangers()), a texture not filled from its surface by the GPU: all of it, as before.
++ * glbox=2: and CoreAnimation's glFlush is left to the one that follows the copy (my_glFlush()).
++ */
++static int box_targets;
+ /*
+  * EXT_shader_framebuffer_fetch -- a fragment shader reads the pixel it is about to write -- is
+  * what CoreAnimation draws a number of things with where the library offers it: the shadows
+@@ -379,6 +395,7 @@
+ static const char *eagl_slot_name(unsigned offset);
+ static void census_report(void);
+ static void clear_now(struct eagl *e);
++static void box_unfollowed(struct eagl *e);
+ 
+ static void
+ eagl_enter(struct eagl *e, unsigned offset)
+@@ -391,6 +408,26 @@
+ 	}
+ 	slot_calls[offset / 8]++;
+ 	e->calls++;
++	if (box_targets) {
++		/*
++		 * Entries that draw, clear, copy or fill and are handed on as they come (eagl_gen.h), so
++		 * where they write is not known: glCopyTexImage2D, glCompressedTex(Sub)Image2D,
++		 * glDrawRangeElements, glBlitFramebuffer, glDraw*InstancedEXT, glClearBuffer*, glDrawTex*OES,
++		 * glInvalidate(Sub)Framebuffer, glResolveMultisampleFramebufferAPPLE,
++		 * glCopyTextureLevelsAPPLE, glTexStorage2D; and the two that change what is drawn into
++		 * unseen, glFramebufferRenderbuffer and glFramebufferTextureLayer.
++		 */
++		switch (offset) {
++		case 0x1b8: case 0xbe8: case 0xc00: case 0xcb0: case 0x1540: case 0x15a0: case 0x17a0: case 0x17d8:
++		case 0x17e0: case 0x1838: case 0x1840: case 0x1848: case 0x1850: case 0x1fc0: case 0x1fc8: case 0x1fd0:
++		case 0x1fd8: case 0x1fe0: case 0x1fe8: case 0x1ff0: case 0x1ff8: case 0x2000: case 0x2018: case 0x2020:
++		case 0x2028: case 0x2040:
++			box_unfollowed(e);
++			break;
++		default:
++			break;
++		}
++	}
+ 	if (slow_calls_us != 0) {
+ 		call_began_us = now_us();
+ 	}
+@@ -559,9 +596,103 @@
+ 		}
+ 		CFRelease(image->surface);
+ 		*image = e->images[--e->image_count];
++	}
++}
++
++/* (glbox) Part of a target has been written: the box that is copied into its surface grows around it. */
++static void
++box_add(struct image *image, long long x, long long y, long long width, long long height)
++{
++	long long right = x + width, top = y + height;
++
++	if (image->box_all) {
++		return;
++	}
++	x = x < 0 ? 0 : x;
++	y = y < 0 ? 0 : y;
++	right = right > image->width ? image->width : right;
++	top = top > image->height ? image->height : top;
++	if (right <= x || top <= y) {
++		return;                 /* (nothing of it is in the picture) */
++	}
++	if (image->box[2] <= image->box[0] || image->box[3] <= image->box[1]) {
++		image->box[0] = (GLint)x;
++		image->box[1] = (GLint)y;
++		image->box[2] = (GLint)right;
++		image->box[3] = (GLint)top;
++	} else {
++		image->box[0] = x < image->box[0] ? (GLint)x : image->box[0];
++		image->box[1] = y < image->box[1] ? (GLint)y : image->box[1];
++		image->box[2] = right > image->box[2] ? (GLint)right : image->box[2];
++		image->box[3] = top > image->box[3] ? (GLint)top : image->box[3];
+ 	}
++	if (image->box[0] == 0 && image->box[1] == 0 && image->box[2] == image->width && image->box[3] == image->height) {
++		image->box_all = true;
++	}
+ }
+ 
++/* (glbox) A draw or a clear into a target, which is bound: inside the scissor box if there is one, else anywhere. */
++static void
++box_drawn(struct image *image)
++{
++	GLint box[4] = { 0, 0, 0, 0 };
++
++	if (image->box_all) {
++		return;
++	}
++	if (!glIsEnabled(GL_SCISSOR_TEST)) {
++		image->box_all = true;
++		return;
++	}
++	glGetIntegerv(GL_SCISSOR_BOX, box);
++	box_add(image, box[0], box[1], box[2], box[3]);
++}
++
++/* (glbox) A texture is filled or copied into, not drawn into: a part of it (`whole` false), or who knows. */
++static void
++box_filled(struct eagl *e, GLuint texture, bool whole, GLint x, GLint y, GLsizei width, GLsizei height)
++{
++	struct image *image;
++
++	if (!box_targets || texture == 0 || e->image_count == 0 || (image = image_of(e, texture)) == NULL || image->mirror == 0) {
++		return;
++	}
++	if (whole) {
++		image->box_all = true;
++	} else {
++		box_add(image, x, y, width, height);
++	}
++}
++
++/* (glbox) A call that writes where it is not followed (eagl_enter()): every target is copied whole the next time. */
++static void
++box_unfollowed(struct eagl *e)
++{
++	e->box_unfollowed++;
++	for (unsigned i = 0; i < e->image_count; i++) {
++		e->images[i].box_all = true;
++	}
++}
++
++/*
++ * (glbox) A target is about to be copied into its surface. Any other texture that copies into the
++ * same surface no longer holds what the surface does outside its own box: all of it the next time.
++ */
++static void
++box_strangers(struct eagl *e, struct image *image)
++{
++	uint32_t surface = IOSurfaceGetID(image->surface);
++
++	for (unsigned i = 0; i < e->image_count; i++) {
++		struct image *other = &e->images[i];
++
++		if (other != image && other->mirror != 0 && !other->box_all && IOSurfaceGetID(other->surface) == surface) {
++			other->box_all = true;
++			e->box_strangers++;
++		}
++	}
++}
++
+ /* Apple's OpenGL ES takes blue-first pixels into a texture called GL_RGBA; everybody else's calls the texture so too. */
+ static GLenum
+ internal_format(GLenum internal, GLenum format)
+@@ -797,6 +928,7 @@
+ {
+ 	GLint read = 0, draw = 0;
+ 	GLint had_width = 0, had_height = 0, had_format = 0;
++	GLboolean boxed = 0;
+ 	bool copied = false;
+ 
+ 	while (glGetError() != 0) {
+@@ -825,12 +957,18 @@
+ 	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
+ 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
+ 	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
++	if (box_targets && (boxed = glIsEnabled(GL_SCISSOR_TEST))) {
++		glDisable(GL_SCISSOR_TEST);     /* (glbox: a blit is cut by the scissor, and all of the texture must be the surface's) */
++	}
+ 	if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE &&
+ 	    glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+ 		glBlitFramebuffer(0, image->invert ? image->height : 0, image->width, image->invert ? 0 : image->height,
+ 		    0, 0, image->width, image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+ 		copied = glGetError() == 0;
+ 	}
++	if (boxed) {
++		glEnable(GL_SCISSOR_TEST);
++	}
+ 	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+ 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+ 	return copied;
+@@ -845,9 +983,39 @@
+ 	uint8_t *base;
+ 
+ 	image->drawn = false;
++	if (box_targets) {
++		box_strangers(e, image);
++	}
+ 	if (image->mirror != 0) {
+ 		GLint read = 0, draw = 0;
++		GLint x0 = 0, y0 = 0, x1 = image->width, y1 = image->height;
++		GLboolean boxed = 0;
+ 
++		if (box_targets) {
++			/* (glbox) only what was drawn into since the last copy; the scissor is CoreAnimation's and cuts a blit */
++			if (!image->box_all) {
++				x0 = image->box[0];
++				y0 = image->box[1];
++				x1 = image->box[2];
++				y1 = image->box[3];
++				e->box_parts++;
++			}
++			image->box_all = false;
++			image->box[0] = image->box[1] = image->box[2] = image->box[3] = 0;
++			e->box_copies++;
++			e->box_whole += (uint64_t)image->width * (uint64_t)image->height;
++			if (x1 <= x0 || y1 <= y0) {
++				/* nothing was: the surface holds the picture already (its seed moves all the same) */
++				if (IOSurfaceLock(surface, 0, NULL) == 0) {
++					IOSurfaceUnlock(surface, 0, NULL);
++				}
++				return;
++			}
++			e->box_pixels += (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0);
++			if ((boxed = glIsEnabled(GL_SCISSOR_TEST))) {
++				glDisable(GL_SCISSOR_TEST);
++			}
++		}
+ 		/* the frame into the surface's memory, by the GPU (blit_targets); upside down if it is drawn so */
+ 		glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+ 		glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+@@ -861,10 +1029,13 @@
+ 		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+ 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
+ 		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
+-		glBlitFramebuffer(0, 0, image->width, image->height, 0, image->invert ? image->height : 0, image->width,
+-		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++		glBlitFramebuffer(x0, y0, x1, y1, x0, image->invert ? image->height - y0 : y0, x1,
++		    image->invert ? image->height - y1 : y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+ 		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+ 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
++		if (boxed) {
++			glEnable(GL_SCISSOR_TEST);
++		}
+ 		if (IOSurfaceLock(surface, 0, NULL) == 0) {
+ 			IOSurfaceUnlock(surface, 0, NULL);
+ 		}
+@@ -1210,6 +1381,16 @@
+ 	}
+ 	if (e->frames == 30 || e->frames % 200 == 0) {
+ 		summary(e);
++	}
++	if (box_targets && e->frames % 200 == 0 && e->box_copies != 0) {
++		/* (glbox) what it saves: how many of the copies were of a part, and how much of the pictures was copied */
++		say("redwood-gl: glbox: %u copies into surfaces since the last such line, %u of a part (%u%%); %llu.%llu%% of "
++		    "their pixels copied; all of every target asked for %u times by calls that are not followed, of one %u "
++		    "times by another texture of its surface\n", e->box_copies, e->box_parts,
++		    e->box_parts * 100 / e->box_copies, e->box_pixels * 100 / e->box_whole,
++		    e->box_pixels * 1000 / e->box_whole % 10, e->box_unfollowed, e->box_strangers);
++		e->box_copies = e->box_parts = e->box_unfollowed = e->box_strangers = 0;
++		e->box_pixels = e->box_whole = 0;
+ 	}
+ 	census_report();
+ 	if (e->frames == 600 && e->errors == 0) {
+@@ -1256,6 +1437,9 @@
+ 	frame_begin(e);
+ 	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
+ 		image->drawn = image->painted = true;
++		if (box_targets && image->mirror != 0) {
++			box_drawn(image);       /* (a clear that is put off is made with the scissor of now: clear_now()) */
++		}
+ 		if (frame_lines && image->width >= 1000 && image->height >= 2000) {
+ 			/* the display's picture (a surface of its size): where this frame first draws into it */
+ 			e->line.into_display++;
+@@ -2693,6 +2877,7 @@
+ 
+ 	g->state = GROUP_NONE;
+ 	group_flattened++;
++	box_filled(e, texture, true, 0, 0, 0, 0);
+ 	flat[3] = alpha;
+ 	for (int i = 0; i < 3; i++) {
+ 		flat[i] = clamp01(g->colours[16 + i] * alpha);
+@@ -3279,6 +3464,7 @@
+ {
+ 	struct eagl *e = context;
+ 	uint64_t began;
++	bool copying = false;
+ 
+ 	EAGL_ENTER(e, 0x2d8);
+ 	if (eagl_tracing) {
+@@ -3286,7 +3472,15 @@
+ 	}
+ 	clear_now(e);
+ 	began = now_us();
+-	glFlush();
++	if (box_targets > 1) {
++		/* (glbox=2) a frame that is copied is flushed after its copy (frame_end()): once, not twice */
++		for (unsigned i = 0; i < e->image_count && !copying; i++) {
++			copying = e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0;
++		}
++	}
++	if (!copying) {
++		glFlush();
++	}
+ 	e->flushing += now_us() - began;
+ 	frame_end(e, false);
+ 	EAGL_LEAVE(e, 0x2d8);
+@@ -3408,6 +3602,13 @@
+ 	if (target == GL_TEXTURE_2D && e->unit < 8) {
+ 		group_forget(e, e->bound[e->unit]);
+ 	}
++	if (box_targets) {
++		if (target == GL_TEXTURE_2D && e->unit < 8) {
++			box_filled(e, e->bound[e->unit], true, 0, 0, 0, 0);
++		} else {
++			box_unfollowed(e);
++		}
++	}
+ 	uint64_t began = slow_calls_us != 0 ? now_us() : 0;
+ 	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
+ 	if (began != 0 && now_us() - began >= slow_calls_us) {
+@@ -3435,6 +3636,13 @@
+ 		group_read(e, e->bound[e->unit]);
+ 		group_forget(e, e->bound[e->unit]);
+ 	}
++	if (box_targets) {
++		if (target == GL_TEXTURE_2D && e->unit < 8) {
++			box_filled(e, e->bound[e->unit], level != 0, x, y, width, height);
++		} else {
++			box_unfollowed(e);
++		}
++	}
+ 	glTexSubImage2D(target, level, x, y, width, height, format, type, pixels);
+ 	EAGL_LEAVE(e, 0x9a0);
+ }
+@@ -3458,6 +3666,13 @@
+ 			group_forget(e, e->bound[e->unit]);
+ 		}
+ 	}
++	if (box_targets) {
++		if (target == GL_TEXTURE_2D && e->unit < 8) {
++			box_filled(e, e->bound[e->unit], level != 0, x0, y0, width, height);
++		} else {
++			box_unfollowed(e);
++		}
++	}
+ 	glCopyTexSubImage2D(target, level, x0, y0, x, y, width, height);
+ 	EAGL_LEAVE(e, 0x1c8);
+ }
+@@ -4086,6 +4301,7 @@
+ 			surface_changed(e, image);              /* (what it adds up to now) */
+ 			surface_to_texture(e, image);
+ 		}
++		image->box_all = !gpu_filled;           /* (glbox: filled so, the texture is the surface's picture exactly) */
+ 	}
+ 	e->attaching += now_us() - began;
+ 	if (attached++ < 24) {
+@@ -4251,6 +4467,11 @@
+ 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
+ 		blit_targets = strstr(arguments, "glblit=0") == NULL;
+ 		sync_frames = strstr(arguments, "glsync=0") == NULL;
++		if ((argument = strstr(arguments, "glbox=")) != NULL) {
++			box_targets = (int)strtoul(argument + 6, NULL, 10);
++			say("redwood-gl: glbox=%d: of a frame, what was drawn into is copied into its surface%s%s\n", box_targets,
++			    box_targets ? "" : " -- no: all of it", box_targets > 1 ? "; one glFlush a frame" : "");
++		}
+ 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
+ 			wait_for_frames = 0;
+ 		}

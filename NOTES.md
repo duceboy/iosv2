@@ -5822,3 +5822,31 @@ durch den Nutzer.
   Panel-Stufe) und `gpu:` (bereit, letzter/erledigter Fence, Ring-Zeiger); die 5-s-Zeile bekommt je Programm (backboardd / andere)
   Abgaben, geschobene KB, Schiebezeit, Wartezeit auf die Sperre und den größten Einzel-Push mit IOSurface.
 - Beim nächsten Einfrieren: Kabel an, `spes-cmd.py status` zweimal im Abstand von 5 s, `spes-cmd.py "sample"`, dann Logring sichern.
+
+### 18.11.2026 18:52 – Fehlende Boot-Args seit all-12, App-Abstürze geklärt, glbox-Entwurf gebaut
+
+- **Seit all-12 fehlten in den Images `spesvib=5 spesmetal=1 adsp=1 spesamp=2 spescodec=4`, seit all-13 auch
+  `spesddr_khz=2133000`** (per `strings` an den Images belegt: all-1…all-11 haben sie, all-12…all-23 nicht). Also liefen
+  all-12 bis all-23 ohne Ton-Kette, ohne Haptik, ohne Metal-Plug-in-Namen und ohne DDR-Vote. Kein Eintrag begründet das;
+  all-12 war ein IPA-Testlauf mit kurzer Liste, danach wurde die Liste so weitergeführt (Versehen). `tools-local/ios-run.sh`
+  setzt die Gruppe jetzt fest (BASE_ARGS, abschaltbar mit `BASE_ARGS=`). Auf dem Telefon liegen RedwoodAudio.driver und
+  die Metal-Freigabeliste (nur Probes) unverändert.
+- **Preferences-SIGSEGV und AegirPoster-SIGABRT (Agent, Disassemblierung CoreImage/NanoUniverse):** gemeinsame Wurzel: der Prozess
+  hat kein Metal-Gerät (`MTLCreateSystemDefaultDevice()` = nil). CoreImage fällt dann auf einen EAGL-Kontext zurück, dessen
+  Makro-Tabelle leer ist (`glDisable` über Nullzeiger, pc=0) – in Apps läuft Apples EAGLContext, nicht unsere Brücke (redwood-gl
+  nur in backboardd). AegirPoster: `[_device newBufferWithLength:0x1b0 options:1]` an nil → nil in addObject:. Auslöser bei
+  Preferences: MobileIcons skaliert Symbole über CoreImage (hier Mitteilungen). Kein Code-Fix nötig; Weg: `spesmetal=1` und den
+  Prozess in `NegroniMetal.bundle/clients`. Offen: AegirPoster stürzte früher auch mit Gerät ab (kein .ips dazu).
+- webbookmarksd-SIGABRT: gleiche Kette wie Safari.History (fileURLWithPath: nil) → vermutlich mit 0227 erledigt, ungeprüft.
+- Betriebszeit im Log („up Ns“) zählt ab dem SoC-Reset, also inklusive Wartezeit in Fastboot (all-23: erste Zeile up 2893 s).
+- Kernel-Zeilen stehen nicht im iOS-Systemlog (oslog-Abzug 496 MB → 22 GB Text, 0 Treffer; wieder gelöscht).
+- **glbox (Agent-Entwurf, tools/eagl-box.patch, ins Bauskript eingehängt):** Boot-Arg `glbox=1` kopiert am Bildende nur die
+  Vereinigung der gezeichneten Scissor-Boxen in die Surface statt des ganzen Bildes; Rückfall auf Vollkopie bei Scissor aus,
+  unverfolgten Schreibwegen, zweiter Textur derselben Surface. `glbox=2` spart zusätzlich CAs glFlush (ungeprüft, später).
+  Standard AUS. Bau reproduzierbar: ohne Patch bytegleich zur installierten Bibliothek (4e0962dd…), mit Patch 8d24f0ec…
+  (344 KB statt 542 KB: __TEXT kleiner, vermutlich weil eagl_enter nicht mehr in jeden Einsprung eingebettet wird).
+  Auf dem Telefon als `/redwood/lib/libredwood-gl.dylib.new` abgelegt (SHA geprüft), **nicht aktiv**; Sicherung der alten als
+  `.base-20261117`. Aktivieren (mv + backboardd neu) erst mit dem Nutzer am Bildschirm; /dev/spes-screen gibt es in diesem
+  Image nicht, ich kann das Bild also nicht selbst prüfen.
+- Nächste Läufe: **all-24** = Kernel 0229 + wiederhergestellte Args + Panel 60 Hz (Kette `tools-local/spes-next.sh` wartet auf
+  Fastboot, sichert zuerst den Logring von all-23). Danach all-25: neue Bibliothek aktiv, `glbox=1`, Sichtprüfung.
