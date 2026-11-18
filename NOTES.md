@@ -5904,3 +5904,13 @@ durch den Nutzer.
   Nicht belegt, was davon. Solche Berichte gibt es auch ohne Einfrieren (assetsd im laufenden all-23, backboardd am Morgen).
 - Folgerung: 0227 nimmt die Safari.History-Absturzschleife samt ReportCrash-Last weg; ob das Einfrieren damit seltener wird,
   zeigt nur die Nutzung. Beim nächsten Vorfall zusätzlich die neuesten `*.wakeups_resource*.ips` sichern.
+
+### 18.11.2026 19:12 – Nachtrag: woher die Aufweck-Berichte kommen
+
+- sweet_ufs.c wartet auf jedes UFS-Kommando im Thread des Aufrufers: 50 µs aktiv, danach Schlaf in 200-µs-Schritten per Timer
+  (CMD_SPIN_NS/CMD_SLEEP_NS, Zeilen 91–92, 233–261), ein Kommando zur Zeit (Slot 0, Bounce-Puffer 1 MiB, unter dem Mutex).
+  Jedes Platten-Kommando kostet den Prozess also ein bis mehrere Timer-Aufwecker. Die vier `wakeups_resource`-Berichte vor
+  dem Einfrieren bedeuten damit sehr wahrscheinlich: starke Plattenlast (ReportCrash nach den Safari.History-Abstürzen, Safari/
+  WebContent), keine Unterbrechungsflut. Belegt ist der Mechanismus im Code, nicht die Zuordnung der 45000 Aufwecker.
+- Kein schneller Hebel: Abschluss per Unterbrechung statt Timer und mehr als ein Kommando zugleich wären ein eigener Umbau des
+  Speichertreibers (später, mit Messung des Plattendurchsatzes vorher).
