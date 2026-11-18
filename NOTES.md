@@ -5787,3 +5787,38 @@ durch den Nutzer.
   einem Lauf (zwei davon nur lesend/Diagnose), weil der Nutzer weg ist und das Telefon in Fastboot wartet. all-23 = Args wie all-22.
 - GPU-Takt: laut Autor (NOTES ~Zeile 349, all47) brachten 1115 MHz keine besseren Bildzeiten → kein Hebel.
 - Weitere Agenten laufen: Zeichenzeit backboardd (Performance), Ursache des Einfrierens (Code-Audit auf unbegrenztes Warten).
+
+### 18.11.2026 18:41 – all-23 läuft (0225–0228), Agentenberichte Performance und Einfrieren, 0229
+
+- Netz war 17:50–18:30 weg (Hotspot unterwegs); der Warteauftrag hing, zwei Agenten brachen ab und wurden fortgesetzt.
+- **all-23** (CI 44350942184, Args wie all-22), Start 18:31:14, USB-Netz nach 46 s, SSH ok.
+  - 0225: `spes-cmd.py "sample"` → „sampled“, 37 SMP-Zeilen im Live-Log. Funktioniert.
+  - 0228: `CollectionsPoster custom filter: ratio 0x8000 table 9 x 32, ratio 0x8000 table 15 x 32: accepted, not applied` (12 Zeilen =
+    Log-Grenze). Ob CollectionsPoster dadurch seinen Check-in schafft, noch nicht geprüft.
+  - 0226: die Registerzeilen stehen vor dem USB-Netz und damit nicht im Live-Log; `/dev/klog` liefert nichts. Versuch über das
+    iOS-Systemlog (oslog-pull.sh all-23, 496 MB) läuft; sonst beim nächsten OrangeFox-Abzug.
+  - 0227: ohne Tippen nicht prüfbar (kein launchctl/uiopen auf dem Telefon) → wenn der Nutzer Safari öffnet.
+  - AegirPoster stürzt weiter mit SIGABRT ab (4× im Start), driverkitd SIG9 wie immer.
+- **Performance (Agent, all-21-Log; gebaut ist research/mesa-build/out/eagl-spes.c, nicht die HackiOS-Kopie):**
+  - „handing on“ = CoreAnimations eigenes glFlush je Bild; Mesa hat hier keinen Submit-Thread → Mesa-CPU + Kernel-submit() laufen
+    synchron im Render-Thread. submit() wartet nicht auf die GPU, kann aber an gGPULock und am Cache-Ausschieben darunter hängen.
+  - 60 langsame Bilder: 28 flush-dominiert (Flush Median 18 ms), 32 CPU-dominiert (22 mit Textur-Refill per CPU-Kopie).
+  - Stärkster Befund: lange Flushes fallen in Perioden, in denen der Kernel je Abgabe 3–5 MB aus dem CPU-Cache schiebt
+    (1,3–2,5 ms je Abgabe unter gGPULock): Flush Median 9,5 ms dort gegen 1,8 ms sonst. Wessen Puffer das sind, ist offen.
+  - GPU: nur sysmem; praktisch eine Vollbildkopie (2,74 Mpx) je Bild plus Clears; Minimalbild ~9–10 ms GPU in zwei Abgaben.
+  - Rangliste: (1) Cache-Push aufklären und aus der Sperre nehmen (Kernel), (2) nur die geänderte Box kopieren und den Blit in
+    CAs Abgabe legen (eagl.c), (3) Boot-Arg `spesddr_khz=2133000` (fehlte in all-21; bei 785 MHz nie isoliert gemessen),
+    (4) `glblit=0` (spart Kopie, Autor sah Bildfehler → Sichtprüfung), (5) cpu-prep nur auf den Fence des Puffers warten lassen.
+  - Schon widerlegt: GMEM, 1115 MHz, gpu_keep=0, glwait=1, glfetch=0, gpu_modpush=0. Render-Auflösung senken: kein sicherer Weg
+    ohne MobileGestalt-Cache.
+- **Einfrieren (Agent, Code-Audit + Log):** Ursache nicht belegt. Letzter Frame zwischen 6987 und 7017 s, direkt nach Power-Taste
+  und fünf Wischern vom unteren Rand (App-Umschalter). GPU kurz vorher langsam (18,5 ms je Abgabe), ohne Fehlerzeile. Danach als
+  einzige neue Zeile `send_resource_violation(CPU wakes, …)` 12× (vorher 0×): ein Task wacht seitdem dauernd per Timer auf.
+  Presenter-Hänger, DSI/Backlight und 0224 laut Audit und Log unwahrscheinlich (setPanelOn lief in den Minuten davor nicht, kein
+  Sperrzyklus). Lücke: GPU-Waits unter 1 s bzw. mit abgelaufener Frist scheitern stumm; keine Recovery. Hypothesen: (1) Render-Thread
+  schleift in kurzen Fence-Waits auf eine stehende GPU, (2) SpringBoard/WebKit hängt und backboardd bekommt keine Commits,
+  (3) Halter von gGPULock/fLock hängt, (4) Vsync-Timer tot.
+- **0229** (nur Diagnose, CI 44361206908): `status` meldet zusätzlich `fb:` (Vsync-Zähler und Alter, gezeigte Bilder, Display an/aus,
+  Panel-Stufe) und `gpu:` (bereit, letzter/erledigter Fence, Ring-Zeiger); die 5-s-Zeile bekommt je Programm (backboardd / andere)
+  Abgaben, geschobene KB, Schiebezeit, Wartezeit auf die Sperre und den größten Einzel-Push mit IOSurface.
+- Beim nächsten Einfrieren: Kabel an, `spes-cmd.py status` zweimal im Abstand von 5 s, `spes-cmd.py "sample"`, dann Logring sichern.
