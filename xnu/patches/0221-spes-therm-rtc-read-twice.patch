@@ -1,0 +1,33 @@
+spes therm: read the RTC counter twice (0221, read only).
+
+all-13 (spestherm=1): one of twelve 30-second lines showed "rtc 17023242" (0x0103c0ca) between 245996 and 246056; every SPMI
+read had reported success and the LSB check (as Linux qpnp-rtc) passed. spes_therm_rtc_read now reads the four bytes a second
+time and accepts the value only if the second reading is the same or one second later; otherwise it tries again (three
+attempts as before). Still observer reads of 0x6048..0x604b only. The cause of the wrong bytes is not known yet.
+
+diff --git a/bsd/dev/spes_therm.c b/bsd/dev/spes_therm.c
+index 5cbdd0e..cb143cb 100644
+--- a/bsd/dev/spes_therm.c
++++ b/bsd/dev/spes_therm.c
+@@ -195,6 +195,21 @@ spes_therm_rtc_read(uint32_t *secs, uint8_t *ctrl_out)
+ 			return -1;
+ 		}
+ 		if (spes_rtc_read_consistent(b[0], lsb)) {
++			/*
++			 * 0221: all-13 logged one counter of 0x0103c0ca between 0x0003c0ec and 0x0003c128 (three
++			 * of the four bytes wrong, each read reported success). Read the four bytes a second time
++			 * and take the value only when the counter did not move by more than a second.
++			 */
++			uint8_t c[4] = {0, 0, 0, 0};
++			bool again = true;
++			for (unsigned i = 0; i < 4; i++) {
++				if (sweet_spmi_read(SPES_THERM_SID, SPES_RTC_RDATA0 + i, &c[i]) != 0) {
++					again = false;
++				}
++			}
++			if (!again || spes_rtc_assemble(c) - spes_rtc_assemble(b) > 1u) {
++				continue;
++			}
+ 			*secs = spes_rtc_assemble(b);
+ 			if (ctrl_out) {
+ 				*ctrl_out = ctrl;
