@@ -5658,3 +5658,27 @@ durch den Nutzer.
   zurücksetzen, bei CLEAR_HALT den Endpunkt neu starten. Bis dahin: nach USB-Unterbrechung Neustart nötig.
 - Der Live-Log-Empfänger (tools-local/spes-live.py) stirbt mit der Claude-Sitzung → nach einem Sitzungsabsturz zuerst `ps` prüfen und
   mit nohup neu starten.
+
+### 2026-11-18 13:20 – MEILENSTEIN: mobile Daten über LTE (all-15 Handshake, all-16 Sitzung, Safari ohne WLAN)
+
+- Kernel CI 44281689369 (0173–0220, 12d0bab2…). 0221 noch nicht gebaut.
+- **all-15** (11:21; `modem_ipa_data=1 modem_cell=1`, ohne readonly, Modem offline): IPA voll eingerichtet wie in all-6 (PAS 15,
+  GSI enabled, ERROR_LOG 0), **kein Hänger** → der Stillstand von all-6 lag nicht an IPA (dort waren die Boot-Args abgeschnitten).
+  QMI: eigener IPA-Server angekündigt, Modem-Dienst 0x31:0x201 nach 272 ms, **INIT_DRIVER akzeptiert (result 0)**, INDICATION_REGISTER,
+  DRIVER_INIT_COMPLETE, INIT_COMPLETE gesendet, Datenkanäle gestartet (TX ep 1 ch 0, RX ep 9 ch 3, mux 1); Anfrage 0x27 und 13
+  Filterregeln quittiert (nicht installiert). DPM open OK, WDA „link 2, UL 5 DL 5“, WDS bind mux 1 OK, IPv4 OK. Start erwartungsgemäß
+  abgelehnt (result 1 error 14, call end reason 3, verbose 3/2001), solange das Modem offline ist. Offene Frage 1 (INIT_DRIVER-Werte
+  für v4.2) damit erledigt.
+- **all-16** (11:24; zusätzlich `modem_nas=1 modem_online=1 modem_pin`): PIN ok, LTE registriert/PS attached nach ~90 s →
+  `wds: SESSION STARTED`, packet service status 2, Runtime Settings (Adresse/Gateway/DNS/MTU 1500) → `SPES CELL: session UP`,
+  en1 link up, DHCP DISCOVER/OFFER/REQUEST/ACK mit iOS. **Nutzer: WLAN aus, Safari lädt Seiten über Mobilfunk.** Sitzung über
+  eine Stunde ohne Abriss, kein Kernel-Problem, TSENS 43–47 °C. en1 brauchte keinen eigenen Eintrag in preferences.plist.
+  (Adressen stehen nur im lokalen Log.)
+- Offen am Datenweg: Zähler `spes_cell_status`/`spes_ipa_status` haben keinen Aufrufer (kein Blick auf Pakete/Fehler ohne Trace) →
+  Abfrage über den USB-Befehlsserver; Durchsatz (Poll-Schleife 1 ms, DL-Aggregation 8192 B); IPv6; Abriss/Wiederaufbau (Schritt 6);
+  Filterregeln; Statusleiste/Einstellungen wissen nichts vom Mobilfunk (CommCenter fehlt).
+- Nebenbefund: `com.apple.Safari.History` (XPC-Dienst, im Log als com.apple.Safari) bricht bei jedem Start mit SIGABRT ab
+  (gleicher Abbruchpfad wie syncdefaultsd); Safari selbst läuft. Nutzer: YouTube in Safari läuft, nur 360p-Wiedergabe auffällig
+  (Art des Fehlers noch erfragen).
+- 0220-Test (Kabel ab/an) in all-15 ohne Befund: Nutzer ging direkt nach Fastboot, keine USB-Zeilen im Live-Log. Wiederholen.
+- tools-local/ios-run.sh: `BUILD_ONLY=1` (nur Image), `NO_CMD=1 WAIT_FB=N` (nicht selbst nach Fastboot schicken, auf die Tasten warten).
