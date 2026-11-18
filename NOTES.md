@@ -5889,3 +5889,18 @@ durch den Nutzer.
   sonst vollständiger Rückweg. dsiSend plant Befehle im Video-Modus über DSI 0x100 (Bit 28 | Zeile 2413), DT: dsi-ctrl-hw-v2.4.
 - Vor dem Lauf die 0226-Werte gegen die Liste „Lauf NICHT machen, wenn …“ im BERICHT halten. Plan: erst Vorlauf
   `sweetfb_rate2=1 sweetfb_rate=60` (testet nur die Befehlsplanung), dann Hauptlauf mit dem Nutzer am Bildschirm.
+
+### 18.11.2026 19:11 – 0231; Beobachtung zum Einfrieren: Aufweck-Berichte von vier Prozessen kurz davor
+
+- **0231** (Diagnose, CI 44364975190, steht bei GitHub in der Warteschlange): gescheiterte GPU-Wartezeiten ≥ 10 ms (oder 2000 beliebige)
+  ergeben höchstens alle 2 s eine Zeile; die 5-s-Statistik ist in zwei Zeilen geteilt (die zweite Hälfte war in jedem Log abgeschnitten).
+  Lauf 44364495648 (0230) scheiterte an `curl: (56) Recv failure` des Bauservers, nicht am Code.
+- Auf dem Telefon liegen vom Zeitpunkt des all-21-Einfrierens vier `*.wakeups_resource`-Berichte (Telefonzeit 08:26:18–21, gut
+  1,5 min vor dem letzten Bild bei ~08:28): MobileSafari 1299/s über 35 s, WebKit.WebContent 2467/s über 18 s, ReportCrash 2767/s
+  über 16 s, Preferences 684/s über 66 s (Grenze 150/s). Der Beginn (~08:25:15) fällt mit dem Safari.History-Absturz
+  (08:25:14–20, fünfter in Folge) und dem Start von ReportCrash zusammen. Vier unabhängige Prozesse gleichzeitig, darunter ein
+  Hintergrundprozess: das spricht für eine systemweite Ursache (Timer-/Polling-Schleifen in unseren Treibern, die dem aufrufenden
+  Prozess angerechnet werden – z. B. Warten in 200-µs-Schritten –, oder eine Unterbrechungsflut), nicht für vier Einzelfehler.
+  Nicht belegt, was davon. Solche Berichte gibt es auch ohne Einfrieren (assetsd im laufenden all-23, backboardd am Morgen).
+- Folgerung: 0227 nimmt die Safari.History-Absturzschleife samt ReportCrash-Last weg; ob das Einfrieren damit seltener wird,
+  zeigt nur die Nutzung. Beim nächsten Vorfall zusätzlich die neuesten `*.wakeups_resource*.ips` sichern.
