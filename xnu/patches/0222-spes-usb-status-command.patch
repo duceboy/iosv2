@@ -1,0 +1,51 @@
+sweet usb: "status" command on the USB command server (0222, read only).
+
+all-16 (2026-11-18): the first LTE data session worked (Safari without Wi-Fi), but nothing showed how many packets went either
+way: spes_cell_status() and spes_ipa_status() had no caller and the phone's root has no ping/netstat. The command server
+(UDP 5141, USB link only) now answers "status" with both texts: en1 counters (to/from modem, drops, ARP/DHCP) and IPA counters
+(packets/bytes/drops/errors per direction, GSI channel states). Nothing is written to hardware.
+Mac side: tools-local/spes-cmd.py status. Not run on hardware yet.
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index a089171..6b82ce8 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -34,6 +34,9 @@
+ #include <net/kpi_protocol.h>
+ #include <netinet/in.h>
+ #include <pexpert/device_tree.h>
++/* 0222: counters for the "status" command; defined (as empty stubs off spes) in bsd/dev/spes_cell.c, spes_ipa.c */
++extern void spes_cell_status(char *out, size_t size);
++extern void spes_ipa_status(char *out, size_t size);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+@@ -944,6 +947,7 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+  * 0184: command server on UDP 5141 (ue0), after ios-flame 0089 but without its register pokes.
+  * Only datagrams from 192.168.7.0/24 (the USB link) are taken; each gets one reply line.
+  *   ping      -> pong
++ *   status    -> two lines: counters of en1 (spes_cell_status) and of the IPA (spes_ipa_status), 0222
+  *   sync      -> filesystems flushed
+  *   reboot    -> sync, PSCI SYSTEM_RESET
+  *   fastboot  -> sync, restart reason "bootloader" (0x77665500) in IMEM restart_reason (live FDT
+@@ -1120,6 +1124,20 @@ ud_cmd_thread(__unused void *arg, __unused wait_result_t wr)
+ 				reset = bootloader = true;
+ 				reply = "rebooting to fastboot\n";
+ 			}
++		} else if (strcmp(buf, "status") == 0) {
++			/* 0222: the packet counters of the cellular path (read only; text built by their owners) */
++			static char st[900];
++			size_t at;
++			snprintf(st, sizeof(st), "cell: ");
++			at = strlen(st);
++			spes_cell_status(st + at, 400);
++			at = strlen(st);
++			snprintf(st + at, sizeof(st) - at, "\nipa: ");
++			at = strlen(st);
++			spes_ipa_status(st + at, 400);
++			at = strlen(st);
++			snprintf(st + at, sizeof(st) - at, "\n");
++			reply = st;
+ 		} else {
+ 			reply = "unknown command\n";
+ 		}
