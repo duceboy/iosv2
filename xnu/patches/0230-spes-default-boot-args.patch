@@ -1,0 +1,76 @@
+pexpert: spesdef=1 takes the arguments every spes iOS image passes from a list in the kernel (0230).
+
+XNU keeps BOOT_LINE_LENGTH (608) bytes of boot-args and tools/build-spes-ios-graphics.sh stops at 600. With the cellular
+data path, the panel and the sound chain together the line was 633 bytes; all-12 to all-23 (2026-11-18) therefore ran
+without adsp/spesamp/spescodec, spesvib and from all-13 without spesddr_khz, and all-24 fits only at exactly 600 with
+glsync, spestherm and spesmetal dropped. PE_parse_boot_argn() and PE_parse_boot_arg_str() now look an argument that is
+not on the line up in a fixed list, if (and only if) spesdef=1 is on the line; an argument on the line always wins.
+No driver reads the line past these two functions (checked: PE_boot_args() users are the sysctl, panic/stackshot text,
+memdev, bsd_init messages). Userland that reads kern.bootargs itself: the EAGL bridge (gl* switches, none in the list),
+its preflight (spesgpu=1: stays on the line), NegroniMetal (negronimetal=). Without spesdef=1 nothing changes.
+Not run on hardware yet.
+
+diff --git a/pexpert/gen/bootargs.c b/pexpert/gen/bootargs.c
+index c94c0eb..d291ddb 100644
+--- a/pexpert/gen/bootargs.c
++++ b/pexpert/gen/bootargs.c
+@@ -187,13 +187,46 @@ gotit:
+ 	return arg_found;
+ }
+ 
++/*
++ * 0230 (spes): the boot-args line is BOOT_LINE_LENGTH (608) bytes and the spes images had reached it (all-12 to
++ * all-23 ran without the sound chain, haptics and the DDR vote because the list had been cut to fit). With
++ * spesdef=1 on the line, an argument that is not on the line is looked up in this list: the arguments every spes
++ * iOS image has passed since all-1 (tools/build-spes-ios-graphics.sh, tools-local/ios-run.sh). What is on the
++ * line wins, so every one of them can still be set differently or to 0. Not in the list on purpose: spesgpu=1
++ * (the EAGL bridge's preflight reads it from kern.bootargs), wlan_mac, modem_pin, and everything a run chooses.
++ */
++static char spes_default_args[] =
++    "sweetlog=1 sweettouch=1 sweettouchdelay=5 sweettouchdiag=3 sweetkeys=1 sweethw=0 sweetfb_noconsole=1 "
++    "sweetfb_hz=60 sweetfb_rate=60 spesgpuprobe=1 spesgpu_mhz=785 modem=1 wifi=1 modem_part=modem_b spesbattery=1 "
++    "sweetusb=2 spesscaler=2 spesvib=5 spesddr_khz=2133000 adsp=1 spesamp=2 spescodec=4";
++
++static boolean_t
++spes_default_args_on(void)
++{
++	static int on = -1;
++
++	if (on < 0) {
++		char *line = PE_boot_args();
++		uint32_t value = 0;
++
++		if (line == NULL || *line == '\0') {
++			return FALSE;           /* (asked before there is a line: not remembered) */
++		}
++		on = PE_parse_boot_argn_internal(line, "spesdef", &value, sizeof(value), FALSE) && value != 0;
++	}
++	return on > 0;
++}
++
+ boolean_t
+ PE_parse_boot_argn(
+ 	const char      *arg_string,
+ 	void            *arg_ptr,
+ 	int                     max_len)
+ {
+-	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE);
++	if (PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE)) {
++		return TRUE;
++	}
++	return spes_default_args_on() && PE_parse_boot_argn_internal(spes_default_args, arg_string, arg_ptr, max_len, FALSE);
+ }
+ 
+ boolean_t
+@@ -202,7 +235,10 @@ PE_parse_boot_arg_str(
+ 	char            *arg_ptr,
+ 	int                     strlen)
+ {
+-	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE);
++	if (PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE)) {
++		return TRUE;
++	}
++	return spes_default_args_on() && PE_parse_boot_argn_internal(spes_default_args, arg_string, arg_ptr, strlen, TRUE);
+ }
+ 
+ #if defined(CONFIG_XNUPOST)

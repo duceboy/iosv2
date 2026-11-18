@@ -23,6 +23,12 @@ python3 tools/mkadt.py shim/out/spes-ios-graphics.adt --device spes --memory-dtb
 # The development kernel uses OSX platform policy; allow iOS executables.
 # ignition_level=1 uses the cache merged into our single HFS root.
 cmdline="debug=0xc serial=3 cpus=$cpus -noprogress rd=ufsroot0 ufsroot=userdata unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin wdt=-1 ufsrw=1 rootrw=1 sweetlog=1 sweettouch=1 sweettouchdelay=5 sweettouchdiag=3 sweetkeys=1 sweethw=0 sweetfb_noconsole=1 sweetfb_hz=$fb_hz spesgpu=1 spesgpuprobe=1 spesgpu_mhz=$gpu_mhz${extra:+ $extra}"
+# SPES_DEFAULTS=1 (kernel with 0230): the arguments that never change come from the kernel's list (spesdef=1);
+# SWEET_EXTRA_ARGS then only needs what differs from it. sweetfb_hz / spesgpu_mhz are passed when they differ from 60 / 785.
+cmdline_short="debug=0xc serial=3 cpus=$cpus -noprogress rd=ufsroot0 ufsroot=userdata unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin wdt=-1 ufsrw=1 rootrw=1 spesdef=1 spesgpu=1${extra:+ $extra}"
+[[ "$fb_hz" == 60 ]] || cmdline_short+=" sweetfb_hz=$fb_hz"
+[[ "$gpu_mhz" == 785 ]] || cmdline_short+=" spesgpu_mhz=$gpu_mhz"
+[[ -n "${SPES_DEFAULTS:-}" ]] && cmdline=$cmdline_short
 (( ${#cmdline} <= 600 )) || { echo "boot-args are ${#cmdline} bytes; XNU keeps 608 (BOOT_LINE_LENGTH): shorten" >&2; exit 3; }
 python3 tools/mkpayload.py "$kernel" shim/out/spes-ios-graphics.adt shim/out/spes-ios-graphics-fixed.payload \
     --cmdline "$cmdline"
