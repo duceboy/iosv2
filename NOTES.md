@@ -5771,7 +5771,7 @@ durch den Nutzer.
   Safari-Datencontainer existiert. Die Containerabfrage des Dienstes liefert also nichts (Ursache offen).
 - Beim nächsten Einfrieren: Kabel dran lassen bzw. anstecken, dann `spes-cmd.py "sample"` und Log sichern, erst danach Fastboot.
 
-### 18.11.2026 17:55 – 0227 (Safari.History), 0228 (Scaler-Selektor 4), Build für all-23
+### 18.11.2026 17:47 – 0227 (Safari.History), 0228 (Scaler-Selektor 4), Build für all-23
 
 - **Safari.History-SIGABRT geklärt (Agent, Disassemblierung SafariCore):** der Block ruft
   `sandbox_container_path_for_pid(getpid(), buf, 0x400)`; bei 0 baut er den Pfad aus `buf`, bei Fehler fragt er
