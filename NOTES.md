@@ -5914,3 +5914,10 @@ durch den Nutzer.
   WebContent), keine Unterbrechungsflut. Belegt ist der Mechanismus im Code, nicht die Zuordnung der 45000 Aufwecker.
 - Kein schneller Hebel: Abschluss per Unterbrechung statt Timer und mehr als ein Kommando zugleich wären ein eigener Umbau des
   Speichertreibers (später, mit Messung des Plattendurchsatzes vorher).
+
+### 18.11.2026 19:13 – Messung: Lesedurchsatz des Speichers (all-23, nur lesen)
+
+- `cat DATEI > /dev/null` an drei bisher ungelesenen Systemdateien: 130 MiB in 755 ms, 74 MiB in 373 ms, 32 MiB in 196 ms
+  → **160–200 MiB/s sequenziell kalt**; warm (aus dem Cache) 93–275 ms, also ~470 MiB/s durch cat selbst.
+- Der Speicher ist beim sequenziellen Lesen kein Engpass. Zufällige kleine Zugriffe (wo die 200-µs-Schritte des Treibers am
+  stärksten wirken) sind nicht gemessen; dafür fehlt ein Werkzeug auf dem Telefon (`dd` gibt es dort nicht).
