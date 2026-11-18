@@ -1,0 +1,113 @@
+sweet sample: a sample on request over USB, and samples for as long as the phone runs (0225).
+
+all-21 (2026-11-18): after 117 minutes the picture froze (Safari, YouTube) while the kernel went on (thermal, touch,
+modem and USB lines to the end); backboardd drew its last frame at about 7010 s. The sampler that says where SpringBoard
+and backboardd are had printed its 40th and last sample 37 minutes earlier, and the phone was on the cable with the
+command server answering. Now: after the 40 samples at 120 s, one every 300 s without end; and the command
+"sample" (or "sample name,name") on UDP 5141 prints one at once (SMP lines, as before).
+Not run on hardware yet.
+
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index b40eccd..e521b26 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -10,7 +10,11 @@
+  * with tools/sweet-crash.py). A thread blocked in a syscall shows the
+  * syscall stub in pc and its caller in lr/bt.
+  *
+- * First sample 90 s after start, then every 120 s, 40 samples at most.
++ * First sample 90 s after start, then every 120 s for 40 samples, then every
++ * 300 s for as long as the phone runs (0225: all-21 froze after 117 minutes,
++ * 37 minutes after the last of 40 samples). 0225 also: sweet_sample_now() for
++ * the USB command server's "sample [name,name]" -- a sample at once, of the
++ * boot-arg's processes or of the ones named.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -27,10 +31,10 @@ extern void sweet_sample_start(void);
+ static char sweet_sample_names[128];
+ 
+ static bool
+-sweet_sample_wanted(const char *name)
++sweet_sample_wanted(const char *names, const char *name)
+ {
+ 	size_t n = strlen(name);
+-	for (const char *t = sweet_sample_names; *t;) {
++	for (const char *t = names; *t;) {
+ 		const char *end = strchr(t, ',');
+ 		size_t tl = end ? (size_t)(end - t) : strlen(t);
+ 		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
+@@ -47,11 +51,11 @@ sweet_sample_wanted(const char *name)
+ extern void sweet_sample_task(const char *name, int pid, task_t task);  /* osfmk/kern/exception.c */
+ 
+ static int
+-sweet_sample_proc(proc_t p, __unused void *arg)
++sweet_sample_proc(proc_t p, void *arg)
+ {
+ 	char name[32];
+ 	proc_name(proc_pid(p), name, sizeof(name));
+-	if (sweet_sample_wanted(name)) {
++	if (sweet_sample_wanted((const char *)arg, name)) {
+ 		task_t task = proc_task(p);
+ 		if (task != TASK_NULL) {
+ 			sweet_sample_task(name, proc_pid(p), task);
+@@ -71,13 +75,33 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 		return;
+ 	}
+ 	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
+-	for (int i = 0; i < 40; i++) {
++	for (int i = 0;; i++) {
+ 		printf("SMP --- sample %d\n", i);
+-		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+-		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
++		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, sweet_sample_names, NULL, NULL);
++		(void)tsleep(&chan, PZERO, "sweetsmp", (i < 40 ? 120 : 300) * hz);
+ 	}
+ }
+ 
++/*
++ * 0225: a sample now, from the USB command server's thread. names: comma separated process
++ * names, or NULL/"" for the boot-arg's (the default list if the sampler is off or not yet up).
++ */
++void sweet_sample_now(const char *names);
++void
++sweet_sample_now(const char *names)
++{
++	static char wanted[128];
++	if (names != NULL && names[0] != 0) {
++		strlcpy(wanted, names, sizeof(wanted));
++	} else if (sweet_sample_names[0] != 0 && sweet_sample_names[0] != '-') {
++		strlcpy(wanted, sweet_sample_names, sizeof(wanted));
++	} else {
++		strlcpy(wanted, "SpringBoard,backboardd", sizeof(wanted));
++	}
++	printf("SMP --- sample on request: %s\n", wanted);
++	proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, wanted, NULL, NULL);
++}
++
+ void
+ sweet_sample_start(void)
+ {
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b3cf0f9..0f3a5fc 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -34,6 +34,7 @@
+ #include <net/kpi_protocol.h>
+ #include <netinet/in.h>
+ #include <pexpert/device_tree.h>
++extern void sweet_sample_now(const char *names);        /* 0225: bsd/dev/sweet_sample.c */
+ /* 0222: counters for the "status" command; defined (as empty stubs off spes) in bsd/dev/spes_cell.c, spes_ipa.c */
+ extern void spes_cell_status(char *out, size_t size);
+ extern void spes_ipa_status(char *out, size_t size);
+@@ -1150,6 +1151,10 @@ ud_cmd_thread(__unused void *arg, __unused wait_result_t wr)
+ 			at = strlen(st);
+ 			snprintf(st + at, sizeof(st) - at, "\n");
+ 			reply = st;
++		} else if (strncmp(buf, "sample", 6) == 0 && (buf[6] == 0 || buf[6] == ' ')) {
++			/* 0225: where are SpringBoard and backboardd (or the processes named) right now -> log ("SMP ...") */
++			sweet_sample_now(buf[6] == ' ' ? buf + 7 : NULL);
++			reply = "sampled: SMP lines in the log\n";
+ 		} else {
+ 			reply = "unknown command\n";
+ 		}
