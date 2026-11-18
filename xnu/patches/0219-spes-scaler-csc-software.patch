@@ -1,0 +1,411 @@
+spes: software stand-in for AppleM2ScalerCSCDriver (0219, spesscaler=N; nothing without the boot-arg).
+
+all-11: "IOServiceMatching failed for: AppleM2ScalerCSCDriver" (SpringBoard, backboardd). SpringBoard's app switcher snapshots
+are two-plane '420f' IOSurfaces that IOSurfaceAccelerator should fill from the BGRA snapshot; with no scaler they keep stale
+memory and show as stripes. iokit/Kernel/arm/SpesScaler.cpp: service AppleM2ScalerCSCDriver + IOSurfaceAcceleratorClient,
+selector 1 with the 0x170-byte block of IOSurfaceAcceleratorTransformSurface (layout read from IOSurfaceAccelerator.framework
+20H392, own disassembly: +0 first surface id, +4 second, +0x20 flags, +0x28 rectangles). spesscaler=1 registers the service,
+logs every request (both surfaces, the block) and refuses it; spesscaler=2 converts and scales the whole first surface into the
+second on the CPU between 'BGRA', '420f', '420v' (BT.601, nearest neighbour; rectangles not applied yet) and bumps the
+destination's seed (sweet_surface_changed). Without the boot-arg probe() fails and clients keep their software paths.
+Not run on hardware yet.
+
+diff --git a/iokit/Kernel/arm/SpesScaler.cpp b/iokit/Kernel/arm/SpesScaler.cpp
+new file mode 100644
+index 0000000..704c9b6
+--- /dev/null
++++ b/iokit/Kernel/arm/SpesScaler.cpp
+@@ -0,0 +1,332 @@
++/*
++ * Software stand-in for AppleM2ScalerCSCDriver (0219, boot-arg spesscaler=N).
++ *
++ * all-11 (2026-11-18): "IOServiceMatching failed for: AppleM2ScalerCSCDriver" from SpringBoard and
++ * backboardd. SpringBoard makes a two-plane '420f' IOSurface for every app switcher snapshot and has
++ * IOSurfaceAccelerator fill it from the BGRA snapshot; with no scaler the surface keeps whatever its
++ * memory held and backboardd shows stripes. AppleJPEG, CMPhoto, CMCapture, CMImaging look for the
++ * same service (tools/inventar).
++ *
++ * Interface, read from IOSurfaceAccelerator.framework 20H392 (dyld cache, own disassembly; no Apple
++ * code here):
++ *   IOSurfaceAcceleratorCreate: IOServiceMatching("AppleM2ScalerCSCDriver"), IOServiceOpen type 0
++ *     (type 0x00b0xxxx is the "strength" variant with a 0x58-byte call; refused here).
++ *   IOSurfaceAcceleratorTransformSurface/TransferSurface: IOConnectCallStructMethod(selector 1,
++ *     0x170 bytes in, nothing out). In the block:
++ *       +0x00 u32  IOSurfaceGetID of the first surface argument (source)
++ *       +0x04 u32  IOSurfaceGetID of the second surface argument (destination)
++ *       +0x08 24 bytes from the caller's completion argument (zero when there is none)
++ *       +0x20 u64  option flags
++ *       +0x28 0x30 bytes copied from the caller's rectangles argument (+0x28 16 bytes, +0x38 32 bytes)
++ *     Which of the two IDs is the source, and the rectangle layout, are assumptions until stage 1 has
++ *     logged real requests; stage 1 dumps the block.
++ *
++ * Stages: 0/absent = no service (as before: clients take their software paths);
++ *         1 = service registered, every request logged with both surfaces, answered kIOReturnUnsupported;
++ *         2 = full-surface conversion and nearest-neighbour scaling between 'BGRA', '420f' and '420v'
++ *             on the CPU (rectangles ignored, logged); anything else kIOReturnUnsupported.
++ * Colour: BT.601, '420f' full range, '420v' video range (integer arithmetic, no floating point).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <pexpert/pexpert.h>
++#include <kern/task.h>
++#include <kern/clock.h>
++#include <sys/proc.h>
++#include "SweetSurface.h"
++
++#define SCALER_BLOCK_MIN        0x68u
++#define SCALER_FMT_BGRA         0x42475241u
++#define SCALER_FMT_420F         0x34323066u
++#define SCALER_FMT_420V         0x34323076u
++#define SCALER_MAX_DIM          8192u
++
++static int spes_scaler_stage = -1;
++
++static int
++scaler_stage(void)
++{
++	if (spes_scaler_stage < 0) {
++		uint32_t v = 0;
++		(void)PE_parse_boot_argn("spesscaler", &v, sizeof(v));
++		spes_scaler_stage = (int)v;
++	}
++	return spes_scaler_stage;
++}
++
++/* One picture as the converter sees it: validated pointers into the surface's kernel mapping. */
++struct scaler_pic {
++	uint32_t format, width, height;
++	uint8_t *p0, *p1;               /* BGRA rows, or luma rows and CbCr rows */
++	uint32_t row0, row1;            /* bytes a row */
++	uint32_t cw, ch;                /* chroma plane size */
++};
++
++static bool
++scaler_pic_from(SweetSurface *s, struct scaler_pic *pic, bool writing)
++{
++	uintptr_t base = s->kernelAddress();
++
++	bzero(pic, sizeof(*pic));
++	pic->format = s->pixelFormat;
++	pic->width = s->width;
++	pic->height = s->height;
++	if (base == 0 || s->width == 0 || s->height == 0 || s->width > SCALER_MAX_DIM || s->height > SCALER_MAX_DIM) {
++		return false;
++	}
++	(void)writing;
++	if (s->pixelFormat == SCALER_FMT_BGRA) {
++		uint64_t need = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * (s->height - 1) + (uint64_t)s->width * 4;
++		if (s->planeCount != 0 || s->bytesPerElement != 4 || s->bytesPerRow < s->width * 4 || need > s->allocSize) {
++			return false;
++		}
++		pic->p0 = (uint8_t *)base + s->offset;
++		pic->row0 = s->bytesPerRow;
++		return true;
++	}
++	if (s->pixelFormat == SCALER_FMT_420F || s->pixelFormat == SCALER_FMT_420V) {
++		const struct sweet_surface_plane *y = &s->planes[0], *c = &s->planes[1];
++		if (s->planeCount != 2 || y->width != s->width || y->height != s->height || y->bytesPerRow < y->width ||
++		    c->width == 0 || c->height == 0 || c->width > (s->width + 1) / 2 || c->height > (s->height + 1) / 2 ||
++		    c->bytesPerRow < c->width * 2 ||
++		    (uint64_t)y->offset + (uint64_t)y->bytesPerRow * (y->height - 1) + y->width > s->allocSize ||
++		    (uint64_t)c->offset + (uint64_t)c->bytesPerRow * (c->height - 1) + (uint64_t)c->width * 2 > s->allocSize) {
++			return false;
++		}
++		pic->p0 = (uint8_t *)base + y->offset;
++		pic->row0 = y->bytesPerRow;
++		pic->p1 = (uint8_t *)base + c->offset;
++		pic->row1 = c->bytesPerRow;
++		pic->cw = c->width;
++		pic->ch = c->height;
++		return true;
++	}
++	return false;
++}
++
++static inline uint8_t
++clamp8(int v)
++{
++	return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
++}
++
++/* Red, green, blue of one source pixel. */
++static inline void
++scaler_rgb(const struct scaler_pic *s, uint32_t x, uint32_t y, int *r, int *g, int *b)
++{
++	if (s->format == SCALER_FMT_BGRA) {
++		const uint8_t *p = s->p0 + (size_t)s->row0 * y + (size_t)x * 4;
++		*b = p[0]; *g = p[1]; *r = p[2];
++		return;
++	}
++	uint32_t cx = x / 2 < s->cw ? x / 2 : s->cw - 1, cy = y / 2 < s->ch ? y / 2 : s->ch - 1;
++	int yy = s->p0[(size_t)s->row0 * y + x];
++	const uint8_t *c = s->p1 + (size_t)s->row1 * cy + (size_t)cx * 2;
++	int cb = c[0] - 128, cr = c[1] - 128;
++	if (s->format == SCALER_FMT_420F) {
++		*r = clamp8((yy * 256 + 359 * cr + 128) >> 8);
++		*g = clamp8((yy * 256 - 88 * cb - 183 * cr + 128) >> 8);
++		*b = clamp8((yy * 256 + 454 * cb + 128) >> 8);
++	} else {
++		int l = (yy - 16) * 298;
++		*r = clamp8((l + 409 * cr + 128) >> 8);
++		*g = clamp8((l - 100 * cb - 208 * cr + 128) >> 8);
++		*b = clamp8((l + 516 * cb + 128) >> 8);
++	}
++}
++
++/* The whole source into the whole destination (nearest neighbour when the sizes differ). */
++static void
++scaler_convert(const struct scaler_pic *s, const struct scaler_pic *d)
++{
++	uint32_t stepx = (uint32_t)(((uint64_t)s->width << 16) / d->width);
++	uint32_t stepy = (uint32_t)(((uint64_t)s->height << 16) / d->height);
++	bool full = d->format == SCALER_FMT_420F;
++	int r, g, b;
++
++	for (uint32_t y = 0; y < d->height; y++) {
++		uint32_t sy = (uint32_t)(((uint64_t)y * stepy) >> 16);
++		if (sy >= s->height) sy = s->height - 1;
++		uint8_t *row = d->p0 + (size_t)d->row0 * y;
++		for (uint32_t x = 0; x < d->width; x++) {
++			uint32_t sx = (uint32_t)(((uint64_t)x * stepx) >> 16);
++			if (sx >= s->width) sx = s->width - 1;
++			scaler_rgb(s, sx, sy, &r, &g, &b);
++			if (d->format == SCALER_FMT_BGRA) {
++				row[x * 4] = (uint8_t)b; row[x * 4 + 1] = (uint8_t)g; row[x * 4 + 2] = (uint8_t)r; row[x * 4 + 3] = 255;
++			} else if (full) {
++				row[x] = clamp8((77 * r + 150 * g + 29 * b + 128) >> 8);
++			} else {
++				row[x] = clamp8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
++			}
++		}
++	}
++	if (d->format == SCALER_FMT_BGRA) {
++		return;
++	}
++	for (uint32_t cy = 0; cy < d->ch; cy++) {
++		uint32_t dy = cy * 2 < d->height ? cy * 2 : d->height - 1;
++		uint32_t sy = (uint32_t)(((uint64_t)dy * stepy) >> 16);
++		if (sy >= s->height) sy = s->height - 1;
++		uint8_t *row = d->p1 + (size_t)d->row1 * cy;
++		for (uint32_t cx = 0; cx < d->cw; cx++) {
++			uint32_t dx = cx * 2 < d->width ? cx * 2 : d->width - 1;
++			uint32_t sx = (uint32_t)(((uint64_t)dx * stepx) >> 16);
++			if (sx >= s->width) sx = s->width - 1;
++			scaler_rgb(s, sx, sy, &r, &g, &b);
++			if (full) {
++				row[cx * 2] = clamp8(((-43 * r - 85 * g + 128 * b + 128) >> 8) + 128);
++				row[cx * 2 + 1] = clamp8(((128 * r - 107 * g - 21 * b + 128) >> 8) + 128);
++			} else {
++				row[cx * 2] = clamp8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
++				row[cx * 2 + 1] = clamp8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
++			}
++		}
++	}
++}
++
++class AppleM2ScalerCSCDriver : public IOService {
++	OSDeclareDefaultStructors(AppleM2ScalerCSCDriver);
++
++public:
++	IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleM2ScalerCSCDriver, IOService);
++
++IOService *
++AppleM2ScalerCSCDriver::probe(IOService *provider, SInt32 *score)
++{
++	if (scaler_stage() <= 0) {
++		return NULL;            /* no boot-arg: no service, exactly as before 0219 */
++	}
++	return IOService::probe(provider, score);
++}
++
++bool
++AppleM2ScalerCSCDriver::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "IOSurfaceAcceleratorClient");
++	registerService();
++	IOLog("SPES SCALER: AppleM2ScalerCSCDriver registered, stage %d (%s)\n", scaler_stage(),
++	    scaler_stage() >= 2 ? "converting on the CPU" : "logging only, every request refused");
++	return true;
++}
++
++class IOSurfaceAcceleratorClient : public IOUserClient {
++	OSDeclareDefaultStructors(IOSurfaceAcceleratorClient);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOSurfaceAcceleratorClient, IOUserClient);
++
++bool
++IOSurfaceAcceleratorClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	char name[32] = "?";
++
++	proc_selfname(name, sizeof(name));
++	if (type != 0) {
++		IOLog("SPES SCALER: %s opens with type 0x%x: refused (only type 0)\n", name, (unsigned)type);
++		return false;
++	}
++	return IOUserClient::initWithTask(owningTask, securityID, type);
++}
++
++IOReturn
++IOSurfaceAcceleratorClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++static void
++scaler_describe(const char *what, uint32_t id, SweetSurface *s)
++{
++	if (s == NULL) {
++		IOLog("SPES SCALER:   %s id %u: no such surface\n", what, id);
++		return;
++	}
++	IOLog("SPES SCALER:   %s id %u fmt 0x%x %ux%u bpe %u bpr %u planes %u alloc %u%s\n", what, id, s->pixelFormat, s->width,
++	    s->height, s->bytesPerElement, s->bytesPerRow, s->planeCount, s->allocSize, s->externalBase ? " (client memory)" : "");
++	for (uint32_t i = 0; i < s->planeCount && i < 3; i++) {
++		IOLog("SPES SCALER:     plane %u %ux%u bpr %u at +%u\n", i, s->planes[i].width, s->planes[i].height,
++		    s->planes[i].bytesPerRow, s->planes[i].offset);
++	}
++}
++
++IOReturn
++IOSurfaceAcceleratorClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	static uint32_t shown, others, done, refused;
++	char name[32] = "?";
++	const uint8_t *in = (const uint8_t *)args->structureInput;
++	uint32_t len = args->structureInputSize;
++	uint32_t ida, idb;
++	uint64_t flags;
++	IOReturn ret = kIOReturnUnsupported;
++
++	proc_selfname(name, sizeof(name));
++	if (selector != 1 || in == NULL || len < SCALER_BLOCK_MIN) {
++		if (others++ < 24) {
++			IOLog("SPES SCALER: %s selector %u scalars %u struct in %u (descriptor %d) out %u: not done\n", name, selector,
++			    args->scalarInputCount, len, args->structureInputDescriptor != NULL, args->structureOutputSize);
++		}
++		return kIOReturnUnsupported;
++	}
++	memcpy(&ida, in, 4);
++	memcpy(&idb, in + 4, 4);
++	memcpy(&flags, in + 0x20, 8);
++	SweetSurface *a = sweet_surface_copy(ida), *b = sweet_surface_copy(idb);
++	bool talk = shown < 40;
++
++	if (talk) {
++		shown++;
++		IOLog("SPES SCALER: %s transform, block %u bytes, flags 0x%llx\n", name, len, flags);
++		scaler_describe("first", ida, a);
++		scaler_describe("second", idb, b);
++		for (uint32_t at = 0x08; at + 16 <= 0x68 && at + 16 <= len; at += 16) {
++			uint64_t lo, hi;
++			memcpy(&lo, in + at, 8);
++			memcpy(&hi, in + at + 8, 8);
++			IOLog("SPES SCALER:   +0x%02x: %016llx %016llx\n", at, lo, hi);
++		}
++	}
++	if (scaler_stage() >= 2 && a != NULL && b != NULL && a != b) {
++		struct scaler_pic src, dst;
++		if (scaler_pic_from(a, &src, false) && scaler_pic_from(b, &dst, true)) {
++			uint64_t began = mach_absolute_time(), ns = 0;
++			scaler_convert(&src, &dst);
++			sweet_surface_changed(b);
++			absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++			ret = kIOReturnSuccess;
++			done++;
++			if (talk || (done % 200) == 0) {
++				IOLog("SPES SCALER:   converted in %llu us (%u done, %u refused so far)\n", ns / 1000, done, refused);
++			}
++		} else if (talk) {
++			IOLog("SPES SCALER:   a format or layout this stage does not do: refused\n");
++		}
++	}
++	if (ret != kIOReturnSuccess) {
++		refused++;
++	}
++	OSSafeReleaseNULL(a);
++	OSSafeReleaseNULL(b);
++	return ret;
++}
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 85d9fae..6c90879 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1565,6 +1565,14 @@ IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category
+ 	return kIOReturnSuccess;
+ }
+ 
++void
++sweet_surface_changed(SweetSurface *s)
++{
++	if (s != NULL && s->state != NULL) {
++		(void)OSIncrementAtomic((volatile SInt32 *)sweet_surface_seed(s));
++	}
++}
++
+ static IOReturn
+ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
+ {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 8225088..f0c1977 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -66,6 +66,9 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++/* The pixels were written in the kernel: bump the seed clients compare (SpesScaler.cpp). */
++void sweet_surface_changed(SweetSurface *surface);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..8c90f3d 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -63,6 +63,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = IOCoreSurfaceRoot;"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleM2ScalerCSCDriver;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleM2ScalerCSCDriver;"
++    "   },"
++    "   {"
+     "     'IOClass'         = AppleCLCD;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+     "     'IONameMatch'     = 'sweet,display';"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 5e2dedd..019cec3 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -19,6 +19,7 @@ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/SpesScaler.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
