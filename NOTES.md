@@ -5701,3 +5701,15 @@ durch den Nutzer.
     bei uns nicht: „90 Hz not set … DSI total differs“, weil fDsi nur mit **`sweetpanel=1`** eingerichtet wird (DSI0-Befehlsweg:
     Helligkeit, Schlaf; Puffer am Ende der Splash-Region) und unsere Images das nicht setzen.
   - Nächster Lauf all-18: Kernel 0223 + `sweetpanel=1` (90 Hz, Helligkeitsweg). Beobachtung durch den Nutzer nötig (Bild, Helligkeit).
+
+### 18.11.2026 14:40 – all-18: Kernel mit 0223, zusätzlich `sweetpanel=1`
+
+- Image all-18 = Args von all-17 + `sweetpanel=1`, Kernel CI 44305700981 (0223). Start 14:37:55, USB-Netz nach 46 s.
+- Nutzer: beim Start wurde das Bild „grün rauschend und immer heller“, danach war iOS da. Ob das Bild seither sauber ist, ist noch offen.
+- Live-Log: genau ein fehlgeschlagener DSI-Befehl, als backboardd die Helligkeit setzte
+  (`brightness 128 … backlight-level 128`): `SWEET FB: DSI cmd 0x3 not done: ctrl 0x1f7 trig 0x4 dma 0x14000000 int 0
+  status 0x200b err 0`, `panel level 0x418: NO DONE`. Danach keine weiteren Panel-Befehle im Log.
+- Die frühen `SWEET FB: rate`-Zeilen stehen nicht im Live-Log (vor dem USB-Netz) → erst mit dem sweetlog klar, ob 90 Hz gesetzt wurde.
+- LTE-Sitzung kam nach 90 s von selbst (`SESSION UP`, en1 link up, DHCP 3). TSENS 42–53 °C.
+- Offen: sweetlog von all-18 sichern (OrangeFox), Ursache des NO DONE (Befehl im Video-Modus ohne DONE-Unterbrechung?),
+  0223-Umstecktest.
