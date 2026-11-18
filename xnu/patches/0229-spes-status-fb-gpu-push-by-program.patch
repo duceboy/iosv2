@@ -1,0 +1,227 @@
+status: is the picture still moving, and whose cache pushes hold the GPU lock (0229, diagnostics only).
+
+Two open questions from all-21 (2026-11-18), both about things the log could not tell apart:
+- The freeze after 117 minutes: kernel alive, no frame from backboardd any more, no error line. The USB command "status" now
+  also says: vsync count and age of the last one, frames shown, display on/off, panel level; GPU ready, last fence submitted
+  and completed, ring read/write pointers. Asked twice a few seconds apart it tells a dead vsync timer, a GPU that stands
+  still and a window server that submits nothing from one another.
+- Slow frames: backboardd's long glFlush (median 18 ms in 28 of 60 frames over 16.7 ms) falls into periods in which 3-5 MB
+  a submission go out of the processor's cache under gGPULock. The five-second line now has two more: submissions, bytes
+  pushed, push time and time waited for the lock, for backboardd and for everybody else, and the largest single push with
+  its IOSurface.
+Nothing changes what is drawn or when. Not run on hardware yet.
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 0f3a5fc..6684beb 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -35,6 +35,12 @@
+ #include <netinet/in.h>
+ #include <pexpert/device_tree.h>
+ extern void sweet_sample_now(const char *names);        /* 0225: bsd/dev/sweet_sample.c */
++/* 0229: is the picture still moving -- iokit/Kernel/arm/SweetFramebuffer.cpp, the GPU backend (bsd/dev/spes_gpu_backend.h) */
++extern void sweet_fb_status(char *out, size_t size);
++extern uint32_t redwood_gpu_last(void);
++extern uint32_t redwood_gpu_completed(void);
++extern void redwood_gpu_ring(uint32_t *rptr, uint32_t *tail);
++extern bool redwood_gpu_ready(void);
+ /* 0222: counters for the "status" command; defined (as empty stubs off spes) in bsd/dev/spes_cell.c, spes_ipa.c */
+ extern void spes_cell_status(char *out, size_t size);
+ extern void spes_ipa_status(char *out, size_t size);
+@@ -1139,7 +1145,7 @@ ud_cmd_thread(__unused void *arg, __unused wait_result_t wr)
+ 			}
+ 		} else if (strcmp(buf, "status") == 0) {
+ 			/* 0222: the packet counters of the cellular path (read only; text built by their owners) */
+-			static char st[900];
++			static char st[1400];
+ 			size_t at;
+ 			snprintf(st, sizeof(st), "cell: ");
+ 			at = strlen(st);
+@@ -1149,7 +1155,16 @@ ud_cmd_thread(__unused void *arg, __unused wait_result_t wr)
+ 			at = strlen(st);
+ 			spes_ipa_status(st + at, 400);
+ 			at = strlen(st);
+-			snprintf(st + at, sizeof(st) - at, "\n");
++			snprintf(st + at, sizeof(st) - at, "\nfb: ");
++			at = strlen(st);
++			sweet_fb_status(st + at, 300);
++			at = strlen(st);
++			{
++				uint32_t rptr = 0, tail = 0;
++				redwood_gpu_ring(&rptr, &tail);
++				snprintf(st + at, sizeof(st) - at, "\ngpu: %s; last fence %u, completed %u; ring read %u written %u\n",
++				    redwood_gpu_ready() ? "ready" : "NOT ready", redwood_gpu_last(), redwood_gpu_completed(), rptr, tail);
++			}
+ 			reply = st;
+ 		} else if (strncmp(buf, "sample", 6) == 0 && (buf[6] == 0 || buf[6] == ' ')) {
+ 			/* 0225: where are SpringBoard and backboardd (or the processes named) right now -> log ("SMP ...") */
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 47f7acb..b8539c4 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -46,6 +46,7 @@
+ #include <mach/mach_time.h>
+ #include <mach/vm_param.h>
+ #include <sys/systm.h>
++#include <sys/proc.h>      /* 0229: proc_selfname */
+ 
+ #include "SweetSurface.h"
+ 
+@@ -235,6 +236,18 @@ static struct {
+ 	uint32_t submissions, commands, buffers, surfaces, waits, over;
+ 	uint32_t made, given_again;             /* buffers of their own made for programs, and of those kept ones given again */
+ 	uint64_t making;                        /* ... and the time it took to make the others */
++	/*
++	 * 0229: the same by program, [0] the window server, [1] everybody else: submissions, bytes out of the
++	 * cache, the time that took, and the time waited for gGPULock before it. all-21: backboardd's long
++	 * flushes (18 ms) fall into the periods in which 3-5 MB a submission go out of the cache under the
++	 * lock; whose buffers they are, and who waits for whom, the one line for all could not say.
++	 */
++	struct {
++		uint32_t submissions;
++		uint64_t pushed, pushing, locking;
++	} by[2];
++	uint64_t largest;                       /* the most one buffer sent out of the cache */
++	uint32_t largest_surface;               /* its IOSurface, 0: a buffer of the program's own or the host's */
+ } gGPUStat;
+ 
+ /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
+@@ -1124,6 +1137,9 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 	uint64_t addresses[GPU_SUBMIT_CMDS];
+ 	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
+ 	uint64_t began, nanos, again;
++	uint64_t asked, pushed_before;          /* 0229 (declared here: `goto out` may not pass an initialisation) */
++	char program[32];
++	int who;
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+ 	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
+@@ -1141,7 +1157,12 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		ret = kIOReturnVMError;
+ 		goto out;
+ 	}
++	asked = mach_absolute_time();                   /* 0229 */
++	proc_selfname(program, sizeof(program));
++	who = strcmp(program, "backboardd") == 0 ? 0 : 1;
+ 	IOLockLock(gGPULock);
++	gGPUStat.by[who].locking += mach_absolute_time() - asked;
++	pushed_before = gGPUStat.flushed;
+ 	/*
+ 	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
+ 	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to
+@@ -1169,7 +1190,12 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 			 */
+ 			continue;
+ 		}
++		const uint64_t pushed_here = gGPUStat.flushed;
+ 		if ((b->surface != NULL || b->host) && pushModified(b->memory, b->size, &gGPUStat.flushed)) {
++			if (gGPUStat.flushed - pushed_here > gGPUStat.largest) {
++				gGPUStat.largest = gGPUStat.flushed - pushed_here;
++				gGPUStat.largest_surface = b->surface != NULL ? b->surface->id : 0;
++			}
+ 			continue;                       /* only the pages written since the last push */
+ 		}
+ 		if (b->surface != NULL) {
+@@ -1195,9 +1221,16 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 			redwood_gpu_to_memory(b->kernel, b->size);
+ 		}
+ 		gGPUStat.flushed += b->size;
++		if (b->size > gGPUStat.largest) {
++			gGPUStat.largest = b->size;
++			gGPUStat.largest_surface = b->surface != NULL ? b->surface->id : 0;
++		}
+ 	}
+ 	redwood_gpu_to_memory(NULL, 0);                 /* (and what was written last is in memory: a barrier) */
+ 	gGPUStat.flushing += mach_absolute_time() - began;
++	gGPUStat.by[who].submissions++;
++	gGPUStat.by[who].pushed += gGPUStat.flushed - pushed_before;
++	gGPUStat.by[who].pushing += mach_absolute_time() - began;
+ 	gGPUStat.buffers += request->nr_bos;
+ 	for (uint32_t i = 0; i < request->nr_cmds; i++) {
+ 		struct gpu_buffer * b = cmds[i].submit_idx < request->nr_bos ? buffer(bos[cmds[i].submit_idx].handle) : NULL;
+@@ -1302,6 +1335,19 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
+ 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
+ 		    fBufferBytes >> 20);
++		for (int w = 0; w < 2; w++) {
++			uint64_t pushing, locking;
++			uint32_t n = gGPUStat.by[w].submissions;
++
++			absolutetime_to_nanoseconds(gGPUStat.by[w].pushing, &pushing);
++			absolutetime_to_nanoseconds(gGPUStat.by[w].locking, &locking);
++			if (n != 0) {
++				IOLog("RedwoodGPU: %s: %u submissions, %llu KB out of the cache in %llu us each, %llu us each waiting "
++				    "for the lock\n", w == 0 ? "backboardd" : "others", n, (gGPUStat.by[w].pushed >> 10) / n,
++				    pushing / NSEC_PER_USEC / n, locking / NSEC_PER_USEC / n);
++			}
++		}
++		IOLog("RedwoodGPU: largest push %llu KB (IOSurface %u)\n", gGPUStat.largest >> 10, gGPUStat.largest_surface);
+ 		if (gpu_va != 0) {
+ 			/*
+ 			 * The address space itself, because nothing else said anything about it: what
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8a69bcd..00fab32 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -194,6 +194,7 @@ public:
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void status(char *out, size_t size);    /* 0229 */
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -242,6 +243,37 @@ OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++static AppleCLCD *gSweetCLCD;                   /* 0229: for sweet_fb_status() */
++static uint64_t sweet_fb_last_vsync;
++
++void
++AppleCLCD::status(char *out, size_t size)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - sweet_fb_last_vsync, &ns);
++	snprintf(out, size, "vsync %llu (last %llu ms ago) at %u Hz; frames direct %u copied %u, held back %u; display %s, panel level %#x",
++	    fVsyncCount, sweet_fb_last_vsync != 0 ? ns / NSEC_PER_MSEC : 0, fRateHz, fDirectFrames, fCopiedFrames, fMissed,
++	    fPowerOff ? "off" : "on", fPanelLevel);
++}
++
++/*
++ * 0229: one line for the USB command server's "status": does the vsync timer still fire, are frames
++ * still shown (all-21 froze with the kernel alive and nothing in the log to tell these apart).
++ */
++extern "C" void sweet_fb_status(char *out, size_t size);
++void
++sweet_fb_status(char *out, size_t size)
++{
++	if (size == 0) {
++		return;
++	}
++	out[0] = 0;
++	if (gSweetCLCD != NULL) {
++		gSweetCLCD->status(out, size);
++	}
++}
++
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -402,6 +434,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	thread_deallocate(presenterThread);
+ 	setupRate();
++	gSweetCLCD = this;
+ 	fNextVsync = mach_absolute_time();
+ 	armVsync(fVsync);
+ 
+@@ -656,6 +689,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	sweet_fb_last_vsync = now;
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
