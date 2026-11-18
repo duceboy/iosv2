@@ -1,0 +1,45 @@
+spes scaler: accept IOSurfaceAcceleratorSetCustomFilter (selector 4) from stage 2 (0228).
+
+all-14 and all-21: CollectionsPoster (and once assetsd) call selector 4 with a 32-byte struct and nothing out; the stand-in
+answered kIOReturnUnsupported ("not done", 24 logged, the limit of the log). Disassembly of IOSurfaceAccelerator.framework
+(20H392, local): _IOSurfaceAcceleratorSetCustomFilter -> IOConnectCallStructMethod(conn, 4, block, 0x20, NULL, NULL); block =
+u32 ratio (0x8000 = 1.0), u32, u32 table dimensions, the same three again, u64 address of the coefficients in the caller;
+callers: Portrait, CMImaging, CMCapture, QuartzCore copy_iosurface (ignores the result), SetFilterCoefficients.
+The software scaler has no filter (nearest pixel), so the request is checked, logged (12 lines, own counter) and answered
+with success; the coefficients are not read. Quality may differ from a filtered scale. Whether CollectionsPoster's
+"extension check-in timeout" has to do with it is not known. Not run on hardware yet.
+
+diff --git a/iokit/Kernel/arm/SpesScaler.cpp b/iokit/Kernel/arm/SpesScaler.cpp
+index 268a5cd..b79df72 100644
+--- a/iokit/Kernel/arm/SpesScaler.cpp
++++ b/iokit/Kernel/arm/SpesScaler.cpp
+@@ -282,6 +282,29 @@ IOSurfaceAcceleratorClient::externalMethod(uint32_t selector, IOExternalMethodAr
+ 	IOReturn ret = kIOReturnUnsupported;
+ 
+ 	proc_selfname(name, sizeof(name));
++	if (selector == 4 && in != NULL && len == 0x20 && args->structureOutputSize == 0) {
++		/*
++		 * 0228: IOSurfaceAcceleratorSetCustomFilter (IOSurfaceAccelerator.framework 20H392: struct method 4,
++		 * 32 bytes in, nothing out, synchronous): two scale ratios (0x8000 = 1.0) each with two table
++		 * dimensions, and the caller's address of the coefficients, used by later transforms that ask for
++		 * the custom filter. This scaler takes the nearest pixel and has no filter: the request is checked
++		 * as the library checks it (no zero field), logged, and answered with success from stage 2 on; the
++		 * coefficients are not read. all-14/all-21: CollectionsPoster's calls all got "not done".
++		 */
++		static uint32_t filters;
++		uint32_t f[6];
++		uint64_t where;
++		memcpy(f, in, sizeof(f));
++		memcpy(&where, in + 0x18, 8);
++		bool sane = where != 0 && f[0] != 0 && f[1] != 0 && f[2] != 0 && f[3] != 0 && f[4] != 0 && f[5] != 0 &&
++		    f[1] <= 1024 && f[2] <= 1024 && f[4] <= 1024 && f[5] <= 1024;
++		if (filters++ < 12) {
++			IOLog("SPES SCALER: %s custom filter: ratio 0x%x table %u x %u, ratio 0x%x table %u x %u: %s\n", name,
++			    f[0], f[1], f[2], f[3], f[4], f[5],
++			    !sane ? "refused" : scaler_stage() >= 2 ? "accepted, not applied" : "not done (stage 1)");
++		}
++		return !sane ? kIOReturnBadArgument : scaler_stage() >= 2 ? kIOReturnSuccess : kIOReturnUnsupported;
++	}
+ 	if (selector != 1 || in == NULL || len < SCALER_BLOCK_MIN) {
+ 		if (others++ < 24) {
+ 			IOLog("SPES SCALER: %s selector %u scalars %u struct in %u (descriptor %d) out %u: not done\n", name, selector,
