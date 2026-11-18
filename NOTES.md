@@ -5865,3 +5865,16 @@ durch den Nutzer.
 - CI 44361206908 (0229) erfolgreich; Kernel 0ccf73ef…, Image all-24 f0b33c64… gebaut, Args per strings geprüft.
 - Entwürfe in Arbeit (Agenten, nur Scratch): 90-Hz-Umschaltung nach Linux-Vorbild hinter `sweetfb_rate2=1`; Cache-Push außerhalb
   von gGPULock hinter `gpu_pushout=1`.
+
+### 18.11.2026 18:58 – 0230 (Standardsatz der spes-Schalter im Kernel), Entwurf gpu_pushout
+
+- **0230** (CI 44364495648): mit `spesdef=1` sucht PE_parse_boot_argn einen nicht übergebenen Schalter in einer festen Liste
+  (sweetlog, sweettouch*, sweetkeys, sweethw=0, sweetfb_noconsole, sweetfb_hz=60, **sweetfb_rate=60**, spesgpuprobe,
+  spesgpu_mhz=785, modem, wifi, modem_part=modem_b, spesbattery, sweetusb=2, spesscaler=2, spesvib=5, spesddr_khz=2133000,
+  adsp, spesamp=2, spescodec=4). Was auf der Zeile steht, gewinnt. `spesgpu=1` bleibt auf der Zeile (die Vorprüfung der
+  EAGL-Brücke liest kern.bootargs). Bauskript: `SPES_DEFAULTS=1` erzeugt die Kurzform. Erst nach einem Lauf zum Standard machen.
+- **Entwurf `gpu_pushout=1`** (Agent, research/drafts/20261118/push/, nicht angewendet, nicht übersetzt): submit() entscheidet
+  unter gGPULock nur noch, was zu schieben ist, schiebt ohne Sperre, nimmt sie wieder. Lebensdauer über einen Pin-Zähler je
+  Puffer, auf den freeBuffer() wartet (ein retain reicht bei Host-Puffern nicht: freeBuffer entwirt die Seiten). Bringt nur
+  etwas, wenn backboardd hinter den Pushes ANDERER wartet – das zeigen erst die 0229-Zeilen (`backboardd: … waiting for the lock`).
+- Hilfswerkzeuge der Agenten (Disassembler-Ersatz über cstool, .ips-Auswertung) liegen in research/drafts/20261118/.
