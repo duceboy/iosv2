@@ -1,0 +1,991 @@
+spes: temperatures and clock, read only (0218, spestherm=N; sub-agent draft, docs/SPES-THERM-DRAFT.md).
+
+bsd/dev/spes_therm.c/.h: TSENS (live DT reg 0x4410000 SROT / 0x4411000 TM, 16 sensors, Linux tsens2xxx), PM6125 RTC second
+counter (SID 0 0x6048.., Linux rtc-pm8xxx/qpnp-rtc) and the PMIC temp alarm (0x2400), one log line every 30 s. Stage 2 adds a
+read-only dump of the ADC block 0x3100 and its arbiter owner. Stages 3/4 (ADC conversions, Linux qcom-spmi-adc5) need writes to
+SID 0 0x3142..0x3147, which this patch does NOT allow-list: sweet_spmi_write() refuses them and the driver says so once.
+sweet_spmi_read() gains the read list spes_therm_spmi_read_allowed() (observer reads). Nothing runs without the boot-arg.
+Not run on hardware yet; open checks in the draft document.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e3ac8da..23bff63 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/spes_cell.c		standard
+ bsd/dev/spes_cpufreq.c		standard
+ bsd/dev/spes_amp.c		standard
+ bsd/dev/spes_usb.c		standard
++bsd/dev/spes_therm.c		standard
+ bsd/dev/sweet_files.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+diff --git a/bsd/dev/spes_therm.c b/bsd/dev/spes_therm.c
+new file mode 100644
+index 0000000..5cbdd0e
+--- /dev/null
++++ b/bsd/dev/spes_therm.c
+@@ -0,0 +1,543 @@
++/*
++ * spes/spesn temperatures and clock, read-out only (boot-arg spestherm=N; nothing happens without it).
++ *
++ *   spestherm=1  TSENS (16 SoC sensors, mdegC) + PM6125 RTC seconds counter + PM6125 temp-alarm status:
++ *                identification once, then ONE log line every 30 s. Reads only: MMIO loads from the
++ *                TSENS blocks and SPMI observer reads (sweet_spmi_read). No PMIC write, no TSENS write.
++ *   spestherm=2  as 1, plus a one-time read-only dump of the PM6125 ADC block (identity, status,
++ *                0x3142..0x3147, last result) and of the SPMI ownership of its APID. There is no supply,
++ *                reset or clock to switch for these three blocks (TSENS is always on, the PMIC is on),
++ *                so stage 2 has nothing to turn on and off again.
++ *   spestherm=3  as 2, plus ONE round of ADC conversions (all 11 live-FDT channels). A conversion needs
++ *                six one-byte PMIC writes (SID 0, 0x3142..0x3147). They are NOT on the SPMI write
++ *                allow-list today: sweet_spmi_write() refuses them and this stage then logs the refusal
++ *                and changes nothing. See EINBAU.md "Freigabeliste". Every configuration byte is read
++ *                back and the five configuration registers are restored to their starting values.
++ *   spestherm=4  as 3, and the die + six thermistor channels are converted in every 30 s round.
++ *
++ * Never touched in any stage: RTC write/alarm registers (0x6040.., 0x61xx), ADC_TM (0x3400/0x3500),
++ * TSENS thresholds/interrupt registers, the TZ re-init SCM call of Linux's tsens-reinit-wa, charger,
++ * charge pump, fuel gauge.
++ *
++ * Every address and value is documented with its origin in spes_therm.h (live FDT node / Linux file +
++ * function). SPMI arbiter addresses (ownership lookup, reads only): live FDT qcom,spmi@1c40000, core
++ * 0x1c40000, cnfg 0x1c0a000; mapping table core + 0x900 + 4 * apid (PPID in bits 19:8), owner
++ * cnfg + 0x700 + 4 * apid bits 2:0 - the same offsets bsd/dev/sweet_spmi.c and sweet_keys.c use.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include "sweet_spmi.h"
++#include "spes_therm.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);   /* sweet_spmi.c, 0186; allow-listed only */
++
++#define LOGP                "SPES THERM: "
++#define THERM_PERIOD_MS     30000u
++#define THERM_ARB_CORE_PA   0x01c40000u
++#define THERM_ARB_CFG_PA    0x01c0a000u
++#define THERM_ADC_POLLS     40u            /* Linux ADC_CONV_TIME_RETRY_POLL */
++#define THERM_ADC_POLL_MS   10u            /* Linux ADC_POLL_DELAY_MIN_US */
++
++static const char *const therm_tsens_name[SPES_TSENS_SENSORS] = {
++	/* live FDT thermal-zones, thermal-sensors = <&tsens0 0..15> */
++	"mapss", "cdsp-hvx", "wlan", "camera", "video", "mdm-1", "cpu-1-0", "cpu-1-1",
++	"cpu-1-2", "cpu-1-3", "cpuss-0", "cpuss-1", "cpuss-2", "mdm-0", "display", "gpu",
++};
++
++static int          therm_stage;
++static bool         therm_started;
++static vm_offset_t  therm_srot, therm_tm;
++static bool         therm_spmi_ok;
++static bool         therm_adc_dead;        /* a restore failed or a write was refused: no more conversions */
++static int          therm_last_max = SPES_TSENS_BAD;
++static uint64_t     therm_rtc_off;         /* boot-arg spesrtcoff: UTC seconds at RTC counter 0 */
++static int          therm_sleep_chan;
++
++static uint32_t
++therm_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++therm_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&therm_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint32_t
++therm_uptime_s(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return (uint32_t)(ns / NSEC_PER_SEC);
++}
++
++/* ------------------------------------------------------------------ TSENS (MMIO loads only) */
++
++static bool
++therm_tsens_map(void)
++{
++	if (therm_srot == 0) {
++		therm_srot = ml_io_map(SPES_TSENS_SROT_PA, 0x1000);
++	}
++	if (therm_tm == 0) {
++		therm_tm = ml_io_map(SPES_TSENS_TM_PA, 0x1000);
++	}
++	return therm_srot != 0 && therm_tm != 0;
++}
++
++/* true when the controller has finished its first round; waits at most 5 * 500 us as Linux does */
++static bool
++therm_tsens_ready(uint32_t *trdy_out)
++{
++	uint32_t trdy = 0;
++	for (unsigned i = 0; i < 6; i++) {
++		trdy = therm_rd(therm_tm, SPES_TSENS_TRDY);
++		if (trdy & SPES_TSENS_TRDY_FIRST) {
++			break;
++		}
++		delay(500);
++	}
++	if (trdy_out) {
++		*trdy_out = trdy;
++	}
++	return (trdy & SPES_TSENS_TRDY_FIRST) != 0;
++}
++
++/* caller has checked: mapped, sensor < 16 and enabled, controller ready */
++static int
++therm_tsens_sample(unsigned sensor)
++{
++	uint32_t off = SPES_TSENS_SN_STATUS + 4u * sensor;
++	uint32_t s1 = therm_rd(therm_tm, off), s2 = s1, s3 = s1;
++	if (!(s1 & SPES_TSENS_VALID)) {
++		s2 = therm_rd(therm_tm, off);
++		if (!(s2 & SPES_TSENS_VALID)) {
++			s3 = therm_rd(therm_tm, off);
++		}
++	}
++	return spes_tsens_pick(s1, s2, s3);
++}
++
++int
++spes_therm_tsens_read(unsigned sensor, int *mdegc)
++{
++	if (sensor >= SPES_TSENS_SENSORS || mdegc == NULL || !therm_tsens_map()) {
++		return -1;
++	}
++	uint32_t mask = spes_tsens_enabled_mask(therm_rd(therm_srot, SPES_TSENS_SROT_CTRL));
++	if (!(mask & (1u << sensor)) || !therm_tsens_ready(NULL)) {
++		return -1;
++	}
++	*mdegc = therm_tsens_sample(sensor);
++	return 0;
++}
++
++int
++spes_therm_tsens_max(void)
++{
++	return therm_last_max;
++}
++
++static void
++therm_tsens_identify(void)
++{
++	if (!therm_tsens_map()) {
++		printf(LOGP "TSENS mapping failed\n");
++		return;
++	}
++	uint32_t ctrl = therm_rd(therm_srot, SPES_TSENS_SROT_CTRL);
++	uint32_t trdy = 0;
++	bool ready = therm_tsens_ready(&trdy);
++	printf(LOGP "TSENS srot %#x tm %#x: ctrl %#x (%s) sensor-mask %#x trdy %#x (%s)\n",
++	    SPES_TSENS_SROT_PA, SPES_TSENS_TM_PA, ctrl, (ctrl & 1u) ? "enabled" : "OFF",
++	    spes_tsens_enabled_mask(ctrl), trdy, ready ? "first round done" : "NOT ready, values withheld");
++	printf(LOGP "tsens order: 0 %s 1 %s 2 %s 3 %s 4 %s 5 %s 6 %s 7 %s 8 %s 9 %s 10 %s 11 %s 12 %s 13 %s 14 %s 15 %s\n",
++	    therm_tsens_name[0], therm_tsens_name[1], therm_tsens_name[2], therm_tsens_name[3],
++	    therm_tsens_name[4], therm_tsens_name[5], therm_tsens_name[6], therm_tsens_name[7],
++	    therm_tsens_name[8], therm_tsens_name[9], therm_tsens_name[10], therm_tsens_name[11],
++	    therm_tsens_name[12], therm_tsens_name[13], therm_tsens_name[14], therm_tsens_name[15]);
++}
++
++/* ------------------------------------------------------------------ PM6125 RTC (observer reads only) */
++
++int
++spes_therm_rtc_read(uint32_t *secs, uint8_t *ctrl_out)
++{
++	uint8_t b[4] = {0, 0, 0, 0}, lsb = 0, ctrl = 0;
++	if (secs == NULL || sweet_spmi_init() != 0) {
++		return -1;
++	}
++	if (sweet_spmi_read(SPES_THERM_SID, SPES_RTC_CTRL, &ctrl) != 0) {
++		return -1;
++	}
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		for (unsigned i = 0; i < 4; i++) {
++			if (sweet_spmi_read(SPES_THERM_SID, SPES_RTC_RDATA0 + i, &b[i]) != 0) {
++				return -1;
++			}
++		}
++		if (sweet_spmi_read(SPES_THERM_SID, SPES_RTC_RDATA0, &lsb) != 0) {
++			return -1;
++		}
++		if (spes_rtc_read_consistent(b[0], lsb)) {
++			*secs = spes_rtc_assemble(b);
++			if (ctrl_out) {
++				*ctrl_out = ctrl;
++			}
++			return 0;
++		}
++	}
++	return -1;
++}
++
++int
++spes_therm_utc_offer(uint64_t *utc_secs)
++{
++	uint32_t rtc = 0;
++	uint8_t ctrl = 0;
++	uint64_t off = therm_rtc_off;
++	if (utc_secs == NULL) {
++		return -1;
++	}
++	if (off == 0) {
++		/* may be called from IOKitInitializeTime, long before spes_therm_init() */
++		(void)PE_parse_boot_argn("spesrtcoff", &off, sizeof(off));
++		therm_rtc_off = off;
++	}
++	if (off == 0 || spes_therm_rtc_read(&rtc, &ctrl) != 0 || !(ctrl & 0x80u)) {
++		return -1;
++	}
++	uint64_t utc = spes_rtc_to_utc(rtc, off);
++	if (utc == 0) {
++		return -1;
++	}
++	*utc_secs = utc;
++	return 0;
++}
++
++/* ------------------------------------------------------------------ PM6125 ADC */
++
++/* Which APID carries SID 0 / peripheral 0x31 and who owns it (arbiter tables, MMIO loads only). */
++static void
++therm_adc_owner_log(void)
++{
++	vm_offset_t core = ml_io_map(THERM_ARB_CORE_PA, 0x2000);
++	vm_offset_t cfg = ml_io_map(THERM_ARB_CFG_PA, 0x1000);
++	if (core == 0 || cfg == 0) {
++		printf(LOGP "ADC: arbiter mapping failed\n");
++		return;
++	}
++	uint32_t count = therm_rd(core, 4) & 0x7ffu;
++	if (count == 0 || count > 512) {
++		printf(LOGP "ADC: arbiter APID count %u not plausible\n", count);
++		return;
++	}
++	unsigned found = 0;
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t map = therm_rd(core, 0x900u + 4u * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != (SPES_ADC_BASE >> 8)) {
++			continue;
++		}
++		uint32_t owner = therm_rd(cfg, 0x700u + 4u * i) & 7u;
++		printf(LOGP "ADC: ppid %#x -> APID %u owner EE %u (%s)\n", SPES_ADC_BASE >> 8, i, owner,
++		    owner == 0 ? "apps: writes possible once allow-listed" : "NOT apps: sweet_spmi_write will refuse");
++		found++;
++	}
++	if (found == 0) {
++		printf(LOGP "ADC: no APID maps ppid %#x\n", SPES_ADC_BASE >> 8);
++	}
++}
++
++static void
++therm_adc_dump(void)
++{
++	static const uint16_t regs[] = {
++		SPES_ADC_REVISION2, SPES_ADC_TYPE, SPES_ADC_SUBTYPE, SPES_ADC_STATUS1,
++		SPES_ADC_DIG_PARAM, SPES_ADC_FAST_AVG, SPES_ADC_CH_SEL, SPES_ADC_DELAY,
++		SPES_ADC_EN_CTL1, SPES_ADC_CONV_REQ, SPES_ADC_DATA0, SPES_ADC_DATA1,
++	};
++	uint8_t v[sizeof(regs) / sizeof(regs[0])];
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		v[i] = 0;
++		if (sweet_spmi_read(SPES_THERM_SID, regs[i], &v[i]) != 0) {
++			printf(LOGP "ADC: read %#x failed (sweet_spmi_read list extended? EINBAU.md)\n", regs[i]);
++			return;
++		}
++	}
++	printf(LOGP "ADC 0x3100: rev2 %#x type %#x subtype %#x status1 %#x | dig %#x avg %#x ch %#x delay %#x en %#x req %#x | data %#x\n",
++	    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10] | (v[11] << 8));
++	therm_adc_owner_log();
++}
++
++/* One allow-listed, value-checked ADC write; configuration bytes are read back. 0 = ok. */
++static int
++therm_adc_wr(uint32_t addr, uint8_t value, uint8_t old, uint32_t ch)
++{
++	uint8_t back = (uint8_t)~value;
++	if (!spes_therm_adc_write_allowed(SPES_THERM_SID, addr, 1) || !spes_therm_adc_value_ok(addr, value, old, ch)) {
++		printf(LOGP "ADC: write %#x = %#x refused by spes_therm.h\n", addr, value);
++		return -1;
++	}
++	if (sweet_spmi_write(SPES_THERM_SID, addr, value) != 0) {
++		return -1;
++	}
++	if (addr == SPES_ADC_CONV_REQ) {
++		return 0;           /* strobe: checked through STATUS1 by the caller */
++	}
++	if (sweet_spmi_read(SPES_THERM_SID, addr, &back) != 0 || back != value) {
++		printf(LOGP "ADC: %#x wrote %#x, read back %#x\n", addr, value, back);
++		return -1;
++	}
++	return 0;
++}
++
++/*
++ * One conversion as Linux adc_configure() + adc_poll_wait_eoc() + adc_read_voltage_data(), then
++ * the five configuration registers go back to what they were. 0 = *code valid.
++ */
++static int
++therm_adc_convert(const struct spes_adc_chan *c, uint16_t *code)
++{
++	static const uint16_t cfg[5] = {
++		SPES_ADC_DIG_PARAM, SPES_ADC_FAST_AVG, SPES_ADC_CH_SEL, SPES_ADC_DELAY, SPES_ADC_EN_CTL1,
++	};
++	uint8_t old[5], want[5], st = 0, lo = 0, hi = 0;
++	int result = -1;
++	unsigned written = 0;
++	bool write_failed = false;
++
++	if (therm_adc_dead || c == NULL || code == NULL) {
++		return -1;
++	}
++	if (sweet_spmi_read(SPES_THERM_SID, SPES_ADC_STATUS1, &st) != 0) {
++		return -1;
++	}
++	if (st & SPES_ADC_REQ_STS) {
++		printf(LOGP "ADC: busy (status1 %#x), %s skipped, nothing written\n", st, c->name);
++		return -1;
++	}
++	for (unsigned i = 0; i < 5; i++) {
++		if (sweet_spmi_read(SPES_THERM_SID, cfg[i], &old[i]) != 0) {
++			return -1;
++		}
++	}
++	want[0] = spes_adc_dig_param(old[0], c);
++	want[1] = spes_adc_fast_avg(old[1]);
++	want[2] = c->ch;
++	want[3] = spes_adc_delay(old[3], c);
++	want[4] = (uint8_t)(old[4] | SPES_ADC_EN_BIT);
++
++	for (written = 0; written < 5; written++) {
++		if (therm_adc_wr(cfg[written], want[written], old[written], c->ch) != 0) {
++			printf(LOGP "ADC: %s: configuration write %#x failed, restoring\n", c->name, cfg[written]);
++			written++;      /* the failed register may have changed: restore it too */
++			write_failed = true;
++			goto restore;
++		}
++	}
++	if (therm_adc_wr(SPES_ADC_CONV_REQ, SPES_ADC_REQ_BIT, 0, c->ch) != 0) {
++		printf(LOGP "ADC: %s: conversion request failed, restoring\n", c->name);
++		write_failed = true;
++		goto restore;
++	}
++	for (unsigned poll = 0; poll < THERM_ADC_POLLS; poll++) {
++		if (sweet_spmi_read(SPES_THERM_SID, SPES_ADC_STATUS1, &st) != 0) {
++			goto restore;
++		}
++		if ((st & (SPES_ADC_EOC | SPES_ADC_REQ_STS)) == SPES_ADC_EOC) {
++			if (sweet_spmi_read(SPES_THERM_SID, SPES_ADC_DATA0, &lo) == 0 &&
++			    sweet_spmi_read(SPES_THERM_SID, SPES_ADC_DATA1, &hi) == 0) {
++				uint16_t raw = (uint16_t)(lo | (hi << 8));
++				if (raw == SPES_ADC_INVALID) {
++					printf(LOGP "ADC: %s: result 0x8000 (invalid)\n", c->name);
++				} else {
++					*code = raw;
++					result = 0;
++				}
++			}
++			goto restore;
++		}
++		therm_sleep_ms(THERM_ADC_POLL_MS);
++	}
++	printf(LOGP "ADC: %s: no end of conversion after %u ms (status1 %#x)\n", c->name,
++	    THERM_ADC_POLLS * THERM_ADC_POLL_MS, st);
++
++restore:
++	/* enable first (index 4), then delay, channel, averaging, digital parameters */
++	for (unsigned i = written; i-- > 0;) {
++		uint8_t now = 0;
++		if (sweet_spmi_read(SPES_THERM_SID, cfg[i], &now) != 0) {
++			therm_adc_dead = true;
++			continue;
++		}
++		if (now != old[i] && therm_adc_wr(cfg[i], old[i], old[i], c->ch) != 0) {
++			therm_adc_dead = true;
++		}
++	}
++	if (therm_adc_dead) {
++		printf(LOGP "ADC: RESTORE of 0x3142..0x3146 INCOMPLETE: no further conversions this boot\n");
++		return -1;
++	}
++	if (write_failed) {
++		/* expected while 0x3142..0x3147 are not on the allow-list: say it once, then stay quiet */
++		therm_adc_dead = true;
++		printf(LOGP "ADC: write refused or failed, starting values confirmed/restored: no further conversions this boot (allow-list? EINBAU.md)\n");
++		return -1;
++	}
++	return result;
++}
++
++/* all = every live-FDT channel (stage 3 round); otherwise die + thermistors. One log line. */
++static void
++therm_adc_round(bool all)
++{
++	char line[400];
++	size_t n = 0;
++	line[0] = 0;
++	for (unsigned i = 0; i < SPES_ADC_NCHAN && !therm_adc_dead; i++) {
++		const struct spes_adc_chan *c = &spes_adc_chans[i];
++		uint16_t code = 0;
++		if (!all && c->kind == SPES_ADC_VOLT) {
++			continue;
++		}
++		if (therm_adc_convert(c, &code) != 0) {
++			n += (size_t)snprintf(line + n, sizeof(line) - n, " %s=?", c->name);
++		} else {
++			n += (size_t)snprintf(line + n, sizeof(line) - n, " %s=%d(%#x)", c->name, spes_adc_convert(c, code), code);
++		}
++		if (n >= sizeof(line) - 1) {
++			break;
++		}
++	}
++	printf(LOGP "adc [mC; uV for ref_gnd/vref/vph/vcoin]%s\n", line);
++}
++
++/* ------------------------------------------------------------------ the 30 s line */
++
++static void
++therm_round(void)
++{
++	char line[320];
++	size_t n = 0;
++	int hot = SPES_TSENS_BAD, hoti = -1;
++	uint32_t mask = 0;
++	line[0] = 0;
++	/* readiness is checked once per round; a controller that is not ready yields "-" for all */
++	if (therm_srot != 0 && therm_tm != 0 && therm_tsens_ready(NULL)) {
++		mask = spes_tsens_enabled_mask(therm_rd(therm_srot, SPES_TSENS_SROT_CTRL));
++	}
++	for (unsigned i = 0; i < SPES_TSENS_SENSORS; i++) {
++		if (!(mask & (1u << i))) {
++			n += (size_t)snprintf(line + n, sizeof(line) - n, " -");
++		} else {
++			int mc = therm_tsens_sample(i);
++			n += (size_t)snprintf(line + n, sizeof(line) - n, " %d", mc);
++			if (mc > hot) {
++				hot = mc;
++				hoti = (int)i;
++			}
++		}
++		if (n >= sizeof(line) - 1) {
++			break;
++		}
++	}
++	therm_last_max = hot;
++
++	uint32_t rtc = 0;
++	uint8_t ctrl = 0, tz = 0;
++	bool rtc_ok = therm_spmi_ok && spes_therm_rtc_read(&rtc, &ctrl) == 0;
++	bool tz_ok = therm_spmi_ok && sweet_spmi_read(SPES_THERM_SID, SPES_TZ_STATUS, &tz) == 0;
++	printf(LOGP "up %us tsens mC%s max %d (%s) | rtc %s%u ctrl %#x | pmic-alarm status %s%#x\n",
++	    therm_uptime_s(), line, hot, hoti >= 0 ? therm_tsens_name[hoti] : "none",
++	    rtc_ok ? "" : "unreadable ", rtc, ctrl, tz_ok ? "" : "unreadable ", tz);
++}
++
++static void
++therm_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++
++	therm_tsens_identify();
++
++	therm_spmi_ok = sweet_spmi_init() == 0;
++	if (!therm_spmi_ok) {
++		printf(LOGP "SPMI not available: RTC/ADC/temp-alarm skipped\n");
++	} else {
++		uint32_t rtc = 0;
++		uint8_t ctrl = 0, sub = 0, st = 0, sd = 0;
++		if (spes_therm_rtc_read(&rtc, &ctrl) != 0) {
++			printf(LOGP "RTC not readable (sweet_spmi_read list extended for 0x6046/0x6048..b? EINBAU.md)\n");
++		} else {
++			uint64_t utc = spes_rtc_to_utc(rtc, therm_rtc_off);
++			printf(LOGP "RTC ctrl 0x6046 = %#x (%s) counter %u s = %u d %02u:%02u:%02u since RTC start; spesrtcoff %llu -> utc %llu%s\n",
++			    ctrl, (ctrl & 0x80u) ? "running" : "STOPPED", rtc, rtc / 86400u, (rtc % 86400u) / 3600u,
++			    (rtc % 3600u) / 60u, rtc % 60u, (unsigned long long)therm_rtc_off, (unsigned long long)utc,
++			    utc ? "" : " (no plausible offset; system time not offered)");
++		}
++		if (sweet_spmi_read(SPES_THERM_SID, SPES_TZ_SUBTYPE, &sub) == 0 &&
++		    sweet_spmi_read(SPES_THERM_SID, SPES_TZ_STATUS, &st) == 0 &&
++		    sweet_spmi_read(SPES_THERM_SID, SPES_TZ_SHUTDOWN_CTRL1, &sd) == 0) {
++			printf(LOGP "PMIC temp-alarm 0x2400: subtype %#x (%s) status %#x shutdown_ctrl1 %#x (threshold %u)\n",
++			    sub, sub == 0x09 ? "gen2, state = status bits 6:4" : sub == 0x08 ? "gen1, stage = status bits 1:0" : "unknown",
++			    st, sd, sd & 3u);
++		} else {
++			printf(LOGP "PMIC temp-alarm not readable\n");
++		}
++		if (therm_stage >= 2) {
++			therm_adc_dump();
++		}
++		if (therm_stage >= 3) {
++			therm_adc_round(true);
++		}
++	}
++
++	for (;;) {
++		therm_round();
++		if (therm_stage >= 4 && therm_spmi_ok && !therm_adc_dead) {
++			therm_adc_round(false);
++		}
++		therm_sleep_ms(THERM_PERIOD_MS);
++	}
++}
++
++void
++spes_therm_init(void)
++{
++	int stage = 0;
++	DTEntry platform;
++	thread_t thread;
++
++	if (therm_started || !PE_parse_boot_argn("spestherm", &stage, sizeof(stage)) || stage <= 0) {
++		return;
++	}
++	therm_started = true;
++	if (SecureDTLookupEntry(NULL, "/spes-platform", &platform) != kSuccess) {
++		printf(LOGP "not a spes device tree, nothing done\n");
++		return;
++	}
++	therm_stage = stage > 4 ? 4 : stage;
++	(void)PE_parse_boot_argn("spesrtcoff", &therm_rtc_off, sizeof(therm_rtc_off));
++	printf(LOGP "stage %d (1 tsens+rtc, 2 +adc dump, 3 +adc round, 4 +adc every 30 s)\n", therm_stage);
++	if (kernel_thread_start(therm_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf(LOGP "kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/spes_therm.h b/bsd/dev/spes_therm.h
+new file mode 100644
+index 0000000..84794a9
+--- /dev/null
++++ b/bsd/dev/spes_therm.h
+@@ -0,0 +1,365 @@
++/*
++ * spes/spesn thermal + clock read-out: constants, pure arithmetic and the SPMI access lists.
++ * Free of kernel headers (only <stdint.h>/<stdbool.h> types) so tests/test_spes_therm.py compiles
++ * this very file on the host, like spes_spmi_allow.h and spes_lpg.h.
++ *
++ * Origin of every address/value (live FDT = bericht-recovery/spes-live.dts, phone spesn 0x30022;
++ * Linux = xiaomi-spes-devs android_kernel_xiaomi_spes, lineage-24.0):
++ *
++ * TSENS  live FDT tsens0 "tsens@c222000", compatible qcom,tsens24xx: reg = <0x4410000 0x8> (SROT),
++ *        <0x4411000 0x1ff> (TM). NOTE: the node NAME says c222000, the reg says 0x4410000; reg counts.
++ *        Linux drivers/thermal/tsens.h: TSENS_TM_SN_STATUS = TM + 0xa0, 16 sensors (TSENS_MAX_SENSORS),
++ *        4 bytes apart (hw_id << 2). drivers/thermal/tsens2xxx.c: SROT + 0x4 control, bit 0 TSENS_EN,
++ *        bits 18:3 sensor enable mask (tsens2xxx_hw_sensor_en); TM + 0xe4 TRDY, bit 3 first round
++ *        complete; status bits 11:0 last temp (two's complement, sign bit 0x800, unit 0.1 degC,
++ *        msm_tsens_convert_temp: * 100 = mdegC), bit 21 valid, bits 17/18/19 lower/upper/critical;
++ *        up to three reads, two equal invalid ones win (tsens2xxx_get_temp).
++ *        Sensor names: live FDT thermal-zones "*-usr" with thermal-sensors = <&tsens0 N>.
++ * RTC    live FDT qcom,pm6125@0 / qcom,pm6125_rtc, compatible qcom,pm8941-rtc (no reg, no
++ *        allow-set-time). Linux drivers/rtc/rtc-pm8xxx.c pm8941_regs: ctrl 0x6046 (bit 7 enable),
++ *        read 0x6048..0x604b (seconds, LSB first), pm8xxx_rtc_read_time: read 4 bytes, read the LSB
++ *        again, on carry (second LSB < first) read the 4 bytes again. write 0x6040 and the alarm block
++ *        0x61xx are NOT touched here.
++ * ADC    live FDT pm6125_vadc "vadc@3100", compatible qcom,spmi-adc5, SID 0, reg 0x3100 0x100,
++ *        channels: 0x00 ref_gnd, 0x01 vref_1p25, 0x06 die_temp, 0x83 vph_pwr (1:3), 0x85 vcoin (1:3),
++ *        0x4c xo_therm, 0x4d pa_therm0, 0x4e quiet_therm, 0x52 camera_flash_therm, 0x53 emmc_ufs_therm,
++ *        0x55 rf_pa1_therm (all six: qcom,ratiometric, qcom,hw-settle-time = 200 us, pre-scaling 1:1).
++ *        There is NO battery thermistor channel in this vadc node (battery temperature = SM5602).
++ *        Linux drivers/iio/adc/qcom-spmi-adc5.c: STATUS1 0x08 (bit 0 EOC, bit 1 REQ_STS), DIG_PARAM 0x42
++ *        (bit 6 cal_val, 5:4 cal_sel, 3:2 decimation), FAST_AVG_CTL 0x43 (2:0 samples), CH_SEL_CTL 0x44,
++ *        DELAY_CTL 0x45 (3:0 hw settle index), EN_CTL1 0x46 (bit 7 ADC_EN), CONV_REQ 0x47 (bit 7),
++ *        DATA0/1 0x50/0x51; adc_configure(): read 0x42..0x46, modify, write the five bytes one by one,
++ *        then CONV_REQ; adc_poll_wait_eoc(): (STATUS1 & 3) == 1, 40 polls of 10 ms.
++ *        adc_get_dt_channel_data(): decimation default ADC_DECIMATION_DEFAULT = 2, cal_val TIMER_CAL = 0,
++ *        cal_method RATIOMETRIC = 1 / ABSOLUTE = 2, avg_samples default 0, data_pmic5 hw_settle table
++ *        {15,100,200,...} -> 200 us = index 2, default index 0.
++ *        drivers/iio/adc/qcom-vadc-common.[ch]: VADC5_MAX_CODE 0x7fff, full scale 0x70e4, reference
++ *        1.875 V, ADC_USR_DATA_CHECK 0x8000 = invalid; qcom_vadc_scale_hw_calib_therm() with the table
++ *        adcmap_100k_104ef_104fb_1875_vref (uV -> mdegC, linear interpolation, clamped at both ends);
++ *        qcom_vadc_scale_hw_calib_die_temp(): uV * den / (num * 2) - 273150.
++ * TEMP-ALARM live FDT pm6125_tz "qcom,temp-alarm@2400" (SID 0). Linux qcom-spmi-temp-alarm.c: SUBTYPE
++ *        0x05 (8 = gen1, 9 = gen2), STATUS 0x08 (gen1 stage bits 1:0, gen2 state bits 6:4),
++ *        SHUTDOWN_CTRL1 0x40 (threshold bits 1:0). Read raw only.
++ */
++#ifndef SPES_THERM_H
++#define SPES_THERM_H
++
++/* ------------------------------------------------------------------ TSENS */
++#define SPES_TSENS_SROT_PA        0x04410000u
++#define SPES_TSENS_TM_PA          0x04411000u
++#define SPES_TSENS_SROT_CTRL      0x004u
++#define SPES_TSENS_SN_STATUS      0x0a0u
++#define SPES_TSENS_TRDY           0x0e4u
++#define SPES_TSENS_TRDY_FIRST     0x8u
++#define SPES_TSENS_SENSORS        16u
++#define SPES_TSENS_VALID          (1u << 21)
++#define SPES_TSENS_BAD            (-274000)      /* "no value" marker in mdegC (below absolute zero) */
++
++/* status word -> mdegC (12 bit two's complement tenths of a degree) */
++static inline int
++spes_tsens_code_to_mc(uint32_t status)
++{
++	int code = (int)(status & 0xfffu);
++	if (code & 0x800) {
++		code -= 0x1000;
++	}
++	return code * 100;
++}
++
++/* SROT control word -> 16 bit sensor enable mask; 0 when the controller is off */
++static inline uint32_t
++spes_tsens_enabled_mask(uint32_t srot_ctrl)
++{
++	return (srot_ctrl & 1u) ? ((srot_ctrl >> 3) & 0xffffu) : 0u;
++}
++
++/*
++ * Linux's three-read rule: the first valid read wins; with no valid read, take the value two
++ * consecutive reads agree on (2nd == 1st -> 2nd, 3rd == 2nd -> 3rd), else the first.
++ */
++static inline int
++spes_tsens_pick(uint32_t s1, uint32_t s2, uint32_t s3)
++{
++	if (s1 & SPES_TSENS_VALID) {
++		return spes_tsens_code_to_mc(s1);
++	}
++	if (s2 & SPES_TSENS_VALID) {
++		return spes_tsens_code_to_mc(s2);
++	}
++	if (s3 & SPES_TSENS_VALID) {
++		return spes_tsens_code_to_mc(s3);
++	}
++	if ((s1 & 0xfffu) != (s2 & 0xfffu) && (s2 & 0xfffu) == (s3 & 0xfffu)) {
++		return spes_tsens_code_to_mc(s3);
++	}
++	return spes_tsens_code_to_mc(s1);
++}
++
++/* ------------------------------------------------------------------ PMIC (SID 0) */
++#define SPES_THERM_SID            0u
++#define SPES_RTC_CTRL             0x6046u        /* bit 7 = RTC enabled */
++#define SPES_RTC_RDATA0           0x6048u        /* .. 0x604b */
++#define SPES_TZ_SUBTYPE           0x2405u
++#define SPES_TZ_STATUS            0x2408u
++#define SPES_TZ_SHUTDOWN_CTRL1    0x2440u
++
++#define SPES_ADC_BASE             0x3100u
++#define SPES_ADC_REVISION2        0x3101u
++#define SPES_ADC_TYPE             0x3104u
++#define SPES_ADC_SUBTYPE          0x3105u
++#define SPES_ADC_STATUS1          0x3108u
++#define SPES_ADC_DIG_PARAM        0x3142u
++#define SPES_ADC_FAST_AVG         0x3143u
++#define SPES_ADC_CH_SEL           0x3144u
++#define SPES_ADC_DELAY            0x3145u
++#define SPES_ADC_EN_CTL1          0x3146u
++#define SPES_ADC_CONV_REQ         0x3147u
++#define SPES_ADC_DATA0            0x3150u
++#define SPES_ADC_DATA1            0x3151u
++
++#define SPES_ADC_EOC              0x01u
++#define SPES_ADC_REQ_STS          0x02u
++#define SPES_ADC_EN_BIT           0x80u
++#define SPES_ADC_REQ_BIT          0x80u
++#define SPES_ADC_DIG_MASK         0x7cu          /* cal_val | cal_sel | decimation */
++#define SPES_ADC_DIG_RATIO        0x18u          /* timer cal 0, ratiometric 1 << 4, decimation 2 << 2 */
++#define SPES_ADC_DIG_ABS          0x28u          /* timer cal 0, absolute 2 << 4, decimation 2 << 2 */
++#define SPES_ADC_AVG_MASK         0x07u
++#define SPES_ADC_SETTLE_MASK      0x0fu
++#define SPES_ADC_SETTLE_200US     0x02u
++#define SPES_ADC_SETTLE_DEF       0x00u
++#define SPES_ADC_FULL_SCALE       0x70e4
++#define SPES_ADC_MAX_CODE         0x7fffu
++#define SPES_ADC_INVALID          0x8000u
++
++enum { SPES_ADC_VOLT = 0, SPES_ADC_DIE = 1, SPES_ADC_NTC = 2 };
++
++struct spes_adc_chan {
++	uint8_t     ch;       /* CH_SEL_CTL value, live FDT reg */
++	uint8_t     kind;     /* SPES_ADC_* */
++	uint8_t     den;      /* pre-scaling 1:den */
++	const char *name;
++};
++
++/* exactly the child nodes of the live FDT's vadc@3100 */
++static const struct spes_adc_chan spes_adc_chans[] = {
++	{ 0x00, SPES_ADC_VOLT, 1, "ref_gnd" },
++	{ 0x01, SPES_ADC_VOLT, 1, "vref_1p25" },
++	{ 0x06, SPES_ADC_DIE,  1, "die" },
++	{ 0x83, SPES_ADC_VOLT, 3, "vph_pwr" },
++	{ 0x85, SPES_ADC_VOLT, 3, "vcoin" },
++	{ 0x4c, SPES_ADC_NTC,  1, "xo" },
++	{ 0x4d, SPES_ADC_NTC,  1, "pa0" },
++	{ 0x4e, SPES_ADC_NTC,  1, "quiet" },
++	{ 0x52, SPES_ADC_NTC,  1, "cam_flash" },
++	{ 0x53, SPES_ADC_NTC,  1, "ufs" },
++	{ 0x55, SPES_ADC_NTC,  1, "pa1" },
++};
++#define SPES_ADC_NCHAN ((unsigned)(sizeof(spes_adc_chans) / sizeof(spes_adc_chans[0])))
++
++static inline const struct spes_adc_chan *
++spes_adc_chan_find(uint32_t ch)
++{
++	for (unsigned i = 0; i < SPES_ADC_NCHAN; i++) {
++		if (spes_adc_chans[i].ch == ch) {
++			return &spes_adc_chans[i];
++		}
++	}
++	return (const struct spes_adc_chan *)0;
++}
++
++/*
++ * READ list this driver needs in sweet_spmi_read() (observer channel, nothing is written to the
++ * PMIC): RTC control + counter, temp-alarm identity/status, the ADC block's identity, status,
++ * configuration and result registers.
++ */
++static inline bool
++spes_therm_spmi_read_allowed(uint32_t sid, uint32_t addr)
++{
++	if (sid != SPES_THERM_SID) {
++		return false;
++	}
++	if (addr == SPES_RTC_CTRL || (addr >= SPES_RTC_RDATA0 && addr <= SPES_RTC_RDATA0 + 3u)) {
++		return true;
++	}
++	if (addr == SPES_TZ_SUBTYPE || addr == SPES_TZ_STATUS || addr == SPES_TZ_SHUTDOWN_CTRL1) {
++		return true;
++	}
++	return addr == SPES_ADC_REVISION2 || addr == SPES_ADC_TYPE || addr == SPES_ADC_SUBTYPE ||
++	       addr == SPES_ADC_STATUS1 || (addr >= SPES_ADC_DIG_PARAM && addr <= SPES_ADC_CONV_REQ) ||
++	       addr == SPES_ADC_DATA0 || addr == SPES_ADC_DATA1;
++}
++
++/*
++ * WRITE list a conversion needs (NOT yet granted; EINBAU.md "Freigabeliste"): SID 0,
++ * 0x3142..0x3147, one byte. Nothing else, in particular not the RTC and not the ADC_TM blocks.
++ */
++static inline bool
++spes_therm_adc_write_allowed(uint32_t sid, uint32_t addr, uint32_t len)
++{
++	return sid == SPES_THERM_SID && len == 1 && addr >= SPES_ADC_DIG_PARAM && addr <= SPES_ADC_CONV_REQ;
++}
++
++/* The value each register gets for a conversion of `c`, from the register's value before. */
++static inline uint8_t
++spes_adc_dig_param(uint8_t old, const struct spes_adc_chan *c)
++{
++	return (uint8_t)((old & (uint8_t)~SPES_ADC_DIG_MASK) |
++	       (c->kind == SPES_ADC_NTC ? SPES_ADC_DIG_RATIO : SPES_ADC_DIG_ABS));
++}
++
++static inline uint8_t
++spes_adc_fast_avg(uint8_t old)
++{
++	return (uint8_t)(old & (uint8_t)~SPES_ADC_AVG_MASK);         /* 1 sample */
++}
++
++static inline uint8_t
++spes_adc_delay(uint8_t old, const struct spes_adc_chan *c)
++{
++	return (uint8_t)((old & (uint8_t)~SPES_ADC_SETTLE_MASK) |
++	       (c->kind == SPES_ADC_NTC ? SPES_ADC_SETTLE_200US : SPES_ADC_SETTLE_DEF));
++}
++
++/*
++ * Second gate in front of every ADC write: the byte must be either the saved starting value of
++ * that register (restore) or exactly the value a conversion of a live-FDT channel needs.
++ * `old` = the register's saved starting value, `ch` = the channel being converted.
++ */
++static inline bool
++spes_therm_adc_value_ok(uint32_t addr, uint8_t value, uint8_t old, uint32_t ch)
++{
++	const struct spes_adc_chan *c = spes_adc_chan_find(ch);
++	if (c == (const struct spes_adc_chan *)0) {
++		return false;
++	}
++	switch (addr) {
++	case SPES_ADC_DIG_PARAM:
++		return value == old || value == spes_adc_dig_param(old, c);
++	case SPES_ADC_FAST_AVG:
++		return value == old || value == spes_adc_fast_avg(old);
++	case SPES_ADC_CH_SEL:
++		return value == old || value == c->ch;
++	case SPES_ADC_DELAY:
++		return value == old || value == spes_adc_delay(old, c);
++	case SPES_ADC_EN_CTL1:
++		return value == old || value == (uint8_t)(old | SPES_ADC_EN_BIT);
++	case SPES_ADC_CONV_REQ:
++		return value == SPES_ADC_REQ_BIT;      /* strobe, never "restored" */
++	default:
++		return false;
++	}
++}
++
++/* raw code -> microvolts at the pin (reference 1.875 V, full scale 0x70e4, prescale 1:den) */
++static inline int
++spes_adc_code_to_uv(uint32_t code, uint32_t den)
++{
++	if (code > SPES_ADC_MAX_CODE) {
++		code = 0;
++	}
++	return (int)(((int64_t)code * 1875000 / SPES_ADC_FULL_SCALE) * (int64_t)den);
++}
++
++/* PMIC die temperature: 2 mV per kelvin */
++static inline int
++spes_adc_die_mc(uint32_t code)
++{
++	int uv = spes_adc_code_to_uv(code, 1);
++	return (uv > 0 ? uv / 2 : 0) - 273150;
++}
++
++/* 100k NTC (NTCG104EF104) on a 100k pull-up to 1.875 V: microvolts -> mdegC (facts from Linux's table) */
++static const struct { int uv; int mc; } spes_adc_ntc_map[] = {
++	{ 1831000, -40000 }, { 1814000, -35000 }, { 1791000, -30000 }, { 1761000, -25000 },
++	{ 1723000, -20000 }, { 1675000, -15000 }, { 1616000, -10000 }, { 1545000,  -5000 },
++	{ 1463000,      0 }, { 1370000,   5000 }, { 1268000,  10000 }, { 1160000,  15000 },
++	{ 1049000,  20000 }, {  937000,  25000 }, {  828000,  30000 }, {  726000,  35000 },
++	{  630000,  40000 }, {  544000,  45000 }, {  467000,  50000 }, {  399000,  55000 },
++	{  340000,  60000 }, {  290000,  65000 }, {  247000,  70000 }, {  209000,  75000 },
++	{  179000,  80000 }, {  153000,  85000 }, {  130000,  90000 }, {  112000,  95000 },
++	{   96000, 100000 }, {   82000, 105000 }, {   71000, 110000 }, {   62000, 115000 },
++	{   53000, 120000 }, {   46000, 125000 },
++};
++#define SPES_ADC_NTC_N ((unsigned)(sizeof(spes_adc_ntc_map) / sizeof(spes_adc_ntc_map[0])))
++
++static inline int
++spes_adc_ntc_mc(uint32_t code)
++{
++	int uv = spes_adc_code_to_uv(code, 1);
++	unsigned i = 0;
++	while (i < SPES_ADC_NTC_N && spes_adc_ntc_map[i].uv >= uv) {
++		i++;
++	}
++	if (i == 0) {
++		return spes_adc_ntc_map[0].mc;
++	}
++	if (i == SPES_ADC_NTC_N) {
++		return spes_adc_ntc_map[SPES_ADC_NTC_N - 1].mc;
++	}
++	int x0 = spes_adc_ntc_map[i - 1].uv, x1 = spes_adc_ntc_map[i].uv;
++	int y0 = spes_adc_ntc_map[i - 1].mc, y1 = spes_adc_ntc_map[i].mc;
++	return (y1 - y0) * (uv - x0) / (x1 - x0) + y0;
++}
++
++/* code -> the channel's unit: microvolts (VOLT) or mdegC (DIE, NTC) */
++static inline int
++spes_adc_convert(const struct spes_adc_chan *c, uint32_t code)
++{
++	switch (c->kind) {
++	case SPES_ADC_NTC:
++		return spes_adc_ntc_mc(code);
++	case SPES_ADC_DIE:
++		return spes_adc_die_mc(code);
++	default:
++		return spes_adc_code_to_uv(code, c->den);
++	}
++}
++
++/* ------------------------------------------------------------------ RTC arithmetic */
++static inline uint32_t
++spes_rtc_assemble(const uint8_t b[4])
++{
++	return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++}
++
++/* Linux's carry rule: the 4 bytes are good when the LSB read afterwards is not below the first LSB. */
++static inline bool
++spes_rtc_read_consistent(uint8_t first_lsb, uint8_t second_lsb)
++{
++	return second_lsb >= first_lsb;
++}
++
++/*
++ * UTC from the free-running counter and a stored offset (UTC seconds at counter 0). 0 = not
++ * plausible: no offset, or the result lies before 2020-01-01 (1577836800) or after 2100.
++ */
++static inline uint64_t
++spes_rtc_to_utc(uint32_t rtc_secs, uint64_t offset)
++{
++	uint64_t utc = offset + rtc_secs;
++	if (offset == 0 || utc < 1577836800ull || utc > 4102444800ull) {
++		return 0;
++	}
++	return utc;
++}
++
++/* ------------------------------------------------------------------ kernel interface */
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* Boot-arg spestherm=N; without it nothing happens. Thread context, after the scheduler runs. */
++void spes_therm_init(void);
++/* PM6125 RTC counter (seconds since the RTC last lost power). Thread context. 0 = ok. Never writes. */
++int  spes_therm_rtc_read(uint32_t *secs, uint8_t *ctrl);
++/* UTC seconds from the RTC + boot-arg spesrtcoff=; 0 = ok, -1 = no RTC, no offset or implausible. */
++int  spes_therm_utc_offer(uint64_t *utc_secs);
++/* One TSENS sensor in mdegC; 0 = ok, -1 = not mapped/controller not ready/sensor disabled. */
++int  spes_therm_tsens_read(unsigned sensor, int *mdegc);
++/* Hottest enabled TSENS sensor of the last 30 s round, mdegC; SPES_TSENS_BAD before the first round. */
++int  spes_therm_tsens_max(void);
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* SPES_THERM_H */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index aa0a015..61154c8 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -14,6 +14,7 @@
+ #include "sweet_spmi.h"
+ #include "spes_spmi_allow.h"
+ #include "spes_lpg.h"                  /* 0192 */
++#include "spes_therm.h"                /* 0218: read list for RTC, temp alarm, ADC */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+@@ -106,7 +107,8 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	bool lpg = sid == 1 && peripheral == 0xb3 && (addr & 0xffu) <= 0x47u;   /* 0180: PM6125 LPG, spesvib=2 */
+ 	/* 0185: PM6125 PON revision/type/subtype and SOFT_RB_SPARE, read only */
+ 	bool pon = sid == 0 && (addr == 0x801 || addr == 0x804 || addr == 0x805 || addr == 0x88F);
+-	if (!sp_ready || !out || addr > 0xffffu || (!battery && !lpg && !pon)) {
++	bool therm = spes_therm_spmi_read_allowed(sid, addr);          /* 0218: observer reads only */
++	if (!sp_ready || !out || addr > 0xffffu || (!battery && !lpg && !pon && !therm)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 28769ca..1d0b7d6 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -63,6 +63,7 @@ extern void sweet_keys_init(void);
+ extern void spes_vib_init(void);       /* bsd/dev/spes_vib.c (spesvib=1) */
+ extern void spes_cpufreq_init(void);   /* bsd/dev/spes_cpufreq.c (spescpufreq=0 off) */
+ extern void spes_usb_probe(void);     /* bsd/dev/spes_usb.c (spesusb=1, reads only) */
++extern void spes_therm_init(void);    /* bsd/dev/spes_therm.c (spestherm=N, 0218) */
+ extern void spes_amp_init(void);       /* bsd/dev/spes_amp.c (spesamp=1) */
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+@@ -820,6 +821,7 @@ sweet_ufs_init(void)
+ 		spes_vib_init();
+ 		spes_amp_init();
+ 		spes_usb_probe();
++		spes_therm_init();
+ 		sweet_usb_probe();      /* 0183: SM6225 device mode only with sweetusb=2, else returns */
+ 		return 0;
+ 	}
+@@ -1009,6 +1011,7 @@ spes_ufs_probe(void)
+ 		 */
+ 		spes_vib_init();
+ 		spes_usb_probe();
++		spes_therm_init();
+ 		sweet_usb_probe();      /* 0183: SM6225 device mode + live log only with sweetusb=2 */
+ 		return;
+ 	}

@@ -1,0 +1,28 @@
+spes: IOSurface plane bytes-per-row at +0x10 again (0217 = 0209 restored).
+
+0215 reverted 0209 on the suspicion that it blacked the display in all-7/all-8. The cause was the regenerated MobileGestalt
+cache (all-5b on 2026-11-18: the untouched all-5 image was black too, the old cache brought the UI back). Clients read a plane's
+bytes per row at lock result 0x68 + i*0x80 + 0x10 (IOSurfaceClientGetBytesPerRowOfPlane, 20H392); with only +0x08 written they
+get 0: mediaserverd SIGBUS in the H.264 software decoder (420v) and slanted app switcher snapshots (SpringBoard 787x1705 '420f',
+two planes, uploaded plane by plane by redwood-gl with IOSurfaceGetBytesPerRowOfPlane).
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index c58a3ec..85d9fae 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -847,7 +847,14 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);    /* 0215: 0209 (+0x10) taken back: all-7/all-8 black display */
++		/*
++		 * 0217: bytes per row at +0x10 again (0209; IOSurface 20H392 IOSurfaceClientGetBytesPerRowOfPlane reads
++		 * client+0xe0+i*0x80 = plane 0x68+0x10). 0215 took it back for the black display of all-7/all-8, which
++		 * was the regenerated MobileGestalt cache (all-5b, 2026-11-18), not this. Without it clients read 0:
++		 * mediaserverd SIGBUS in H264SW (420v), slanted app switcher snapshots (420f, two planes).
++		 */
++		put32(p, 0x08, pl->bytesPerRow);
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
