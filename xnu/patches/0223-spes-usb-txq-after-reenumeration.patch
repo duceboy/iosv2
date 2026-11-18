@@ -1,0 +1,39 @@
+sweet usb: sending works again after a long unplug (0223).
+
+all-16 with 0220 (2026-11-18): a re-enumeration after a short interruption (392 s) carried on normally. After an hour without
+the cable the Mac's en3 came up "active" (0220's part) but got no frame back: ue0 rx went on counting (415 -> 579), tx stayed
+at 3599. While unplugged the send queue had filled (live log); ud_if_output drops when the queue is full and returns before
+the kick, and the transfer whose completion would have kicked had been ended by the bus reset. Now the bus-reset teardown
+frees the queued frames (they are stale), and ud_if_output kicks before it looks at the queue.
+Not run on hardware yet.
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 6b82ce8..b3cf0f9 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -475,6 +475,17 @@ ud_deconfigure(const char *why)
+ 	lck_mtx_lock(ud.lock);
+ 	ud.configured = false;
+ 	ud.tx_busy = false;
++	/*
++	 * 0223: drop what queued up while the cable was out. all-16: after an hour unplugged the queue held
++	 * UD_TXQ frames; ud_if_output drops (and does not kick) when the queue is full, the transfer whose
++	 * completion would have kicked was ended above, so after the new enumeration ue0 received (rx 415 ->
++	 * 579) but never sent again (tx stayed 3599).
++	 */
++	while (ud.txq_count > 0) {
++		mbuf_freem(ud.txq[ud.txq_head]);
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++		ud.txq_count--;
++	}
+ 	lck_mtx_unlock(ud.lock);
+ 	ud.data_alt = 0;
+ 	for (unsigned i = 0; i < 3; i++) {
+@@ -679,6 +690,7 @@ static errno_t
+ ud_if_output(ifnet_t ifp, mbuf_t m)
+ {
+ 	lck_mtx_lock(ud.lock);
++	ud_tx_kick_locked();            /* 0223: a full queue with an idle endpoint must not stay that way */
+ 	if (ud.txq_count == UD_TXQ || !ud.configured) {
+ 		lck_mtx_unlock(ud.lock);
+ 		mbuf_freem(m);
