@@ -5740,3 +5740,33 @@ durch den Nutzer.
 - 0224: mit Backlight-Dienst sendet die Einschaltsequenz dessen aktuellen Wert (unter der DSI-Sperre gelesen) statt der Rampe.
   CI 44324828337. Nächster Lauf all-21 = Args von all-20.
 - USB-Umstecktest (0223) weiter offen. 90 Hz danach in eigenem Lauf, mit Logring-Sicherung.
+
+### 18.11.2026 18:10 – all-21 (0224) ausgewertet, all-22 läuft, 0225/0226 gebaut
+
+- **all-21** (Kernel 0224, `sweetpanel=1 sweetfb_rate=60`, 15:55–17:30): Nutzer: Helligkeit einstellen ging, wirkte „etwas
+  ruckeliger“; nach knapp 2 h in Safari (youtube.de) Hänger, Oberfläche einmal neu gestartet, danach Bild eingefroren.
+  Logring `research/logs/all-21-sweetlog.txt` (ab 1466 s): Kernel lief bis zum Schluss (Thermik, Touch, Modem, USB);
+  backboardd zeichnete zuletzt bei ~7010 s, danach kein Bild mehr. Kein Absturzbericht von backboardd/SpringBoard, keine
+  Panik, kein Jetsam im Log. Ursache offen. Der Stichproben-Thread (sweet_sample.c) hatte seine 40. und letzte Probe 37 min
+  vorher geschrieben.
+- 0224 im Log: `panel on at the backlight service's level 0x1` (zweimal je Aufwecken): die Überblendung hatte beim Lesen noch
+  nicht begonnen; sie setzt die Stufen danach selbst. Kein dunkles Panel mehr gemeldet.
+- **0223 bestätigt:** Kabel von ~1500 s bis 6987 s ab (1,5 h), nach dem Anstecken lief das Live-Log weiter (tx 3472 → 3661).
+- **Kerne:** mkadt.py legt nur vier CPU-Knoten an (MPIDR 0x100–0x103 = die vier Gold-Kerne, Cortex-A73); die Silver-Kerne
+  haben kein 16K-Granule und werden vom Shim geparkt. `cpus=4` ist also schon das Maximum, beide Taktdomänen stehen auf Maximum.
+- **Bildzeiten aus all-21** (backboardd-Stichproben jedes 20. Bild, 261 Stück): Median 8,7 ms, p90 26 ms, **25 % über 16,7 ms**
+  (verpasstes 60-Hz-Bild). Langsame Bilder: ~445 GL-Aufrufe/65 Zeichenbefehle, 9,5 ms im Weiterreichen an die GPU (Mesa-Flush),
+  kein Texturnachladen. GPU-Arbeit je Abgabe Median 5,8 ms. Touch → nächstes Bild: Median 26 ms, p90 159 ms. Folgerung: Für 90 Hz
+  (11,1 ms) reicht die Zeichenzeit heute nicht; der Hebel ist die Zeichenzeit, nicht die Bildrate.
+- **90-Hz-Analyse (Agent, gegen xiaomi-spes techpack/display):** setupRate() rechnet die Zeilen richtig, lässt aber aus, was
+  Linux bei dfps_immediate_porch_mode_vfp zusätzlich tut: INTF PROG_FETCH_START 0x170 (+ INTF_CONFIG Bit 31) nachziehen
+  (alter Wert läge hinter der neuen Periode → plausibler Grund für das Rauschen), DSI-Total unter TIMING_DB 0x1e8 schreiben,
+  Befehle im Video-Modus über DMA_SCHEDULE_CTRL 0x100 (Zeile 2413) einplanen, Panel-Befehl `60 01` (90 Hz) senden; das
+  On-Kommando enthält `60 21` (60 Hz). Nichts davon ist am Gerät belegt.
+- **0226** (nur lesen): zwei Logzeilen mit den INTF_1- und DSI0-Registern, wie der ABL sie hinterlässt. **0225:** USB-Befehl
+  `sample [name,name]` (sofortige Stichprobe, `tools-local/spes-cmd.py "sample"`), Stichproben danach alle 300 s ohne Ende.
+  CI 44349625703; Image all-23 (Args wie all-22) wird vorbereitet.
+- **all-22** = Image wie all-21, 17:33 gestartet, für SSH-Arbeit. Safari.History-SIGABRT: Ausnahme in
+  `-[NSFileManager _safari_getMobileSafariContainerDirectoryURL:isContainerized:]` → `fileURLWithPath:` mit nil; der
+  Safari-Datencontainer existiert. Die Containerabfrage des Dienstes liefert also nichts (Ursache offen).
+- Beim nächsten Einfrieren: Kabel dran lassen bzw. anstecken, dann `spes-cmd.py "sample"` und Log sichern, erst danach Fastboot.
