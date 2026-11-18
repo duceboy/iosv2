@@ -5682,3 +5682,22 @@ durch den Nutzer.
   (Art des Fehlers noch erfragen).
 - 0220-Test (Kabel ab/an) in all-15 ohne Befund: Nutzer ging direkt nach Fastboot, keine USB-Zeilen im Live-Log. Wiederholen.
 - tools-local/ios-run.sh: `BUILD_ONLY=1` (nur Image), `NO_CMD=1 WAIT_FB=N` (nicht selbst nach Fastboot schicken, auf die Tasten warten).
+
+### 2026-11-18 13:55 – all-17 (0220–0222): Zählerabfrage geht, USB-Wiederanmeldung halb, 0223; Befund Flüssigkeit/90 Hz
+
+- all-17 (CI 44303149004, Kernel bc46c2d9…, Args wie all-16): LTE-Sitzung kommt wieder von selbst (SESSION UP nach ~90 s Modemzeit,
+  DHCP mit iOS). `spes-cmd.py status` (0222) antwortet: en1 attached/link up, IPA ready 1 modem 1, Kanalzustände 2/2/2/2; Zähler 0,
+  solange das WLAN an ist. 0221: RTC-Zeilen ohne Ausreißer (bisher wenige Minuten).
+- **0220 im Log von all-16 (research/logs/all-16-sweetlog.txt):** drei Neuanmeldungen (392 s, 6903 s, 7173 s), jedes Mal
+  „bus reset while configured … stopped“ → address → „ECM endpoints configured“, keine Befehlsfehler. Nach der kurzen Unterbrechung
+  (392 s) lief der Verkehr weiter (Live-Log bis 3962 s). Nach einer Stunde ohne Kabel: en3 am Mac „active“, aber 0 Pakete vom Telefon;
+  ue0 rx zählt weiter (415 → 579), **tx bleibt 3599** → volle Sendewarteschlange ohne Anstoß. **0223** leert die Schlange beim
+  Bus-Reset und stößt in ud_if_output vor der Voll-Prüfung an (CI 44305700981, ungetestet).
+- Flüssigkeit, Bestand aus dem Log (kein neuer Treiber nötig):
+  - CPU: spes_cpufreq stellt beide Domänen auf die höchste Stufe (Silver 1516 → 1900 MHz, Gold 300 → 2400 MHz, zurückgelesen).
+    `cpus=4` = nur 4 von 8 Kernen (welche, noch prüfen).
+  - Anzeige: Panel läuft nach dem ABL mit **59,999 Hz** (3648 Zeilen, 2400 sichtbar, 832 Takte/Zeile); vsync am Bildanfang des Panels.
+    Die 90-Hz-Umschaltung des Autors (0154 setupRate, Standard sweetfb_rate=90: Bild auf 2432 Zeilen kürzen, messen, sonst zurück) greift
+    bei uns nicht: „90 Hz not set … DSI total differs“, weil fDsi nur mit **`sweetpanel=1`** eingerichtet wird (DSI0-Befehlsweg:
+    Helligkeit, Schlaf; Puffer am Ende der Splash-Region) und unsere Images das nicht setzen.
+  - Nächster Lauf all-18: Kernel 0223 + `sweetpanel=1` (90 Hz, Helligkeitsweg). Beobachtung durch den Nutzer nötig (Bild, Helligkeit).
