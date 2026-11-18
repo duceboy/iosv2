@@ -12,10 +12,10 @@ Not run on hardware yet.
 
 diff --git a/iokit/Kernel/arm/SpesScaler.cpp b/iokit/Kernel/arm/SpesScaler.cpp
 new file mode 100644
-index 0000000..704c9b6
+index 0000000..268a5cd
 --- /dev/null
 +++ b/iokit/Kernel/arm/SpesScaler.cpp
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,333 @@
 +/*
 + * Software stand-in for AppleM2ScalerCSCDriver (0219, boot-arg spesscaler=N).
 + *
@@ -49,6 +49,7 @@ index 0000000..704c9b6
 +
 +#if defined(SWEET)
 +#include <IOKit/IOLib.h>
++#include <IOKit/IOKitKeys.h>
 +#include <IOKit/IOService.h>
 +#include <IOKit/IOUserClient.h>
 +#include <pexpert/pexpert.h>
