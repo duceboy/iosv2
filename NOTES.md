@@ -5584,3 +5584,21 @@ durch den Nutzer.
   neu erzeugten Cache auf und sind Folge, nicht Ursache.
 - Regel: den MobileGestalt-Cache nicht löschen/neu erzeugen lassen; gilt der Wert 600 als nötig für die Haptik, erst den
   Schlüssel zuordnen und einzeln testen. Einmal SpringBoard SIGBUS direkt nach dem Neustart der Oberfläche (beobachten).
+
+### 2026-11-18 09:10 – all-10b mit altem Cache: Oberfläche da; Web-/Umschalter-Bildfehler = Metal für alle Apps
+
+- all-10b (Kernel 0216, alter MobileGestalt-Cache): Oberfläche kommt normal. Nutzer: Apps stabiler, Startanimation ruckelt, Vorschau im
+  App-Umschalter mit Bildfehlern, Webseiten (vorher Bing/Google ok) alle verpixelt, Videos gehen nicht, kein Mobilfunk-Menü.
+- Absturzberichte (.ips vom Telefon, lokal ausgewertet):
+  - **AegirPoster** (Erd-Hintergrund, Standard): braucht zwingend Metal. Ohne Gerät Ausnahme in `-[CAMetalLayer setPixelFormat:]`,
+    mit Gerät nil-Puffer in `-[NUNIAegirRenderer getOrCreateUniformBufferforFrameBufferIndex:]`. Unabhängig vom MobileGestalt-Cache
+    (Korrektur zum Eintrag 08:45). Abhilfe: anderes Hintergrundbild wählen bzw. Poster-Konfiguration umstellen.
+  - **SpringBoard SIGBUS**: `-[SweetTextureLayout copyFromTextureMemory:…]` (NegroniMetal) aus ImageIO ASTC/ATX-Dekodierung
+    (App-Umschalter-Vorschauen sind ATX) → memmove über das Ende. Fehler im Metal-Ersatz, trifft jede App mit „*“.
+  - **backboardd SIGSEGV** far 0x14: Mesa `fd_bo_heap_alloc → fd_bo_ref(NULL)` unter `st_TexSubImage`/staging: BO-Anforderung
+    scheitert (GPU-Speicher?) und der Heap-Pfad prüft nicht auf NULL. Offen.
+- Maßnahme (live, umkehrbar): `/System/Library/Extensions/NegroniMetal.bundle/clients` wieder nur die Probes
+  (`metalprobe m2vtest carenderprobe`); vorherige Datei als `clients.metal-all-20261118` daneben. SpringBoard/Safari/WebKit neu gestartet.
+  Prüfung durch den Nutzer: Webseiten und App-Umschalter.
+- Sechs Treiber-Entwürfe parallel beauftragt (research/drafts/: bt, cam, therm, sns, mic, loc; Auftrag BRIEF.md), Ziel: ein Kernel mit
+  allen Lese-Stufen, ein Lauf.
