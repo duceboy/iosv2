@@ -5602,3 +5602,20 @@ durch den Nutzer.
   Prüfung durch den Nutzer: Webseiten und App-Umschalter.
 - Sechs Treiber-Entwürfe parallel beauftragt (research/drafts/: bt, cam, therm, sns, mic, loc; Auftrag BRIEF.md), Ziel: ein Kernel mit
   allen Lese-Stufen, ein Lauf.
+
+### 2026-11-18 09:45 – all-11: 0217 behebt Video; schräge Linien = fehlender AppleM2ScalerCSCDriver
+
+- all-11 (Kernel 0217+0218, 0218 ohne Boot-Arg): **YouTube-Videos spielen** (Nutzer), mediaserverd stürzt nicht mehr ab (all-10b: 10× SIGBUS).
+  0209/0217 (Plane-bytesPerRow bei +0x10) war also richtig; die Rücknahme 0215 beruhte auf der falschen Schwarzbild-Diagnose.
+- Schräge Linien in den App-Umschalter-Vorschauen (und schwächer in Video-Vorschaubildern) bleiben. Messung auf dem Telefon mit
+  userland/surfprobe/cvprobe (CoreVideo-Puffer 787x1705 '420f'): CoreVideo, Erzeuger und zweiter Leser sehen dieselbe Geometrie
+  (Y 787x1705 bpr 832 bei +64, CbCr 394x853 bpr 832) → die Ebenen-Meldung des Kernels stimmt jetzt.
+- Ursache ist der fehlende Farb-/Skalierbaustein: `IOServiceMatching failed for: AppleM2ScalerCSCDriver` (SpringBoard, backboardd).
+  SpringBoard legt für jede Vorschau eine '420f'-Oberfläche 787x1705 mit zwei Ebenen an (Kopf-Layout wie BGRA: bpr 3328), die per
+  IOSurfaceAccelerator aus dem BGRA-Abbild gefüllt werden soll. Ohne den Treiber bleibt ihr Inhalt, was im Speicher stand; backboardd
+  zeigt sie ebenenweise (R8 786x1704 + RG8 393x852) → Streifen. In keinem lokalen Projekt gibt es einen Ersatz (topaz, flame, HackiOS,
+  iOSPlus10 geprüft). Laut Inventar suchen AppleJPEG, CMCapture, CMImaging, CMPhoto, AirPlaySupport denselben Treiber
+  → Software-Ersatz im Kernel (BGRA↔420, Skalieren) ist der nächste Treiber mit dem größten Nutzen für die Oberfläche.
+- Der Rückweg nach Fastboot (0216) ist beim Wechsel all-10b → all-11 erneut gescheitert (PON gesetzt, „sync done“, dann eingefroren).
+- Entwürfe fertig (nur Host-geprüft): research/drafts/therm (als 0218 im Baum), mic, bt; Recherche research/drafts/BAUSTEINE.md.
+  Nutzer hat am 18.11. auch Quellen außerhalb der bekannten Projekte freigegeben (siehe CLAUDE.md).
