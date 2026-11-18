@@ -5637,3 +5637,24 @@ durch den Nutzer.
   Windows-VM) hatte das USB-Gerät „Sweet iOS (USB Ethernet)“ an sich gezogen** (ioreg: prl_vm_app als Nutzer des Geräts, kein en-Interface).
   `prlsrvctl usb set '100000|1209|0001|high|--|0001' --autoconnect host` gesetzt (vorher „ask“); die bestehende Zuordnung löst sich
   erst beim nächsten Einstecken. Merke: „kein USB-Netz“ bei sichtbarem USB-Gerät → zuerst `prlsrvctl usb list` ansehen.
+
+### 2026-11-18 11:25 – all-14: 0219 Stufe 2 behebt die Streifen in den App-Umschalter-Vorschauen
+
+- all-14 (`spesscaler=2`, sonst wie all-13), zwei Läufe (10:38 ohne Live-Log, Log aus dem Ring: research/logs/all-14-sweetlog.txt; 11:05 erneut).
+  **Nutzer: neu erzeugte Vorschauen sind fehlerfrei.** Die anfangs noch gestreiften Vorschauen waren gespeicherte Abbilder aus früheren
+  Läufen; nach erneutem Öffnen der Apps sind keine fehlerhaften mehr vorhanden.
+- Log des ersten Laufs (26 min): über 400 Umrechnungen, 0 abgelehnt, kein Absturz. Anfragen: SpringBoard BGRA 1125x2436 → BGRA 787x1705
+  (bpr 3328, ~92 ms), → 282x609 (~12 ms), 282x609 → 94x203; CollectionsPoster '420f' 512x512 → BGRA 512x512 und BGRA 512x512 →
+  BGRA 1271x1823 / 1326x1326 (bis ~130 ms); assetsd BGRA 74x160 → '420f' 74x160. Alle mit Flags 0x3000 und leeren Rechtecken.
+  Korrektur zu 09:45: die gestreifte Fläche war nicht „'420f' ohne Füllung“, sondern das Fehlen der BGRA-Verkleinerung davor; die
+  '420f'-787x1705-Flächen legt SpringBoard weiterhin an (JPEG-Weg, AppleJPEGDriver -> none, Software).
+- Offen am Scaler: CollectionsPoster ruft 23× **Selektor 4** (32 Bytes rein, nichts raus) → bisher „not done“, Bedeutung nachlesen;
+  Nächster-Nachbar-Verkleinerung (Qualität, ggf. Mittelung); 90–130 ms je großer Fläche im Kernel (NEON/Zeilenweise möglich).
+- `spesscaler=2` steht jetzt fest in tools-local/ios-run.sh.
+- **USB-Gadget übersteht eine zweite Anmeldung nicht:** nach dem Lösen aus der Parallels-VM enumeriert das Gerät neu (bus reset, address 2,
+  configured), en3 erscheint, bleibt aber „inactive“. Letzte Anfrage im Log: `setup 02 01 0000 0082` = CLEAR_FEATURE(ENDPOINT_HALT) auf
+  dem Interrupt-Endpunkt; der Treiber (0075) tut dabei nichts und sendet nach dem zweiten SET_INTERFACE keine neue
+  NETWORK_CONNECTION-Meldung (alter TRB hängt vermutlich noch). Zu beheben: bei Bus-Reset Transfers beenden, configured/data_alt
+  zurücksetzen, bei CLEAR_HALT den Endpunkt neu starten. Bis dahin: nach USB-Unterbrechung Neustart nötig.
+- Der Live-Log-Empfänger (tools-local/spes-live.py) stirbt mit der Claude-Sitzung → nach einem Sitzungsabsturz zuerst `ps` prüfen und
+  mit nohup neu starten.
