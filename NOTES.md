@@ -5567,3 +5567,20 @@ PS_HOLD_RST_CTL (0x85A) Typ 1 (Warmstart), CTL2 (0x85B) Bit 7, jeweils zurückge
 erweitert; Vorlage Xiaomi qpnp-power-on.c qpnp_pon_reset_config), dann 0 nach PS_HOLD 0x440b000 (Live-DT qcom,pshold); PSCI als
 Rückfall. `spesreset=2` Standard auf spes, 1 = PAS-Shutdown (0207), 0 = nur PSCI. CI 44202506575. all-9 (0215) wartet auf Fastboot
 durch den Nutzer.
+
+### 2026-11-18 08:45 – Schwarzes Display (all-3, all-7..all-10): Ursache = neu erzeugter MobileGestalt-Cache
+
+- Zustand am Morgen: all-10 hatte um 02:18 per Countdown „SOFT_RB_SPARE -> 0x4, read back OK“ + „sync done“ geloggt, Fastboot kam
+  nicht (0216/PS_HOLD = vierter Fehlschlag des Rückwegs); Telefon war am Mac nicht sichtbar, Nutzer brachte es von Hand nach Fastboot.
+  Slots unverändert (b, retry 6).
+- **Gegenprobe all-5b:** das unveränderte Image spes-all-5.img (am 17.11. mit Oberfläche) blieb jetzt ebenfalls schwarz
+  → Ursache liegt auf dem Telefon, nicht im Kernel (0207–0216 entlastet). Im Log ist „display on … display off“ nach Bild 3
+  in guten wie schlechten Läufen gleich und taugt nicht als Merkmal.
+- Die drei Cache-Dateien verglichen: `com.apple.MobileGestalt.plist` (= `.regenerated-all3`) unterscheidet sich von
+  `.before-haptics` in genau einem Schlüssel: `CacheExtra/gBw7IWiBnLHaA+lBrZBgWw` 0 → 600 (Bedeutung noch nicht zugeordnet).
+- `.before-haptics` zurückkopiert (Eigentümer mobile), backboardd/SpringBoard/PosterBoard beendet → **Oberfläche kommt sofort,
+  Nutzer bedient das Telefon.** Damit passt auch all-3 (Cache gelöscht = neu erzeugt = schwarz); die damalige Entlastung des
+  Caches war falsch. AegirPoster-Abstürze (unbehandelte ObjC-Ausnahme auf der FBS-Queue, 54× in all-10) traten nur mit dem
+  neu erzeugten Cache auf und sind Folge, nicht Ursache.
+- Regel: den MobileGestalt-Cache nicht löschen/neu erzeugen lassen; gilt der Wert 600 als nötig für die Haptik, erst den
+  Schlüssel zuordnen und einzeln testen. Einmal SpringBoard SIGBUS direkt nach dem Neustart der Oberfläche (beobachten).
