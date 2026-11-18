@@ -5878,3 +5878,14 @@ durch den Nutzer.
   Puffer, auf den freeBuffer() wartet (ein retain reicht bei Host-Puffern nicht: freeBuffer entwirt die Seiten). Bringt nur
   etwas, wenn backboardd hinter den Pushes ANDERER wartet – das zeigen erst die 0229-Zeilen (`backboardd: … waiting for the lock`).
 - Hilfswerkzeuge der Agenten (Disassembler-Ersatz über cstool, .ips-Auswertung) liegen in research/drafts/20261118/.
+
+### 18.11.2026 18:59 – Entwurf 90 Hz, zweiter Weg (`sweetfb_rate2=1`)
+
+- Agent-Entwurf research/drafts/20261118/rate90/ (rate90.patch + BERICHT.md, nicht angewendet; Dry-Run gegen work/xnu sauber,
+  Funktionen in einem Stub-Rahmen warnungsfrei übersetzt, Registermodell am Mac in drei Fällen wie erwartet).
+- Ohne den Schalter unverändert. Mit ihm: Schreiben nur, wenn die gelesenen Register zusammenpassen (DSI-Zeilen = INTF, Video-Engine
+  an, TIMING_DB 0x1e8 = 0, Prefetch 0x170 plausibel); Reihenfolge wie Linux (0x1e8=1 → DSI 0x02c → INTF 0x00c/0x170 → Flush →
+  nächstes Bild → 0x1e8=0), jedes Register zurückgelesen, bei 90 ± 3 Hz Panel-Satz `f1 5a 5a / 60 01 / f7 07 / f1 a5 a5`,
+  sonst vollständiger Rückweg. dsiSend plant Befehle im Video-Modus über DSI 0x100 (Bit 28 | Zeile 2413), DT: dsi-ctrl-hw-v2.4.
+- Vor dem Lauf die 0226-Werte gegen die Liste „Lauf NICHT machen, wenn …“ im BERICHT halten. Plan: erst Vorlauf
+  `sweetfb_rate2=1 sweetfb_rate=60` (testet nur die Befehlsplanung), dann Hauptlauf mit dem Nutzer am Bildschirm.
