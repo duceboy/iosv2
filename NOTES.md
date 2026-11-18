@@ -5638,9 +5638,9 @@ durch den Nutzer.
   `prlsrvctl usb set '100000|1209|0001|high|--|0001' --autoconnect host` gesetzt (vorher „ask“); die bestehende Zuordnung löst sich
   erst beim nächsten Einstecken. Merke: „kein USB-Netz“ bei sichtbarem USB-Gerät → zuerst `prlsrvctl usb list` ansehen.
 
-### 2026-11-18 11:25 – all-14: 0219 Stufe 2 behebt die Streifen in den App-Umschalter-Vorschauen
+### 2026-11-18 11:05 – all-14: 0219 Stufe 2 behebt die Streifen in den App-Umschalter-Vorschauen
 
-- all-14 (`spesscaler=2`, sonst wie all-13), zwei Läufe (10:38 ohne Live-Log, Log aus dem Ring: research/logs/all-14-sweetlog.txt; 11:05 erneut).
+- all-14 (`spesscaler=2`, sonst wie all-13), zwei Läufe (10:38 ohne Live-Log, Log aus dem Ring: research/logs/all-14-sweetlog.txt; 10:58 erneut).
   **Nutzer: neu erzeugte Vorschauen sind fehlerfrei.** Die anfangs noch gestreiften Vorschauen waren gespeicherte Abbilder aus früheren
   Läufen; nach erneutem Öffnen der Apps sind keine fehlerhaften mehr vorhanden.
 - Log des ersten Laufs (26 min): über 400 Umrechnungen, 0 abgelehnt, kein Absturz. Anfragen: SpringBoard BGRA 1125x2436 → BGRA 787x1705
