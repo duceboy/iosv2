@@ -5619,3 +5619,21 @@ durch den Nutzer.
 - Der Rückweg nach Fastboot (0216) ist beim Wechsel all-10b → all-11 erneut gescheitert (PON gesetzt, „sync done“, dann eingefroren).
 - Entwürfe fertig (nur Host-geprüft): research/drafts/therm (als 0218 im Baum), mic, bt; Recherche research/drafts/BAUSTEINE.md.
   Nutzer hat am 18.11. auch Quellen außerhalb der bekannten Projekte freigegeben (siehe CLAUDE.md).
+
+### 2026-11-18 10:45 – all-13: 0218 (spestherm=1) und 0219 Stufe 1 (spesscaler=1) gelaufen; all-14 mit Stufe 2 gestartet
+
+- all-13 (CI 44270083969, Kernel a5c22d5c…, zusätzlich `spestherm=1 spesscaler=1`), Lauf 09:59–10:06. (Sitzung danach abgestürzt,
+  Auswertung aus research/logs/live-usb1.txt ab Zeile 272348 nachgeholt.)
+- **0218 Temperatur (nur lesend):** 16 TSENS-Fühler alle 30 s, 48–58 °C im Leerlauf mit Oberfläche (heißester wechselnd cpuss-0/1,
+  direkt nach dem Start cpu-1-3 57,7 °C). RTC zählt sekundengenau (245966 → +30 je Zeile), ctrl 0x80; **ein Ausreißer** (17023242 bei
+  140 s, danach wieder normal) → Lesen der vier RTC-Bytes ist nicht gegen Überlauf zwischen den Bytes gesichert (doppelt lesen und
+  vergleichen, offen). PMIC-Temperaturalarm Status 0x80.
+- **0219 Stufe 1:** Dienst registriert, SpringBoard und backboardd finden und öffnen ihn (Typ 0). Genau **eine** Anfrage in 6 min:
+  SpringBoard, Block 368 Bytes, **Flags 0x3000 bei +0x20**, erste ID = 'BGRA' 1125x2436 (bpr 4608), zweite ID = 'BGRA' 282x609
+  (bpr 1280), Bytes +0x08…+0x67 sonst alle 0 (keine Rechtecke, kein Completion). Damit bestätigt: erste ID = Quelle, zweite = Ziel,
+  leere Rechtecke = ganze Fläche. Es ist ein reines Verkleinern BGRA→BGRA (kein '420f' wie in all-11 vermutet; die '420f'-Flächen
+  kommen ggf. erst, wenn die erste Anfrage gelingt). Nach der Ablehnung fragt SpringBoard nicht noch einmal.
+- all-14: gleiches Image, nur `spesscaler=2` (Image fa35d223…), 10:38 gestartet. USB-Netz kam nicht: **Parallels (laufende
+  Windows-VM) hatte das USB-Gerät „Sweet iOS (USB Ethernet)“ an sich gezogen** (ioreg: prl_vm_app als Nutzer des Geräts, kein en-Interface).
+  `prlsrvctl usb set '100000|1209|0001|high|--|0001' --autoconnect host` gesetzt (vorher „ask“); die bestehende Zuordnung löst sich
+  erst beim nächsten Einstecken. Merke: „kein USB-Netz“ bei sichtbarem USB-Gerät → zuerst `prlsrvctl usb list` ansehen.
