@@ -5713,3 +5713,17 @@ durch den Nutzer.
 - LTE-Sitzung kam nach 90 s von selbst (`SESSION UP`, en1 link up, DHCP 3). TSENS 42–53 °C.
 - Offen: sweetlog von all-18 sichern (OrangeFox), Ursache des NO DONE (Befehl im Video-Modus ohne DONE-Unterbrechung?),
   0223-Umstecktest.
+
+### 18.11.2026 15:00 – Korrektur zu all-18, all-19 läuft
+
+- Der Eintrag 14:40 vermischt zwei Läufe. Tatsächlich: all-18 (`sweetpanel=1`) lief nur etwa 85 s (14:37:55 bis ~14:39:20):
+  Bild grün rauschend und immer heller (Nutzer), `DSI cmd 0x3 not done … status 0x200b`, `panel level 0x418: NO DONE`,
+  backboardd fand AppleARMBacklight. Der Nutzer ging in Fastboot; dort startete ein noch laufender Auftrag um 14:39:45
+  bereits all-19 (gleicher Kernel, ohne `sweetpanel=1`). „LTE nach 90 s“, TSENS und „alles normal wie vorher“ gehören zu all-19.
+- Der Logring von all-18 ist dadurch überschrieben; gesichert ist der erste all-19-Lauf (`research/logs/all-19a-sweetlog.txt`):
+  ohne Schalter 59,998 Hz, `90 Hz not set`, kein Backlight-Dienst. Ob all-18 auf 90 Hz umgeschaltet hat, ist NICHT belegt.
+- Eindruck des Nutzers „etwas flüssiger, kleine Stotterer“ entstand unter all-19 = 60 Hz wie all-17, also kein 90-Hz-Effekt.
+- 0223: Kabel ~3,5 min ab (up 254–465 s), danach saubere Neuanmeldung (bus reset while configured → ECM endpoints configured);
+  der Lauf endete kurz danach, ob das Senden wieder lief, ist nicht belegt. Test wiederholen.
+- Lehre: vor dem Start eines Ersatzauftrags den alten Auftrag zuerst stoppen; nach einem Fehlbild erst den Logring sichern.
+- Nächster Lauf all-20: `sweetpanel=1 sweetfb_rate=60` (Panel-Befehle ohne Ratenumschaltung) trennt die beiden Ursachen.
