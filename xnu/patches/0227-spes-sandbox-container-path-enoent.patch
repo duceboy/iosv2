@@ -1,0 +1,34 @@
+sweet sandbox: container path request fails for a process without a container (0227).
+
+com.apple.Safari.History died with SIGABRT at every start (all-21: 13 starts): NSInvalidArgumentException in
++[NSURL fileURLWithPath:isDirectory:] from SafariCore -[NSFileManager _safari_getMobileSafariContainerDirectoryURL:
+isContainerized:]. That block calls sandbox_container_path_for_pid(getpid(), buf, 0x400) and, on 0, makes the path of buf;
+on an error it asks LSApplicationRecord for com.apple.mobilesafari's data container. Our stand-in (0147) answered 0 without
+writing the buffer when the process has no CFFIXED_USER_HOME. Before 0147 every caller got ENOENT; only processes with the
+variable (applications, extensions) need the path, and they still get it.
+Open: whether the LaunchServices branch then finds the container (it exists on the phone). Not run on hardware yet.
+
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index f2bf6aa..0c464d3 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -295,7 +295,10 @@ static uint64_t sweet_sandbox_seen;
+  * application, pkd an extension) passes the container from containermanagerd as
+  * CFFIXED_USER_HOME, so it is read from the strings exec left at the top of the process's stack.
+  * PlugInKit does not run an extension without one ("plugin has invalid sandbox or container").
+- * A process without the variable gets success and an untouched buffer.
++ * A process without the variable gets ENOENT (0227; it was success and an untouched buffer: SafariCore's
++ * _safari_getMobileSafariContainerDirectoryURL:isContainerized: takes 0 for "containerized", made a string
++ * of its uninitialised stack buffer and com.apple.Safari.History died in fileURLWithPath: at every start.
++ * With an error it asks LaunchServices for the application's data container instead.)
+  */
+ #define SWEET_SANDBOX_CONTAINER_VAR     "CFFIXED_USER_HOME="
+ 
+@@ -356,6 +359,7 @@ sweet_sandbox_container_path(user_addr_t arg)
+ 	}
+ 	const char *end = (const char *)(strings + strings_size);
+ 	size_t len;
++	error = ENOENT;         /* 0227: no container variable, no path */
+ 	for (const char *s = end - argslen; s < end; s += len + 1) {
+ 		len = strnlen(s, end - s);
+ 		if (len > prefix_len && s + len < end && strncmp(s, SWEET_SANDBOX_CONTAINER_VAR, prefix_len) == 0) {
