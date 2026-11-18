@@ -1,0 +1,42 @@
+sweet fb: the panel wakes at the backlight service's level, not at 1 (0224).
+
+all-20 (2026-11-18, sweetpanel=1 sweetfb_rate=60, AppleARMBacklight on by default): the first lock faded out normally;
+after a wake the lock screen showed briefly and went black, or stayed dim, while the log had "display on" and
+"brightness 128 FadePeriod 12124" and no later brightness 0. setPanelOn(true) ramps 1 -> fPanelLevel after its 120 ms
+sleep-out wait; with the service, fPanelLevel is being moved by backboardd's 185 ms wake fade at that moment (or is still 1),
+and the ramp's 16 steps (256 ms) end after the fade's last step, so the ramp's stale target stays on the panel.
+With the service the sequence now sends the service's current level, read under the DSI lock. Without it: unchanged.
+Not run on hardware yet.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ffdfcf5..f549061 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1296,7 +1296,26 @@ AppleCLCD::setPanelOn(bool on)
+ 	IOLockLock(fDsiLock);
+ 	done &= dsiSend(second, NULL, 0);
+ 	IOLockUnlock(fDsiLock);
+-	if (on) {
++	if (on && fBacklightService) {
++		/*
++		 * 0224: AppleARMBacklight owns the level and backboardd starts its wake fade (0 -> 128 in
++		 * 185 ms) while this sequence is still in its 120 ms sleep-out wait. The ramp below read
++		 * fPanelLevel once, early in that fade or before it (all-20: 1), and its 16 steps ended
++		 * after the fade's last step: the panel stayed at level 1, black, with iOS at brightness
++		 * 128. Send the level the service holds instead, read under the DSI lock so that a step
++		 * of the fade either comes after this one or is the value read here.
++		 */
++		for (int i = 0; i < 2; i++) {
++			uint8_t hdr[4] = { 3, 0, 0x39, 0xc0 };
++			IOLockLock(fDsiLock);
++			uint32_t level = fPanelLevel;
++			uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };
++			done &= dsiSend(hdr, cmd, sizeof(cmd));
++			IOLockUnlock(fDsiLock);
++			IOLog("SWEET FB: panel on at the backlight service's level %#x\n", level);
++			IOSleep(20);
++		}
++	} else if (on) {
+ 		rampPanelLevel(1, fPanelLevel);
+ 	} else {
+ 		IOSleep(120);
