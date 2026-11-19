@@ -5921,3 +5921,22 @@ durch den Nutzer.
   → **160–200 MiB/s sequenziell kalt**; warm (aus dem Cache) 93–275 ms, also ~470 MiB/s durch cat selbst.
 - Der Speicher ist beim sequenziellen Lesen kein Engpass. Zufällige kleine Zugriffe (wo die 200-µs-Schritte des Treibers am
   stärksten wirken) sind nicht gemessen; dafür fehlt ein Werkzeug auf dem Telefon (`dd` gibt es dort nicht).
+
+### 19.11.2026 11:47 – Nacht, Kette, Online-Recherche (Agent auf Opus)
+
+- all-23 lief über Nacht durch (letzte Zeile up 59066 s, 11:27); nur das USB-Netz zum Mac war ab 23:55 weg. Der Logring war
+  nach 16 h überschrieben → die 0226-Registerzeilen fehlen wieder (bei all-24 in den ersten Minuten holen).
+- 11:27 Fastboot: zwei Ketten liefen gleichzeitig (die alte lebte noch, obwohl pgrep sie nicht zeigte). Eine sicherte den Logring
+  (research/logs/all-23-sweetlog.txt), danach lasen beide `current-slot` leer und stoppten (Exit 2). Direkt gelesen: Slot b,
+  retry 6, unbootable no → Lesefehler durch parallele fastboot-Zugriffe. Kurz darauf war das Telefon nicht mehr in Fastboot
+  (Ursache unbekannt). all-24 nicht gestartet. Lehre: vor jeder neuen Kette `pgrep -f spes-next` UND `pgrep -f ios-run` prüfen.
+- CI: 44364975190 bekam dreimal keinen Bauserver (Engpass bei GitHub, actions/runner-images#15291). **44505747653 (0225–0231)
+  erfolgreich.**
+- Online-Bericht: research/drafts/20261119/online/BERICHT.md. Kernpunkte: (1) Upstream iosv2 hat neue Patches mit den Nummern
+  0173/0174 (kollidieren mit unseren; 0174 = GPU-Standardtakt 785 MHz) und tools/repack_payload_cmdline.py; (2) HackiOS-PR #62
+  (Fork Filarh, Redmi Note 13 4G, A610): Window-Server über Metal, GMEM-Kacheln wie Turnip, Cache-Push nur um gemeldete
+  CPU-Zugriffe (GEM_CPU_PREP/FINI) – trifft unser Cache-Push-Problem; (3) der spes-Linux-Kernel schreibt beim 90-Hz-Wechsel nur
+  den DSI-Teil (TIMING_DB, DSI-Timing, Panel-Befehl, nach dem Kickoff TIMING_DB=0, Befehl noch einmal), die INTF-Register
+  fasst dieser Pfad nicht an → rate90-Entwurf um eine „nur DSI“-Variante ergänzen, bevor er läuft; (4) HackiOS 3b9db78
+  (hm_ca_nearest) gegen Bildfehler bei Metal in Apps; (5) HackiOS-Branch mtk: iOS-bluetoothd über Kernel-Schnittstelle + Skywalk.
+  Alles vom Agenten gelesen, von mir nicht nachgeprüft.
