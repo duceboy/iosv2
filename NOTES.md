@@ -5940,3 +5940,15 @@ durch den Nutzer.
   fasst dieser Pfad nicht an → rate90-Entwurf um eine „nur DSI“-Variante ergänzen, bevor er läuft; (4) HackiOS 3b9db78
   (hm_ca_nearest) gegen Bildfehler bei Metal in Apps; (5) HackiOS-Branch mtk: iOS-bluetoothd über Kernel-Schnittstelle + Skywalk.
   Alles vom Agenten gelesen, von mir nicht nachgeprüft.
+
+### 19.11.2026 15:25 – Telefon heiß und nicht ausschaltbar (Nutzer) → über OrangeFox ausgeschaltet
+
+- Nutzer 15:2x: Telefon geht nicht aus und wird extrem heiß. Vom Mac aus nicht erreichbar (kein Fastboot/USB-Netz). Vermutung,
+  nicht geprüft: nach dem Fastboot-Besuch um 11:27 verließ es Fastboot von selbst und hing rund vier Stunden im Android-Start
+  (Mi-Logo-Schleife, iOS-Root in userdata).
+- 15:24:12 Fastboot (Tasten des Nutzers): Slot b, retry 6, unbootable no. OrangeFox aus dem RAM, 15:24:34: **Akku 46,0 °C**, 97 %,
+  „Charging“, heißeste Thermalzone 57 °C. `adb shell reboot -p` 15:24:37, danach kein USB-Gerät mehr.
+  Protokoll: research/logs/notfall-aus-20261119.txt.
+- Lehren: Das Telefon nie unbeaufsichtigt in Fastboot oder nach einem gestoppten Auftrag stehen lassen; wenn eine Kette stoppt,
+  sofort entweder ein Image starten oder über OrangeFox ausschalten (`adb shell reboot -p`). Ausschalten aus dem laufenden iOS
+  gibt es bei uns nicht (Rückweg friert ein) → eigener Punkt für die Treiberliste (PMIC-Ausschalten, vorher fragen).
